@@ -3,18 +3,20 @@ revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.11' and python_full_version < '3.14' and sys_platform == 'win32'",
+    "python_full_version < '3.11' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and sys_platform != 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.11' and python_full_version < '3.14' and sys_platform == 'win32'",
     "(python_full_version >= '3.11' and python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32') or (python_full_version == '3.11.*' and sys_platform == 'emscripten')",
-    "python_full_version < '3.11' and sys_platform == 'win32'",
     "python_full_version < '3.11' and sys_platform != 'win32'",
 ]
 
 [options]
-exclude-newer = "2026-09-24T00:00:00Z"
+exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
+exclude-newer-span = "P2W"
 
 [options.exclude-newer-package]
+claude-agent-sdk = "2026-09-16T00:00:00Z"
 temporalio = false
 
 [[package]]
@@ -173,7 +175,7 @@ wheels = [
 
 [[package]]
 name = "claude-agent-sdk"
-version = "0.2.159"
+version = "0.2.153"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -182,13 +184,13 @@ dependencies = [
     { name = "sniffio" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/db/b2/81eb389ace55434f0119b99b62c10a7ac206def6c92ee0768eb389b0c900/claude_agent_sdk-0.2.159.tar.gz", hash = "sha256:e1905e2637b27971bb561bb6ad317aeb3d50619be5261bfa7ff2e9c2be0f0fd1", size = 354571, upload-time = "2026-09-23T20:26:37.386Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/65/02/0fe09b7cdd10cf71e5f278cb1d363d32d58096401f12d0a39db86a355dcc/claude_agent_sdk-0.2.153.tar.gz", hash = "sha256:b4029afba1acbc064b30bb7623e7160976456feb558db15b012f0bbc1691c042", size = 346576, upload-time = "2026-09-15T20:37:04.397Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ec/06/87d76aced98f7b71cede2ebf4ae7808e52df9d3819c7f4c7b8c3d2a225b6/claude_agent_sdk-0.2.159-py3-none-macosx_11_0_arm64.whl", hash = "sha256:ba7f152560dca5001a0bc46ed13b7da14eb14b419faed25bb1af821bfa95d3de", size = 91937244, upload-time = "2026-09-23T20:26:41.375Z" },
-    { url = "https://files.pythonhosted.org/packages/f4/cf/c65a1f2419fa4b2085a53e91cef41569fde4910057c3709b8ab4303be1fd/claude_agent_sdk-0.2.159-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:87f553fda74e2f57e00f2bcb1705ab9311a937f97571f4f9eceea2bd411b6e32", size = 96294436, upload-time = "2026-09-23T20:26:45.117Z" },
-    { url = "https://files.pythonhosted.org/packages/f1/20/f01e211524f3d8edfe7c2ea26ac595d21afab443810cbedeca5c76f7ead0/claude_agent_sdk-0.2.159-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:b03683d12d217b0b6c189c88a3d260a045171e7fdc9f23e2d0dfb05ff3276834", size = 101405973, upload-time = "2026-09-23T20:26:48.799Z" },
-    { url = "https://files.pythonhosted.org/packages/bf/d5/de876f9b05c2a94c1d03222b6a5908b1d27f695cf862b237f04d92008d62/claude_agent_sdk-0.2.159-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:d3ba57c187b07c87702b94e2b62dd7c61ed874899defcbb35bb5cef4cb94ace1", size = 101764831, upload-time = "2026-09-23T20:26:53.25Z" },
-    { url = "https://files.pythonhosted.org/packages/5f/f2/b315c307a4199cb698a6b6f9e0e90cb8da4b0c8b3d00c68e9007c4a778d1/claude_agent_sdk-0.2.159-py3-none-win_amd64.whl", hash = "sha256:cc1b92ae56f42ade2d083ef2d2e5edb4aa8c7a6d856818a9b8f60cf6ae746f3a", size = 104353298, upload-time = "2026-09-23T20:26:57.913Z" },
+    { url = "https://files.pythonhosted.org/packages/8a/5c/f2b0b76306d58edec2386cbb9c11bad28dea2d9515372af05ae8aa20e7f6/claude_agent_sdk-0.2.153-py3-none-macosx_11_0_arm64.whl", hash = "sha256:a17ca13664b5e69d42ce93b71a892a4ed9b77ea9b4ff74f516b4b0c9752bdeb6", size = 90323861, upload-time = "2026-09-15T20:37:08.613Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/9b/a8c2e4e30a545d9e889cf8fadf70ba3dec44775a37dd682a06eaee8163d7/claude_agent_sdk-0.2.153-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:a7ac06b889e1334095d1393bc1cedfa6d10ed959f0883e342a79ae34394f5133", size = 94904735, upload-time = "2026-09-15T20:37:12.394Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/a7/48640baa6c534d8fd56e586f40bec7ebcca5b99a11822ea92ccefcc6cacb/claude_agent_sdk-0.2.153-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:a51ab955e48d4fa9db6bb655bf181540784f41326ad1d4c6d71011bed2efc4b9", size = 100303111, upload-time = "2026-09-15T20:37:16.217Z" },
+    { url = "https://files.pythonhosted.org/packages/19/1f/8e3bfef4fc1816b506c77c8649a9673a8af65bbab2f72133760192c44567/claude_agent_sdk-0.2.153-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:abbd961421f50e6d319c6530a1a04f5b37b1de0c69e0a2da2c39e951a1ca0e25", size = 100434307, upload-time = "2026-09-15T20:37:20.733Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/01/e334fe863209d115cf7b8e4e215ec2776ede609dbbd9c553653a8450ade3/claude_agent_sdk-0.2.153-py3-none-win_amd64.whl", hash = "sha256:7171fe0b6480c6c2c11627e49388d7c9cfb90406ec30771129e9f75760b971da", size = 103146887, upload-time = "2026-09-15T20:37:25.367Z" },
 ]
 
 [[package]]
@@ -1063,9 +1065,9 @@ version = "2026.6.3"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.11' and python_full_version < '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and sys_platform != 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.11' and python_full_version < '3.14' and sys_platform == 'win32'",
     "(python_full_version >= '3.11' and python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32') or (python_full_version == '3.11.*' and sys_platform == 'emscripten')",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/aa/2a/9618a122aeb2a169a28b03889a2995fe297588964333d4a7d67bdf46e147/rpds_py-2026.6.3.tar.gz", hash = "sha256:1cebd1337c242e4ec2293e541f712b2da849b29f48f0c293684b71c0632625d4", size = 64051, upload-time = "2026-06-30T07:17:53.009Z" }
