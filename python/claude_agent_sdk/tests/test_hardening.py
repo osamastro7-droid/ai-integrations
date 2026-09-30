@@ -15,11 +15,15 @@
 - ``FileSessionStore`` cut long file names (mixing transcripts) and missed other
   Workers' writes.
 - Two agents asking for live output failed with a message about Workflow Streams.
+- ``FileSessionStore`` appended after the half line a dying writer left, so the next
+  load failed; gave keys that differ only in characters it replaced one file; and
+  kept the entry ids of a failed write, so the SDK's retry skipped them.
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
 import gc
 import itertools
 import json
@@ -50,6 +54,7 @@ from temporalio.claude_agent_sdk import (
     ToolSpec,
     _defer_hook,
     _runner,
+    _session_store,
     activity_as_tool,
 )
 from temporalio.claude_agent_sdk.testing import ScriptedClaude
@@ -398,6 +403,148 @@ async def test_the_file_store_sees_another_workers_writes(tmp_path: Path) -> Non
     await two.append(key, [_entry("2")])
     await one.append(key, [_entry("2"), _entry("3")])  # "2" is already stored
     assert [e.get("uuid") for e in await one.load(key) or []] == ["1", "2", "3"]
+
+
+async def test_the_file_store_appends_after_a_half_written_line(
+    tmp_path: Path,
+) -> None:
+    store = FileSessionStore(tmp_path)
+    key = _key("project", "session")
+    await store.append(key, [_entry("1")])
+    (path,) = tmp_path.glob("*.jsonl")
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"type": "user", "uuid": "2", "message": {"conte')  # writer died
+    await store.append(key, [_entry("3")])
+    assert [e.get("uuid") for e in await store.load(key) or []] == ["1", "3"]
+    assert path.read_text(encoding="utf-8").endswith("}\n")  # the half line is gone
+
+
+class _DiskFillsUp:
+    """``os`` for the store module, except that a write stops after 10 bytes."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(os, name)
+
+    @staticmethod
+    def write(fd: int, data: bytes) -> int:
+        os.write(fd, bytes(data)[:10])
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+
+async def test_the_file_store_writes_a_failed_batch_when_it_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileSessionStore(tmp_path)
+    key = _key("project", "session")
+    await store.append(key, [_entry("1")])
+    with monkeypatch.context() as patch:
+        patch.setattr(_session_store, "os", _DiskFillsUp())
+        with pytest.raises(OSError):
+            await store.append(key, [_entry("2"), _entry("3")])
+    await store.append(key, [_entry("2"), _entry("3")])  # the SDK retries the batch
+    assert [e.get("uuid") for e in await store.load(key) or []] == ["1", "2", "3"]
+
+
+_DIE_IN_THE_MIDDLE_OF_AN_APPEND = """
+import asyncio, os, sys
+from temporalio.claude_agent_sdk import FileSessionStore, _session_store
+
+class DiesHalfway:
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    @staticmethod
+    def write(fd, data):
+        os.write(fd, bytes(data)[:10])
+        os._exit(3)  # the Worker process dies in the middle of the write
+
+_session_store.os = DiesHalfway()
+key = {"project_key": "project", "session_id": "session"}
+asyncio.run(FileSessionStore(sys.argv[1]).append(key, [{"type": "user", "uuid": "2"}]))
+"""
+
+
+async def test_the_file_store_recovers_from_a_worker_that_died_mid_append(
+    tmp_path: Path,
+) -> None:
+    store = FileSessionStore(tmp_path)
+    key = _key("project", "session")
+    await store.append(key, [_entry("1")])
+    died = subprocess.run(
+        [sys.executable, "-c", _DIE_IN_THE_MIDDLE_OF_AN_APPEND, str(tmp_path)],
+        timeout=60,
+    )
+    assert died.returncode == 3
+    await store.append(key, [_entry("3")])
+    assert [e.get("uuid") for e in await store.load(key) or []] == ["1", "3"]
+
+
+async def test_a_stuck_transcript_lock_holds_up_only_that_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileSessionStore(tmp_path)
+    stuck, other = _key("project", "stuck"), _key("project", "other")
+    monkeypatch.setattr(_session_store, "_LOCK_WAIT", 3.0)
+    with _session_store._locked(store._path(stuck)):  # a process stalled holding it
+        waiting = asyncio.create_task(store.append(stuck, [_entry("1")]))
+        await asyncio.sleep(0.2)  # that append now waits for the lock
+        await asyncio.wait_for(store.append(other, [_entry("2")]), timeout=2.0)
+        assert [e.get("uuid") for e in await store.load(other) or []] == ["2"]
+        with pytest.raises(OSError) as raised:
+            await waiting
+        assert not isinstance(raised.value, TimeoutError)  # so the SDK retries it
+    await store.append(stuck, [_entry("1")])  # the retry, once the lock is free
+    assert [e.get("uuid") for e in await store.load(stuck) or []] == ["1"]
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (  # the review's case: "/" and "_" became the same character
+            SessionKey(
+                project_key="p",
+                session_id="s",
+                subpath="subagents/workflows/run-1/agent-nested",
+            ),
+            SessionKey(
+                project_key="p",
+                session_id="s",
+                subpath="subagents/workflows_run-1/agent-nested",
+            ),
+        ),
+        (  # the "__" between the parts could belong to either part
+            SessionKey(project_key="a__b", session_id="c"),
+            SessionKey(project_key="a", session_id="b__c"),
+        ),
+        (  # a main transcript and a subagent transcript
+            SessionKey(project_key="p", session_id="s__x"),
+            SessionKey(project_key="p", session_id="s", subpath="x"),
+        ),
+        (  # letters outside ASCII became "_"
+            SessionKey(project_key="p", session_id="zażółć"),
+            SessionKey(project_key="p", session_id="za____"),
+        ),
+        (  # only the case differs: one file on macOS and Windows
+            SessionKey(project_key="p", session_id="Session"),
+            SessionKey(project_key="p", session_id="session"),
+        ),
+    ],
+    ids=[
+        "subpath-separator",
+        "part-separator",
+        "main-and-subagent",
+        "non-ascii",
+        "case",
+    ],
+)
+async def test_the_file_store_keeps_keys_apart_whatever_their_characters(
+    tmp_path: Path, first: SessionKey, second: SessionKey
+) -> None:
+    store = FileSessionStore(tmp_path)
+    await store.append(first, [_entry("1")])
+    await store.append(second, [_entry("2")])
+    assert [e.get("uuid") for e in await store.load(first) or []] == ["1"]
+    assert [e.get("uuid") for e in await store.load(second) or []] == ["2"]
 
 
 # ---- real engine: background tasks, and built-in tools after a cancel ----
