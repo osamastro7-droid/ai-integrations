@@ -9,8 +9,8 @@ from typing import Any, Protocol
 from temporalio import activity
 
 from ._events import emit, publishing
-from ._models import SegmentInput, SegmentOutput
-from ._workflow import SEGMENT_ACTIVITY_NAME
+from ._models import SegmentInput, SegmentOutput, ToolOutcome, ToolStepInput
+from ._workflow import SEGMENT_ACTIVITY_NAME, TOOL_STEP_ACTIVITY_NAME
 
 
 class SegmentRunner(Protocol):
@@ -80,3 +80,38 @@ def make_segment_activity(
             beater.cancel()
 
     return run_claude_segment
+
+
+def make_tool_step_activity(
+    runner: Any, *, heartbeat_every: float = 5.0
+) -> Callable[..., Any]:
+    """Build the tool step Activity around a runner that has ``run_tool_step``.
+
+    Args:
+        runner: Runs the tool step (``ClaudeAgentSdkRunner``, ``ScriptedClaude``).
+        heartbeat_every: Seconds between heartbeats while the step runs (more often
+            when the step's heartbeat timeout needs it: at least three per timeout).
+
+    Returns:
+        The Activity function, named ``run_claude_tool_step``.
+    """
+
+    @activity.defn(name=TOOL_STEP_ACTIVITY_NAME)
+    async def run_claude_tool_step(step: ToolStepInput) -> ToolOutcome:
+        info = activity.info()
+        every = heartbeat_every
+        if info.heartbeat_timeout:
+            every = min(every, info.heartbeat_timeout.total_seconds() / 3)
+
+        async def beat() -> None:
+            while True:
+                activity.heartbeat(step.call.id)
+                await asyncio.sleep(every)
+
+        beater = asyncio.create_task(beat())
+        try:
+            return await runner.run_tool_step(step, info.attempt)
+        finally:
+            beater.cancel()
+
+    return run_claude_tool_step

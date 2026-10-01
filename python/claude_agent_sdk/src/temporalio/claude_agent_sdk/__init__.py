@@ -9,7 +9,11 @@ Worker side: :class:`ClaudeAgentPlugin` with :class:`ClaudeAgentSdkRunner` (or t
 scripted runner in :mod:`temporalio.claude_agent_sdk.testing` for tests).
 """
 
-from temporalio.claude_agent_sdk._activity import SegmentRunner, make_segment_activity
+from temporalio.claude_agent_sdk._activity import (
+    SegmentRunner,
+    make_segment_activity,
+    make_tool_step_activity,
+)
 from temporalio.claude_agent_sdk._events import follow_agent
 from temporalio.claude_agent_sdk._models import (
     AgentState,
@@ -20,12 +24,14 @@ from temporalio.claude_agent_sdk._models import (
     SegmentOutput,
     ToolOutcome,
     ToolSpec,
+    ToolStepInput,
 )
 from temporalio.claude_agent_sdk._plugin import ClaudeAgentPlugin
 from temporalio.claude_agent_sdk._runner import ClaudeAgentSdkRunner
 from temporalio.claude_agent_sdk._session_store import FileSessionStore
 from temporalio.claude_agent_sdk._workflow import (
     SEGMENT_ACTIVITY_NAME,
+    TOOL_STEP_ACTIVITY_NAME,
     DurableClaudeAgent,
     DurableTool,
     activity_as_tool,
@@ -35,6 +41,7 @@ from . import testing
 
 __all__ = [
     "SEGMENT_ACTIVITY_NAME",
+    "TOOL_STEP_ACTIVITY_NAME",
     "AgentState",
     "ClaudeAgentPlugin",
     "ClaudeAgentSdkRunner",
@@ -49,8 +56,10 @@ __all__ = [
     "SegmentRunner",
     "ToolOutcome",
     "ToolSpec",
+    "ToolStepInput",
     "activity_as_tool",
     "follow_agent",
     "make_segment_activity",
+    "make_tool_step_activity",
     "testing",
 ]

@@ -7,16 +7,19 @@ from typing import Any
 
 from temporalio.plugin import SimplePlugin
 
-from ._activity import SegmentRunner, make_segment_activity
+from ._activity import SegmentRunner, make_segment_activity, make_tool_step_activity
 
 
 class ClaudeAgentPlugin(SimplePlugin):
-    """Registers the segment Activity that runs Claude on the Worker.
+    """Registers the Activities that run Claude on the Worker.
+
+    ``run_claude_segment`` runs the model, and ``run_claude_tool_step`` (for runners
+    that have ``run_tool_step``) runs one Claude Code tool call as its own Activity.
 
     Example:
         .. code-block:: python
 
-            runner = ClaudeAgentSdkRunner(session_store=FileSessionStore("/shared/sessions"))
+            runner = ClaudeAgentSdkRunner(cwd="/srv/agent")
             worker = Worker(
                 client,
                 task_queue="agents",
@@ -33,11 +36,14 @@ class ClaudeAgentPlugin(SimplePlugin):
             runner: Runs each model segment, for example ``ClaudeAgentSdkRunner``.
             heartbeat_every: Seconds between heartbeats while a segment runs.
         """
-        segment_activity = make_segment_activity(
-            runner, heartbeat_every=heartbeat_every
-        )
+        added = [make_segment_activity(runner, heartbeat_every=heartbeat_every)]
+        if callable(getattr(runner, "run_tool_step", None)):
+            # Claude Code tools that run as their own Activities.
+            added.append(
+                make_tool_step_activity(runner, heartbeat_every=heartbeat_every)
+            )
 
         def activities(existing: Sequence[Any] | None) -> list[Any]:
-            return [*(existing or []), segment_activity]
+            return [*(existing or []), *added]
 
         super().__init__("ClaudeAgentPlugin", activities=activities)

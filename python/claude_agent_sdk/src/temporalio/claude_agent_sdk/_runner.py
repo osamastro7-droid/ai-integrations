@@ -55,6 +55,7 @@ import asyncio
 import copy
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -85,11 +86,20 @@ from claude_agent_sdk import (
     tool,
 )
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from ._conversation import external_storage_on, read_conversation, too_large
-from ._defer_hook import STOPPED
+from ._defer_hook import STEP_ONLY, STOPPED
 from ._events import emit
-from ._models import DeferredCall, SegmentInput, SegmentOutput, ToolOutcome, ToolSpec
+from ._models import (
+    DeferredCall,
+    SegmentInput,
+    SegmentOutput,
+    ToolOutcome,
+    ToolSpec,
+    ToolStepInput,
+)
+from ._stand_in import StandInModel
 
 ENV_AUTH = (
     "ANTHROPIC_API_KEY",
@@ -123,6 +133,25 @@ MIN_BUFFER_BYTES = 64 * 1024 * 1024
 The engine echoes each delivered tool result as one JSON line, so a result over the
 SDK's default could never reach Claude.
 """
+
+STEP_PROVIDER_ENV = {
+    "ANTHROPIC_API_KEY": "tool-step-stand-in",
+    "ANTHROPIC_AUTH_TOKEN": "",
+    "CLAUDE_CODE_OAUTH_TOKEN": "",
+    "ANTHROPIC_UNIX_SOCKET": "",
+    "CLAUDE_CODE_API_BASE_URL": "",
+    "CLAUDE_CODE_USE_BEDROCK": "",
+    "CLAUDE_CODE_USE_VERTEX": "",
+    "CLAUDE_CODE_USE_FOUNDRY": "",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS": "",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD": "",
+    "CLAUDE_CODE_USE_MANTLE": "",
+    "CLAUDE_CODE_USE_GATEWAY": "",
+}
+"""A tool step talks to the local stand-in model only, whatever provider the Worker uses."""
+
+SAVED_OUTPUT_TAIL = 4096
+"""Bytes of the end of an output Claude Code saved to a file, added to the preview."""
 
 ENGINE_ENV = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
 """Set for every engine run. With background tasks (for example a subagent running in
@@ -480,7 +509,7 @@ def _deliver(
             outcome = results.get(str(block.get("tool_use_id")))
             if block.get("type") != "tool_result" or outcome is None:
                 continue
-            block["content"] = _text(outcome.content)
+            block["content"] = _result_content(outcome)
             if outcome.is_error:
                 block["is_error"] = True
             else:
@@ -610,6 +639,21 @@ def _hook_entry() -> dict[str, Any]:
     return {"type": "command", "command": sys.executable, "args": [str(hook)]}
 
 
+def _hook_folder() -> str:
+    """A new folder with the settings file that registers the hook for every tool."""
+    hook_dir = tempfile.mkdtemp(prefix="tca-hook-")
+    settings = {
+        "hooks": {
+            "PreToolUse": [
+                # Every tool: built-in calls after a pause are denied too.
+                {"matcher": ".*", "hooks": [_hook_entry()]}
+            ]
+        }
+    }
+    Path(hook_dir, "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+    return hook_dir
+
+
 async def _stop_hooks_when_cancelled(hook_dir: str) -> None:
     """Once the segment Activity is cancelled (or timed out), the hook denies every call.
 
@@ -646,6 +690,33 @@ def _as_outcome(value: Any) -> ToolOutcome:
     return ToolOutcome(
         content=value.get("content"), is_error=bool(value.get("is_error"))
     )
+
+
+_SAVED_OUTPUT = re.compile(r"Full output saved to: (.+?)\r?\n")
+"""Where Claude Code names the file it saved a large output to, in its preview."""
+
+
+def _saved_output_tail(content: Any) -> str | None:
+    """The end of an output Claude Code saved to a file, if it did.
+
+    Read it while the engine runs: the file is in the engine's temporary folder.
+    """
+    found = _SAVED_OUTPUT.search(content) if isinstance(content, str) else None
+    path = found.group(1).strip() if found else None
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - SAVED_OUTPUT_TAIL))
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _result_content(outcome: ToolOutcome) -> Any:
+    """A tool result's content for Claude: content blocks as they are, else text."""
+    return outcome.blocks if outcome.blocks is not None else _text(outcome.content)
 
 
 def _text(content: Any) -> str:
@@ -721,6 +792,7 @@ class ClaudeAgentSdkRunner:
         self._max_budget = max_budget_usd
         self.stub_calls = 0
         """Durable tools the engine ran itself. Stays 0 while the engine honors defer."""
+        self._stand_in = StandInModel()
         self._versions: dict[str, str | None] = {}
 
         def is_set(name: str) -> bool:
@@ -997,6 +1069,147 @@ class ClaudeAgentSdkRunner:
             if not resume:
                 self._forget_local_copy(session_id)
 
+    async def run_tool_step(self, step: ToolStepInput, attempt: int) -> ToolOutcome:
+        """Run one Claude Code tool call that paused a segment, as its own Activity.
+
+        Claude Code resumes a copy of the session that ends where it paused at the
+        call (in memory: a session store is not written), and the hook lets it run
+        exactly that call. Afterwards the engine asks the model to go on; a local
+        stand-in answers, so no real model call is made. Tested on Claude Code
+        2.1.273 and 2.1.287: the tool runs once, with the engine's own result.
+
+        Args:
+            step: The call, and where its session paused.
+            attempt: The Activity attempt number.
+
+        Returns:
+            What the tool returned, as Claude Code would show it to Claude.
+
+        Raises:
+            ApplicationError: If the session did not pause at this call, or the
+                engine did not run it (not retried: Claude sees the error).
+            RuntimeError: If the Workflow did not serve its conversation (retried).
+        """
+        del attempt
+        call = step.call
+        key = {
+            "project_key": project_key_for_directory(self._cwd),
+            "session_id": step.session_id,
+        }
+        if self._store is None:
+            entries = await read_conversation(step)
+        else:
+            entries = cast("list[Any]", await self._store.load(key) or [])
+        seed = _seed(entries, step.checkpoint)
+        if seed is None or not any(_marker_of(e) == call.id for e in seed):
+            raise ApplicationError(
+                f"Session {step.session_id} did not pause at tool call {call.id} "
+                f"({call.name}), so the call cannot run.",
+                non_retryable=True,
+            )
+        store = InMemorySessionStore()
+        await store.append(key, seed)  # type: ignore[arg-type]
+        hook_dir = _hook_folder()
+        inp = SegmentInput(
+            session_id=step.session_id,
+            prompt=None,
+            tools=step.tools,
+            builtin_tools=step.builtin_tools,
+            checkpoint=step.checkpoint,
+        )
+        options = self._engine_options(
+            inp,
+            {},
+            step.session_id,
+            True,
+            store,
+            None,
+            hook_dir,
+            self._durable_server(step.tools, []),
+        )
+        env = options["env"]
+        no_proxy = ",".join(
+            p
+            for p in (env.get("NO_PROXY") or os.environ.get("NO_PROXY"), "127.0.0.1")
+            if p
+        )
+        options["env"] = {
+            **env,
+            **STEP_PROVIDER_ENV,
+            "ANTHROPIC_BASE_URL": self._stand_in.base_url,
+            "NO_PROXY": no_proxy,
+            "no_proxy": no_proxy,
+            "TCA_ALLOW_ID": call.id,
+        }
+        result: ToolResultBlock | None = None
+        saved: str | None = None
+        stopper = (
+            asyncio.ensure_future(_stop_hooks_when_cancelled(hook_dir))
+            if activity.in_activity()
+            else None
+        )
+        try:
+            async for message in query(
+                prompt="", options=ClaudeAgentOptions(**options)
+            ):
+                if not isinstance(message, UserMessage) or isinstance(
+                    message.content, str
+                ):
+                    continue
+                for block in message.content:
+                    if (
+                        isinstance(block, ToolResultBlock)
+                        and block.tool_use_id == call.id
+                    ):
+                        result = block
+                        # The engine's temporary folder still exists: read the end
+                        # of an output it saved to a file before the folder goes.
+                        saved = _saved_output_tail(block.content)
+        finally:
+            if stopper is not None:
+                stopper.cancel()
+            shutil.rmtree(hook_dir, ignore_errors=True)
+        text = _text(result.content) if result is not None else ""
+        if result is None or STOPPED in text or STEP_ONLY in text:
+            raise ApplicationError(
+                f"Claude Code did not run tool call {call.id} ({call.name}) in its "
+                f"step: {text or 'no result'}",
+                non_retryable=True,
+            )
+        is_error = bool(result.is_error)
+        if isinstance(result.content, list):
+            return ToolOutcome(blocks=list(result.content), is_error=is_error)
+        if saved is not None:
+            text += (
+                "\n\nThe file named above was removed when the step that ran this "
+                f"call ended. The output ends with:\n{saved}"
+            )
+        return ToolOutcome(content=text, is_error=is_error)
+
+    def _durable_server(self, tools: list[ToolSpec], ran_inside: list[str]) -> Any:
+        """The durable tools as SDK MCP tools.
+
+        The engine never runs them while the hook defers; if it does, the call is
+        recorded in ``ran_inside``.
+        """
+
+        def make_stub(spec: ToolSpec) -> Any:
+            @tool(spec.name, spec.description, spec.input_schema)
+            async def stub(args: dict[str, Any]) -> dict[str, Any]:
+                del args
+                self.stub_calls += 1  # never happens while the hook defers
+                ran_inside.append(spec.name)
+                return {
+                    "content": [
+                        {"type": "text", "text": "This tool must run through Temporal."}
+                    ],
+                    "is_error": True,
+                }
+
+            return stub
+
+        return create_sdk_mcp_server(SERVER, tools=[make_stub(t) for t in tools])
+
     def _forget_local_copy(self, session_id: str) -> None:
         """Remove the engine's own copy of a new session from its config folder.
 
@@ -1054,41 +1267,7 @@ class ClaudeAgentSdkRunner:
         """
         # Durable tools the engine ran itself (must stay empty).
         ran_inside: list[str] = []
-
-        def make_stub(spec: ToolSpec) -> Any:
-            @tool(spec.name, spec.description, spec.input_schema)
-            async def stub(args: dict[str, Any]) -> dict[str, Any]:
-                del args
-                self.stub_calls += 1  # never happens while the hook defers
-                ran_inside.append(spec.name)
-                return {
-                    "content": [
-                        {"type": "text", "text": "This tool must run through Temporal."}
-                    ],
-                    "is_error": True,
-                }
-
-            return stub
-
-        hook_dir = tempfile.mkdtemp(prefix="tca-hook-")
-        settings_file = Path(hook_dir) / "settings.json"
-        settings_file.write_text(
-            json.dumps(
-                {
-                    "hooks": {
-                        "PreToolUse": [
-                            {
-                                # Every tool: built-in calls after a pause are denied too.
-                                "matcher": ".*",
-                                "hooks": [_hook_entry()],
-                            }
-                        ]
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-
+        hook_dir = _hook_folder()
         options = self._engine_options(
             inp,
             injected,
@@ -1097,7 +1276,7 @@ class ClaudeAgentSdkRunner:
             store,
             guard,
             hook_dir,
-            create_sdk_mcp_server(SERVER, tools=[make_stub(t) for t in inp.tools]),
+            self._durable_server(inp.tools, ran_inside),
         )
         prompt: Any
         in_message = {k: v for k, v in injected.items() if k not in (delivered or ())}
@@ -1223,11 +1402,14 @@ class ClaudeAgentSdkRunner:
             resumed_at,
         )
         if deferred is not None:
-            name = deferred.name.removeprefix(PREFIX)
             out = SegmentOutput(
                 session_id=sid,
                 deferred=DeferredCall(
-                    id=deferred.id, name=name, input=dict(deferred.input)
+                    id=deferred.id,
+                    name=deferred.name.removeprefix(PREFIX),
+                    input=dict(deferred.input),
+                    # A Claude Code tool that runs as its own Activity (a tool step).
+                    kind="durable" if deferred.name.startswith(PREFIX) else "engine",
                 ),
                 checkpoint=checkpoint,
                 cost_usd=cost,
@@ -1279,7 +1461,7 @@ class ClaudeAgentSdkRunner:
             )
             system_prompt = "\n\n".join(p for p in (base, hint) if p) or None
         durable_names = [PREFIX + t.name for t in inp.tools]
-        payload = sum(len(_text(o.content)) for o in injected.values())
+        payload = sum(len(_text(_result_content(o))) for o in injected.values())
         payload += len(inp.prompt or "")
         options: dict[str, Any] = {
             "system_prompt": system_prompt,
@@ -1312,6 +1494,7 @@ class ClaudeAgentSdkRunner:
                 **ENGINE_ENV,
                 "TCA_HOOK_DIR": hook_dir,
                 "TCA_ANSWERED_IDS": " ".join(injected),
+                "TCA_TOOL_ACTIVITIES": "\n".join(inp.tool_activities),
             },
             "cli_path": self._cli_path,
             "permission_mode": DEFAULT_PERMISSION_MODE,  # extra_options may change it
@@ -1377,7 +1560,7 @@ class ClaudeAgentSdkRunner:
             {
                 "type": "tool_result",
                 "tool_use_id": tid,
-                "content": _text(o.content),
+                "content": _result_content(o),
                 "is_error": o.is_error,
             }
             for tid, o in injected.items()

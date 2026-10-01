@@ -17,7 +17,7 @@ from typing import Any
 
 from temporalio import activity
 
-from ._models import ConversationPage, SegmentInput, SegmentOutput
+from ._models import ConversationPage, SegmentInput, SegmentOutput, ToolStepInput
 
 QUERY = "__temporal_claude_agent_transcript"
 """The Workflow Query that returns the conversation, a page at a time."""
@@ -72,11 +72,13 @@ def page(
     return ConversationPage(entries=entries[start:end], total=len(entries))
 
 
-async def read_conversation(inp: SegmentInput) -> list[dict[str, Any]]:
-    """The committed conversation a segment continues: inline, or read from the Workflow.
+async def read_conversation(
+    inp: SegmentInput | ToolStepInput,
+) -> list[dict[str, Any]]:
+    """The committed conversation a step continues: inline, or read from the Workflow.
 
     Args:
-        inp: The segment input.
+        inp: The segment (or tool step) input.
 
     Returns:
         The transcript entries, oldest first (empty for a new conversation).

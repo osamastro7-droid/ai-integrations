@@ -5,6 +5,7 @@
 Temporal integration for Anthropic's [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview), published as [`temporalio-claude-agent-sdk`](https://pypi.org/project/temporalio-claude-agent-sdk/) and imported as `temporalio.claude_agent_sdk`.
 
 - **Every durable tool call Claude makes is its own Temporal Activity.** Finished calls never run again after a crash, retries follow your retry policy, and the Activity ID (`tool-<tool_use_id>`) doubles as an idempotency key for the systems a tool touches. When Claude calls several tools in one message, they run at once.
+- **Claude Code's own side effects too.** Bash commands and MCP tools run as their own Activities by default, like durable tools: a step that runs again never runs a command again.
 - **Tools can wait for a human.** Mark a tool `needs_approval=True` and the agent waits, for minutes or weeks, until someone approves or rejects the call.
 - **Crashes resume cleanly, on any Worker.** The conversation lives in the Workflow, like any other Workflow state: Workers share nothing but the Temporal server. Each model step ends at a checkpoint that Temporal records, and a step that runs again (after a crash, a timeout, or on another machine) starts from what the Workflow committed, so nothing a failed attempt added reaches Claude.
 
@@ -95,6 +96,28 @@ Pass the plugin to the Worker, or to the Client the Worker is built from, not bo
 Other [`ClaudeAgentOptions`](https://code.claude.com/docs/en/agent-sdk/python) go in the runner's `extra_options` (for example `permission_mode`, `agents`, `hooks`, `setting_sources`, `thinking`). `env`, `mcp_servers` and `allowed_tools` are merged with the plugin's own, and `system_prompt` (a string, or a preset such as Claude Code's own prompt) is the default for agents that set none. Options the agent or the plugin sets (`model`, `tools`, `max_turns`, `cwd`, `settings`, session and resume options, and the same engine flags in `extra_args`) are refused. The runner sets `permission_mode="default"` unless you pass one: since Claude Code 2.1.285, a run without one uses auto mode when telemetry is off or the provider is Bedrock, Vertex or Foundry, and auto mode asks the model whether each tool call may run. External MCP servers run inside the segment, like built-in tools, and hooks from settings you load must not decide on the plugin's `mcp__durable__` tools.
 
 `approvers` checks the name the caller passes. It is not authentication: control who may send Updates with Temporal's own access control.
+
+## Claude Code's own tools
+
+Claude Code's built-in tools are off unless you enable them with `builtin_tools`. Those that change things outside the conversation run as their own Activities, like durable tools: `tool_activities` (by default `("Bash", "mcp__*")`: Bash, and the tools of MCP servers you give the runner in `extra_options`).
+
+```python
+self.agent = DurableClaudeAgent(
+    builtin_tools=["Bash", "Read", "Grep"],
+    tool_approvals=["Bash"],  # a human approves each command first
+    tool_activity_retry_policy=RetryPolicy(maximum_attempts=1),
+)
+```
+
+- Each call is an Activity `run_claude_tool_step` with ID `tool-<tool_use_id>`, so a step that runs again (after a crash or a timeout) never runs the command again. Tested: the model call after a command hangs past the step's timeout; as its own Activity the command ran once, inside the segment it ran twice.
+- The Activity resumes Claude Code at the call and runs exactly that call, so Claude gets Claude Code's own result. Afterwards the engine asks the model to go on; a stand-in on the Worker (on 127.0.0.1) answers instead, so a tool call costs no model call, whatever provider the Worker uses (tested with Bedrock configured). About 1.4 seconds per call (measured on Linux with Claude Code 2.1.273).
+- `tool_approvals` makes calls wait for a decision, like `needs_approval` (`pending_approvals()` shows the command). A rejected command never runs.
+- A command that fails is a result for Claude, not a failed Activity. The Activity fails, and Temporal retries it with `tool_activity_retry_policy`, only when the step itself breaks (a Worker dies while the command runs, a timeout), so the command can run again then; `maximum_attempts=1` gives "at most once".
+- Output over about 30 KB: Claude Code shows Claude a preview and saves the rest to a file in its temporary folder, which the step removes. Claude also gets the last 4 KB.
+- Several calls in one message: a Bash call that pauses the segment runs beside the durable calls after it. A Bash call after a durable call keeps its denial, and Claude calls it again.
+- Commands run on the disk of the Worker that runs the tool step, in the runner's `cwd`. Give Workers the same files (a shared disk), or one Worker per agent.
+- File tools (`Read`, `Edit`, `Write`, ...) stay in the segment: Claude Code checks an edit against what it read in the same session, and re-checks a deferred edit on resume (tested), so they cannot be split off. So do tools that call the model themselves (`WebFetch`) and subagents (`Agent`). Inside the segment, a tool can run again when the segment runs again: give such tools work that is safe to repeat.
+- `PowerShell` uses the same path as Bash (not tested here); MCP tool names take patterns, such as `mcp__github__*`. `tool_activities=()` runs everything inside the segment.
 
 ## Where the conversation lives
 
@@ -193,7 +216,7 @@ The agent loop runs in *segments*. A segment is one Activity that runs the Claud
 
 1. Durable tools are declared to Claude as SDK MCP tools.
 2. A `PreToolUse` command hook answers `defer` whenever Claude calls one ([documented in the hooks guide](https://code.claude.com/docs/en/hooks)). The engine stops with `stop_reason: "tool_deferred"`, and the segment returns the call.
-3. The Workflow runs the call as its own Activity, after an approval if the tool needs one.
+3. The Workflow runs the call as its own Activity, after an approval if the tool needs one. A Claude Code tool in `tool_activities` pauses the segment the same way, and runs in a tool step (see [Claude Code's own tools](#claude-codes-own-tools)).
 4. The next segment resumes the session with the result as a normal `tool_result` message.
 
 **Several calls in one message.** The engine keeps one paused call per run, so the hook defers the first durable call of a message and denies the calls after it. The segment reports the denied durable calls, and the Workflow runs them with the paused one, at once, each its own Activity with its own approval. The next segment moves their denials before the point where the engine resumes and puts the real results in them, so Claude sees each call with its result, and the paused call's result arrives as usual. A built-in call after the paused one keeps its denial, and Claude calls it again. Tested on Claude Code 2.1.273 and 2.1.287, with the conversation in the Workflow and in a session store: three durable calls in one message, durable and built-in calls mixed, two such messages in a row, a step that runs again, and Continue-As-New while the results wait.
@@ -211,9 +234,9 @@ Tested on the real engine, both ways: a Worker killed while Claude is answering,
 
 - **Claude Code 2.1.273 or newer.** Tested: when Claude calls two tools in one message, Claude Code 2.1.259 replaces the paused call's result with `[Tool result missing due to internal error]`, so Claude asks for the same tool again. The runner checks `claude -v` before starting the engine and refuses older engines.
 - **Built-in calls after a durable call wait.** In a message with several calls, a built-in call after the first durable call is denied and called again by Claude in its next turn (durable calls all run; see [How it works](#how-it-works)). `ClaudeAgentSdkRunner(one_tool_at_a_time=True)` asks Claude for one call per message instead.
-- **Claude Code's built-in tools** (Bash, Edit, and so on) are off unless you pass `builtin_tools`. When enabled, they run inside the segment Activity, not as their own Activities, on the Worker's disk in the runner's `cwd` (shared by every agent on that Worker). They can run again when a segment runs again, possibly on another Worker with a different disk, and files a failed attempt wrote are not rolled back. Give them work that is safe to repeat, or make the work a durable tool.
+- **Claude Code's tools that stay in the segment** (file tools, `WebFetch`, subagents, and any tool not in `tool_activities`) run on the Worker's disk in the runner's `cwd` (shared by every agent on that Worker). They can run again when a segment runs again, possibly on another Worker with a different disk, and files a failed attempt wrote are not rolled back. See [Claude Code's own tools](#claude-codes-own-tools).
 - **Each step reads the whole conversation** (with the Query, or from a session store), so reading grows with the conversation's length. Compaction does not shrink it: Claude Code keeps the entries from before a compaction, and resuming uses some of them (a preserved segment of recent messages; tested with `/compact`), so the plugin keeps them all.
-- **Subagents run in the foreground, without durable tools.** The runner turns off Claude Code's background tasks (a background subagent kept the engine working after it paused). A subagent (Claude Code's `Agent` tool) can use built-in tools; a durable tool call from a subagent cannot pause the run, so the step fails closed.
+- **Subagents run in the foreground, without durable tools.** The runner turns off Claude Code's background tasks (a background subagent kept the engine working after it paused). A subagent (Claude Code's `Agent` tool) can use Claude Code's tools, inside the segment; it cannot pause the run, so a durable tool call from a subagent is denied with a hint to leave it to the main agent, which can then call it (tested).
 - **Long conversations.** Continue-As-New keeps the Workflow's history small, but what Claude reads grows until Claude Code compacts it. A request the model refuses as too long fails the task.
 - **Logins that survive resumes.** Use `ANTHROPIC_API_KEY`, Amazon Bedrock, Google Vertex AI, Microsoft Foundry, or `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. Every step after the first resumes the session, and a Claude app login cannot refresh itself there.
 
@@ -225,7 +248,7 @@ Tested on the real engine, both ways: a Worker killed while Claude is answering,
 
 ## Testing your agents
 
-`temporalio.claude_agent_sdk.testing.ScriptedClaude` is a segment runner that plays Claude with a Python policy. It needs no engine and no API key. Like the real runner, it keeps the conversation in the Workflow, so tests can kill a Worker and continue on a new one (give it a folder to keep sessions there instead, like a session store), and its checkpoints behave like the real runner's: a segment that runs again decides again, with a new tool call id.
+`temporalio.claude_agent_sdk.testing.ScriptedClaude` is a segment runner that plays Claude with a Python policy. It needs no engine and no API key. Like the real runner, it keeps the conversation in the Workflow, so tests can kill a Worker and continue on a new one (give it a folder to keep sessions there instead, like a session store), and its checkpoints behave like the real runner's: a segment that runs again decides again, with a new tool call id. A policy can return several calls (one message), and `engine_tools` plays Claude Code tools such as Bash in tool steps.
 
 ## Documentation
 

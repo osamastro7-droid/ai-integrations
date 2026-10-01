@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import inspect
 import re
 from collections.abc import Callable, Sequence
@@ -26,10 +27,14 @@ from ._models import (
     SegmentOutput,
     ToolOutcome,
     ToolSpec,
+    ToolStepInput,
 )
 
 SEGMENT_ACTIVITY_NAME = "run_claude_segment"
 """Name of the Activity that runs one model segment."""
+
+TOOL_STEP_ACTIVITY_NAME = "run_claude_tool_step"
+"""Name of the Activity that runs one Claude Code tool call (a tool step)."""
 
 _OPEN_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": True}
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,50}")
@@ -43,6 +48,33 @@ def _is_cancellation(err: BaseException) -> bool:
     if isinstance(err, asyncio.CancelledError):
         return True
     return isinstance(err, ActivityError) and isinstance(err.cause, CancelledError)
+
+
+_ENGINE_ACTIVITY_TOOLS = ("Bash", "PowerShell")
+"""Claude Code built-in tools that can run as their own Activities (and MCP tools)."""
+
+
+def _check_tool_activities(patterns: Sequence[str], approvals: Sequence[str]) -> None:
+    """Refuse Claude Code tools that cannot run as their own Activities.
+
+    A tool step answers the engine's model calls with a stand-in, and Claude Code
+    re-checks file edits against what it read in its own step (tested: a deferred Edit
+    is refused on resume), so file tools, tools that call the model themselves (such
+    as WebFetch) and subagents stay in the segment.
+    """
+    for pattern in patterns:
+        if pattern not in _ENGINE_ACTIVITY_TOOLS and not pattern.startswith("mcp__"):
+            raise ValueError(
+                f"tool_activities: {pattern!r} cannot run as its own Activity. Use "
+                "'Bash', 'PowerShell', or MCP tool names ('mcp__<server>__<tool>', "
+                "patterns allowed); other Claude Code tools stay in the segment."
+            )
+    for pattern in approvals:
+        if not any(fnmatch.fnmatchcase(pattern, p) for p in patterns):
+            raise ValueError(
+                f"tool_approvals: {pattern!r} does not run as its own Activity, so it "
+                "could not wait for a decision. Add it to tool_activities."
+            )
 
 
 def _check_tool_name(name: str) -> None:
@@ -229,6 +261,10 @@ class DurableClaudeAgent:
         model: str | None = None,
         max_turns: int | None = None,
         builtin_tools: Sequence[str] = (),
+        tool_activities: Sequence[str] = ("Bash", "mcp__*"),
+        tool_approvals: Sequence[str] = (),
+        tool_activity_timeout: timedelta = timedelta(minutes=10),
+        tool_activity_retry_policy: RetryPolicy | None = None,
         segment_timeout: timedelta = timedelta(minutes=10),
         segment_heartbeat_timeout: timedelta | None = timedelta(seconds=30),
         segment_retry_policy: RetryPolicy | None = None,
@@ -254,7 +290,18 @@ class DurableClaudeAgent:
             model: Optional model name.
             max_turns: Optional cap on engine turns within one segment.
             builtin_tools: Claude Code built-in tools to enable inside the engine.
-                They run inside the segment Activity, not as their own Activities.
+                Those in ``tool_activities`` run as their own Activities; the others
+                run inside the segment Activity.
+            tool_activities: Claude Code tools that run as their own Activities, like
+                durable tools: ``Bash``, ``PowerShell``, and MCP tools (name patterns
+                such as ``mcp__github__*``). Each call is an Activity
+                ``run_claude_tool_step`` with ID ``tool-<tool_use_id>``. Calls from a
+                subagent run inside the segment.
+            tool_approvals: Patterns of ``tool_activities`` whose calls wait for a
+                human decision first, like ``needs_approval`` tools.
+            tool_activity_timeout: Timeout of each attempt of such a call.
+            tool_activity_retry_policy: Retry policy of such a call (a failing command
+                is a result for Claude, not a failed Activity).
             segment_timeout: Timeout of each model segment attempt.
             segment_heartbeat_timeout: Heartbeat timeout of each segment attempt.
                 It also bounds how late a cancel reaches a running segment: the
@@ -308,6 +355,11 @@ class DurableClaudeAgent:
         self._model = model
         self._max_turns = max_turns
         self._builtin_tools = list(builtin_tools)
+        _check_tool_activities(tool_activities, tool_approvals)
+        self._tool_activities = list(tool_activities)
+        self._tool_approvals = list(tool_approvals)
+        self._tool_activity_timeout = tool_activity_timeout
+        self._tool_activity_retry_policy = tool_activity_retry_policy
         self._segment_timeout = segment_timeout
         self._segment_heartbeat_timeout = segment_heartbeat_timeout
         self._segment_retry_policy = segment_retry_policy
@@ -652,6 +704,7 @@ class DurableClaudeAgent:
                         model=self._model,
                         max_turns=self._max_turns,
                         builtin_tools=self._builtin_tools,
+                        tool_activities=self._tool_activities,
                         checkpoint=state.checkpoint,
                         injected=dict(state.pending),
                         segment_index=index,
@@ -828,6 +881,20 @@ class DurableClaudeAgent:
         if self._stream is not None:
             self._topic.publish(cap_event({**event, "at": workflow.now().isoformat()}))
 
+    def _tool_step(self, call: DeferredCall) -> ToolStepInput:
+        """What the tool step needs: the call, and where its session paused."""
+        state = self._state
+        return ToolStepInput(
+            session_id=state.session_id or "",
+            checkpoint=state.checkpoint or "",
+            call=call,
+            tools=[t.spec() for t in self._tools.values()],
+            builtin_tools=self._builtin_tools,
+            conversation=ConversationRef(
+                query=QUERY, agent=self._key or "", entries=len(state.transcript)
+            ),
+        )
+
     async def _run_tools(self, calls: list[DeferredCall]) -> list[ToolOutcome]:
         """Run the calls at once, each its own Activity; return their outcomes in order.
 
@@ -870,11 +937,18 @@ class DurableClaudeAgent:
     async def _execute_tool(
         self, call: DeferredCall, record: dict[str, Any]
     ) -> ToolOutcome:
-        tool = self._tools.get(call.name)
-        if tool is None:
+        engine = call.kind == "engine"
+        tool = None if engine else self._tools.get(call.name)
+        if not engine and tool is None:
             record["status"] = "unknown tool"
             return ToolOutcome(content=f"Unknown tool: {call.name}", is_error=True)
-        if tool.needs_approval:
+        if engine:
+            needs_approval = any(
+                fnmatch.fnmatchcase(call.name, p) for p in self._tool_approvals
+            )
+        else:
+            needs_approval = tool is not None and tool.needs_approval
+        if needs_approval:
             self._waiting[call.id] = call
             record["status"] = "waiting for approval"
             self._publish(
@@ -897,6 +971,20 @@ class DurableClaudeAgent:
                 )
             record["status"] = "started"
         try:
+            if tool is None:  # a Claude Code tool: its own Activity, a tool step
+                outcome: ToolOutcome = await workflow.execute_activity(
+                    TOOL_STEP_ACTIVITY_NAME,
+                    self._tool_step(call),
+                    result_type=ToolOutcome,
+                    activity_id=f"tool-{call.id}",
+                    start_to_close_timeout=self._tool_activity_timeout,
+                    heartbeat_timeout=self._segment_heartbeat_timeout,
+                    retry_policy=self._tool_activity_retry_policy,
+                    cancellation_type=self._segment_cancellation_type,
+                    summary=f"tool {call.name}",
+                )
+                record["status"] = "done"
+                return outcome
             result = await workflow.execute_activity(
                 tool.activity,
                 call.input,

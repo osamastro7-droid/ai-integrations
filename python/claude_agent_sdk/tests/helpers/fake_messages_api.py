@@ -18,6 +18,10 @@ from typing import Any
 from temporalio.claude_agent_sdk.testing import Final, HistoryItem, Policy
 
 PREFIX = "mcp__durable__"
+ENGINE_TOOLS = frozenset(
+    {"Agent", "Bash", "Edit", "Glob", "PowerShell", "Read", "Write"}
+)
+"""Claude Code tools a scripted policy may call by name (MCP tools: ``mcp__...``)."""
 Decide = Callable[[dict[str, Any]], list[dict[str, Any]]]
 
 
@@ -303,6 +307,18 @@ class FakeMessagesAPI:
             "input": args,
         }
 
+    def call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        """A tool_use block: a Claude Code tool or an MCP tool by its own name, else a
+        durable tool."""
+        if name in ENGINE_TOOLS or name.startswith("mcp__"):
+            return {
+                "type": "tool_use",
+                "id": self.next_id("toolu_engine"),
+                "name": name,
+                "input": args,
+            }
+        return self.tool_use(name, args)
+
 
 def policy_decider(api_ref: list[FakeMessagesAPI], policy: Policy) -> Decide:
     """Play a scripted policy (the same kind ``ScriptedClaude`` uses) through the real engine."""
@@ -315,7 +331,7 @@ def policy_decider(api_ref: list[FakeMessagesAPI], policy: Policy) -> Decide:
         if isinstance(action, Final):
             return [{"type": "text", "text": action.text}]
         calls = action if isinstance(action, list) else [action]
-        return [api_ref[0].tool_use(call.name, call.input) for call in calls]
+        return [api_ref[0].call(call.name, call.input) for call in calls]
 
     return decide
 

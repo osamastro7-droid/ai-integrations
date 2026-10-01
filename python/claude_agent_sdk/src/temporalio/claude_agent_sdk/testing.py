@@ -12,6 +12,7 @@ id).
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import os
 import tempfile
@@ -23,7 +24,13 @@ from typing import Any
 
 from ._conversation import external_storage_on, read_conversation
 from ._events import emit
-from ._models import DeferredCall, SegmentInput, SegmentOutput, ToolOutcome
+from ._models import (
+    DeferredCall,
+    SegmentInput,
+    SegmentOutput,
+    ToolOutcome,
+    ToolStepInput,
+)
 
 
 @dataclass
@@ -60,6 +67,8 @@ class HistoryItem:
         input: The call's arguments.
         content: The tool's result.
         is_error: Whether the call failed.
+        kind: ``durable``, or ``engine`` for a Claude Code tool that ran as its own
+            Activity.
     """
 
     id: str
@@ -67,6 +76,7 @@ class HistoryItem:
     input: dict[str, Any]
     content: Any
     is_error: bool
+    kind: str = "durable"
 
 
 Policy = Callable[[str, "list[HistoryItem]"], "ToolCall | list[ToolCall] | Final"]
@@ -120,6 +130,7 @@ class ScriptedClaude:
         *,
         cost_per_segment: float = 0.01,
         think_seconds: float = 0.0,
+        engine_tools: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
     ) -> None:
         """Create the runner.
 
@@ -131,8 +142,13 @@ class ScriptedClaude:
                 Workers of a test.
             cost_per_segment: Cost reported for each segment, in USD.
             think_seconds: Delay per segment, to leave time for a test to crash a Worker.
+            engine_tools: Stand-ins for Claude Code tools (such as ``Bash``) that run
+                as their own Activities: a call to a name in the agent's
+                ``tool_activities`` runs the function with the call's input in a tool
+                step. Others return ``{"ran": <name>}``.
         """
         self._policy = policy
+        self._engine_tools = dict(engine_tools or {})
         self._dir = Path(state_dir) if state_dir is not None else None
         if self._dir is not None:
             self._dir.mkdir(parents=True, exist_ok=True)
@@ -234,8 +250,12 @@ class ScriptedClaude:
             change["final"] = answer
         else:
             retry = f"_{attempt}" if attempt > 1 else ""
+            durable = {t.name for t in inp.tools}
             for n, act in enumerate(action if isinstance(action, list) else [action]):
                 letter = chr(ord("a") + n - 1) if n else ""  # the first id as before
+                engine = act.name not in durable and any(
+                    fnmatch.fnmatchcase(act.name, p) for p in inp.tool_activities
+                )
                 calls.append(
                     {
                         "id": (
@@ -244,6 +264,7 @@ class ScriptedClaude:
                         ),
                         "name": act.name,
                         "input": act.input,
+                        "kind": "engine" if engine else "durable",
                     }
                 )
             state["pending"] = calls
@@ -265,6 +286,25 @@ class ScriptedClaude:
             out.transcript_keep = len(entries)
             out.transcript_add = [{"uuid": checkpoint, **change}]
         return out
+
+    async def run_tool_step(self, step: ToolStepInput, attempt: int) -> ToolOutcome:
+        """Run a Claude Code tool call that runs as its own Activity, with its stand-in.
+
+        Args:
+            step: The call.
+            attempt: The Activity attempt number.
+
+        Returns:
+            The stand-in's result.
+        """
+        del attempt
+        run = self._engine_tools.get(step.call.name)
+        if run is None:
+            return ToolOutcome({"ran": step.call.name})
+        result = run(step.call.input)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result if isinstance(result, ToolOutcome) else ToolOutcome(result)
 
     @staticmethod
     def _held_problem(inp: SegmentInput, entries: list[dict[str, Any]]) -> str | None:

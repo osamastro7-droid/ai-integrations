@@ -30,10 +30,13 @@ class ToolOutcome:
     Attributes:
         content: The tool's result (any JSON-serializable value).
         is_error: Whether the call failed; Claude sees the content as an error.
+        blocks: Content blocks (text, images) to hand back exactly as they are,
+            instead of ``content``: what a Claude Code tool returned.
     """
 
     content: Any = None
     is_error: bool = False
+    blocks: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -42,13 +45,17 @@ class DeferredCall:
 
     Attributes:
         id: The ``tool_use_id`` Claude assigned to the call.
-        name: The durable tool's name.
+        name: The durable tool's name, or the Claude Code tool's name.
         input: The call's arguments.
+        kind: ``durable`` for a durable tool (an Activity of yours), ``engine`` for a
+            Claude Code tool (such as Bash, or an MCP server's tool) that runs as
+            its own Activity, ``run_claude_tool_step``.
     """
 
     id: str
     name: str
     input: dict[str, Any]
+    kind: str = "durable"
 
 
 @dataclass
@@ -109,6 +116,8 @@ class SegmentInput:
             runner reads it when it has no session store.
         transcript: The committed conversation itself, for callers that drive a runner
             directly (tests); the Workflow passes ``conversation`` instead.
+        tool_activities: Name patterns of Claude Code tools that pause the segment
+            like durable tools, to run as their own Activities.
     """
 
     session_id: str
@@ -123,6 +132,33 @@ class SegmentInput:
     segment_index: int = 0
     live_output: bool = False
     fork: bool = False
+    conversation: ConversationRef | None = None
+    transcript: list[dict[str, Any]] | None = None
+    tool_activities: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ToolStepInput:
+    """Input of a tool step: one Claude Code tool call, run as its own Activity.
+
+    The step resumes the session where it paused at the call, and lets Claude Code run
+    exactly that call.
+
+    Attributes:
+        session_id: The Claude session.
+        checkpoint: Where the segment that paused at the call ended.
+        call: The call to run.
+        tools: The durable tools, as the segment declared them.
+        builtin_tools: The Claude Code built-in tools the segment enabled.
+        conversation: Where the conversation the Workflow holds can be read.
+        transcript: The committed conversation itself, for direct calls (tests).
+    """
+
+    session_id: str
+    checkpoint: str
+    call: DeferredCall
+    tools: list[ToolSpec] = field(default_factory=list)
+    builtin_tools: list[str] = field(default_factory=list)
     conversation: ConversationRef | None = None
     transcript: list[dict[str, Any]] | None = None
 
