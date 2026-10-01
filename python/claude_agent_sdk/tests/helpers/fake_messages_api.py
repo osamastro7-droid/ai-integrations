@@ -314,7 +314,8 @@ def policy_decider(api_ref: list[FakeMessagesAPI], policy: Policy) -> Decide:
         action = policy(said[-1] if said else "", history)
         if isinstance(action, Final):
             return [{"type": "text", "text": action.text}]
-        return [api_ref[0].tool_use(action.name, action.input)]
+        calls = action if isinstance(action, list) else [action]
+        return [api_ref[0].tool_use(call.name, call.input) for call in calls]
 
     return decide
 

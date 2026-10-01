@@ -69,8 +69,12 @@ class HistoryItem:
     is_error: bool
 
 
-Policy = Callable[[str, "list[HistoryItem]"], "ToolCall | Final"]
-"""Decides the next step from the latest prompt and every finished tool call so far."""
+Policy = Callable[[str, "list[HistoryItem]"], "ToolCall | list[ToolCall] | Final"]
+"""Decides the next step from the latest prompt and every finished tool call so far.
+
+A list of calls is one message with several calls; they all run, and their results
+arrive together.
+"""
 
 
 def _as_outcome(value: Any) -> ToolOutcome:
@@ -82,7 +86,15 @@ def _as_outcome(value: Any) -> ToolOutcome:
 
 
 def _new_state(prompt: str) -> dict[str, Any]:
-    return {"prompt": prompt, "history": [], "pending": None, "turn": 0}
+    return {"prompt": prompt, "history": [], "pending": [], "turn": 0}
+
+
+def _pending(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """The calls waiting for results (a folder from an older version kept one call)."""
+    pending = state.get("pending")
+    if isinstance(pending, dict):
+        return [pending]
+    return list(pending or [])
 
 
 def _fold(entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -91,9 +103,9 @@ def _fold(entries: list[dict[str, Any]]) -> dict[str, Any]:
     for entry in entries:
         if "prompt" in entry:
             state["prompt"] = entry["prompt"]
-        if "result" in entry and state["pending"] is not None:
-            state["history"].append({**state["pending"], **entry["result"]})
-        state["pending"] = entry.get("call")
+        for call, result in zip(state["pending"], entry.get("results", [])):
+            state["history"].append({**call, **result})
+        state["pending"] = entry.get("calls", [])
         state["turn"] = entry["turn"]
     return state
 
@@ -190,20 +202,23 @@ class ScriptedClaude:
         if inp.prompt is not None:
             state["prompt"] = inp.prompt  # a new task on the same session
             change["prompt"] = inp.prompt
-        pending = state["pending"]
-        if pending is not None:
-            raw = inp.injected.get(pending["id"])
-            if raw is None:
-                return SegmentOutput(
-                    session_id=inp.session_id,
-                    is_error=True,
-                    error=f"The paused call {pending['id']} got no result",
-                )
-            outcome = _as_outcome(raw)
-            result = {"content": outcome.content, "is_error": outcome.is_error}
-            state["history"].append({**pending, **result})
-            state["pending"] = None
-            change["result"] = result
+        pending = _pending(state)
+        missing = [call["id"] for call in pending if call["id"] not in inp.injected]
+        if missing:
+            return SegmentOutput(
+                session_id=inp.session_id,
+                is_error=True,
+                error=f"The paused call {', '.join(missing)} got no result",
+            )
+        if pending:
+            results = []
+            for call in pending:
+                outcome = _as_outcome(inp.injected[call["id"]])
+                result = {"content": outcome.content, "is_error": outcome.is_error}
+                state["history"].append({**call, **result})
+                results.append(result)
+            state["pending"] = []
+            change["results"] = results
         if self._think:
             await asyncio.sleep(self._think)
         action = self._policy(
@@ -211,7 +226,7 @@ class ScriptedClaude:
         )
         state["turn"] += 1
         change["turn"] = state["turn"]
-        deferred: DeferredCall | None = None
+        calls: list[dict[str, Any]] = []
         answer: str | None = None
         if isinstance(action, Final):
             emit({"type": "text", "text": action.text})  # what Claude writes
@@ -219,14 +234,20 @@ class ScriptedClaude:
             change["final"] = answer
         else:
             retry = f"_{attempt}" if attempt > 1 else ""
-            call: dict[str, Any] = {
-                "id": f"toolu_{inp.session_id[:8]}_{state['turn']:02d}{retry}",
-                "name": action.name,
-                "input": action.input,
-            }
-            state["pending"] = call
-            change["call"] = call
-            deferred = DeferredCall(**call)
+            for n, act in enumerate(action if isinstance(action, list) else [action]):
+                letter = chr(ord("a") + n - 1) if n else ""  # the first id as before
+                calls.append(
+                    {
+                        "id": (
+                            f"toolu_{inp.session_id[:8]}_{state['turn']:02d}"
+                            f"{letter}{retry}"
+                        ),
+                        "name": act.name,
+                        "input": act.input,
+                    }
+                )
+            state["pending"] = calls
+            change["calls"] = calls
         if self._dir is not None:
             checkpoint = self._save(inp.session_id, state)
         else:
@@ -234,10 +255,11 @@ class ScriptedClaude:
         out = SegmentOutput(
             session_id=inp.session_id,
             result=answer,
-            deferred=deferred,
+            deferred=DeferredCall(**calls[0]) if calls else None,
             checkpoint=checkpoint,
             cost_usd=self._cost,
             external_storage=external_storage_on(),
+            siblings=[DeferredCall(**call) for call in calls[1:]],
         )
         if self._dir is None:
             out.transcript_keep = len(entries)

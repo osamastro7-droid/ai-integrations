@@ -148,6 +148,9 @@ class SegmentOutput:
         external_storage: Whether the Worker's data converter has External Storage,
             which moves large payloads (such as a long conversation) out of the
             history.
+        siblings: The other durable calls Claude made in the same message as
+            ``deferred``. They did not run in the engine: the Workflow runs them with
+            ``deferred``, and the next segment delivers every result.
     """
 
     session_id: str
@@ -160,6 +163,7 @@ class SegmentOutput:
     transcript_keep: int | None = None
     transcript_add: list[dict[str, Any]] = field(default_factory=list)
     external_storage: bool = False
+    siblings: list[DeferredCall] = field(default_factory=list)
 
 
 @dataclass

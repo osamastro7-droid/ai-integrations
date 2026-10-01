@@ -103,7 +103,10 @@ def test_extra_args_cannot_pass_the_same_engine_flags(tmp_path: Path) -> None:
     _runner_in(tmp_path, extra_options={"extra_args": {"debug-to-stderr": None}})
 
 
-def test_extra_options_can_set_a_default_prompt_and_settings(tmp_path: Path) -> None:
+@pytest.mark.parametrize("one_at_a_time", [False, True], ids=["default", "one-call"])
+def test_extra_options_can_set_a_default_prompt_and_settings(
+    tmp_path: Path, one_at_a_time: bool
+) -> None:
     preset = {"type": "preset", "preset": "claude_code"}
     runner = _runner_in(
         tmp_path,
@@ -112,6 +115,7 @@ def test_extra_options_can_set_a_default_prompt_and_settings(tmp_path: Path) -> 
             "setting_sources": ["project"],
             "session_store_flush": "eager",
         },
+        one_tool_at_a_time=one_at_a_time,
     )
     hint = _runner.ONE_TOOL_HINT
 
@@ -126,8 +130,14 @@ def test_extra_options_can_set_a_default_prompt_and_settings(tmp_path: Path) -> 
         assert options["session_store_flush"] == "eager"
         return options["system_prompt"]
 
-    assert prompt_for(None) == {**preset, "append": hint}  # Claude Code's own prompt
-    assert prompt_for("You are a refund agent.") == f"You are a refund agent.\n\n{hint}"
+    if one_at_a_time:  # Claude Code's own prompt, or the agent's, with the hint
+        assert prompt_for(None) == {**preset, "append": hint}
+        assert prompt_for("You are a refund agent.") == (
+            f"You are a refund agent.\n\n{hint}"
+        )
+    else:  # several calls in one message all run, so no hint by default
+        assert prompt_for(None) == preset
+        assert prompt_for("You are a refund agent.") == "You are a refund agent."
 
 
 @pytest.mark.parametrize(

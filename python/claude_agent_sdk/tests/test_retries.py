@@ -91,11 +91,14 @@ class Session:
     async def finish(self, out: SegmentOutput) -> SegmentOutput:
         """Run the tool calls (``count`` returns its step) until the final answer."""
         while out.deferred is not None:
-            call = out.deferred
-            out = await self.run(
-                self.input(injected={call.id: ToolOutcome({"n": call.input["n"]})})
-            )
+            out = await self.run(self.input(injected=results(out)))
         return out
+
+
+def results(out: SegmentOutput) -> dict[str, ToolOutcome]:
+    """``count`` results for every call of a paused message, as the Workflow runs them."""
+    calls = [out.deferred, *out.siblings] if out.deferred is not None else []
+    return {c.id: ToolOutcome({"n": c.input["n"]}) for c in calls}
 
 
 def start_api(api_holder: list[FakeMessagesAPI]) -> FakeMessagesAPI:
@@ -390,15 +393,16 @@ async def test_only_requests_refused_for_good_are_not_retried(
 async def test_parallel_calls_in_a_resumed_session_keep_every_result(
     tmp_path: Path, retry_at: int | None, mode: str
 ) -> None:
-    """Claude keeps sending two calls per message; each paused call's result must arrive."""
+    """Claude keeps sending two calls per message; both run, and both results arrive,
+    also when the step that delivers them runs again."""
     ref: list[FakeMessagesAPI] = []
 
     def two_at_a_time(body: dict[str, Any]) -> list[dict[str, Any]]:
         _, _, history = history_of(body)
         done = [h for h in history if h.name == "count" and not h.is_error]
-        if len(done) >= 3:
-            return [{"type": "text", "text": "FINAL"}]
-        step = len(done) + 1
+        if len(done) >= 6:
+            return [{"type": "text", "text": f"FINAL {len(done)}"}]
+        step = len(done) // 2 + 1
         return [
             ref[0].tool_use("count", {"n": step}),
             ref[0].tool_use("count", {"n": step, "again": True}),
@@ -412,18 +416,14 @@ async def test_parallel_calls_in_a_resumed_session_keep_every_result(
         runner = make_runner(api, tmp_path, mode)
         s = Session(runner)
         out = await s.run(s.input("count to 3"))
-        while out.deferred is not None and len(handed) < 6:
-            call = out.deferred
-            handed.append(call.input["n"])
-            attempt = 2 if len(handed) == retry_at else 1
-            out = await s.run(
-                s.input(injected={call.id: ToolOutcome({"n": call.input["n"]})}),
-                attempt,
-            )
+        while out.deferred is not None and len(handed) < 12:
+            handed += [c.input["n"] for c in [out.deferred, *out.siblings]]
+            attempt = 2 if s.index == retry_at else 1
+            out = await s.run(s.input(injected=results(out)), attempt)
     finally:
         api.stop()
-    assert out.result == "FINAL"
-    assert handed == [1, 2, 3]  # each step was handed to the Workflow once
+    assert out.result == "FINAL 6"
+    assert handed == [1, 1, 2, 2, 3, 3]  # each call was handed to the Workflow once
     missing = [
         r for r in api.requests if "Tool result missing" in str(r.get("messages"))
     ]

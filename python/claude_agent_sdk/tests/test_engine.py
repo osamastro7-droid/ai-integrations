@@ -69,6 +69,7 @@ async def _drive(
     tools: list[ToolSpec],
     limit: int = 8,
     added: list[int] | None = None,
+    builtin: list[str] | None = None,
 ) -> tuple[list[tuple[str, dict[str, Any]]], SegmentOutput]:
     """Run segments like the Workflow does: pause, run the tool, resume with its result.
 
@@ -93,15 +94,18 @@ async def _drive(
                 session_id=str(uuid.uuid4()),
                 prompt=prompt,
                 tools=tools,
+                builtin_tools=builtin or [],
                 transcript=[] if held else None,
             ),
             1,
         )
     )
     paused: list[tuple[str, dict[str, Any]]] = []
+    steps = 0
     while seg.deferred is not None and len(paused) < limit:
-        call = seg.deferred
-        paused.append((call.name, call.input))
+        calls = [seg.deferred, *seg.siblings]  # the Workflow runs them all
+        paused += [(call.name, call.input) for call in calls]
+        steps += 1
         seg = hold(
             await runner.run(
                 SegmentInput(
@@ -109,8 +113,9 @@ async def _drive(
                     prompt=None,
                     tools=tools,
                     checkpoint=seg.checkpoint,
-                    injected={call.id: _fake_tool(call.name, call.input)},
-                    segment_index=len(paused),
+                    injected={c.id: _fake_tool(c.name, c.input) for c in calls},
+                    builtin_tools=builtin or [],
+                    segment_index=steps,
                     transcript=list(transcript) if held else None,
                 ),
                 1,
@@ -145,43 +150,101 @@ async def test_engine_pauses_at_every_durable_call_and_resumes(
 
 
 @pytest.mark.parametrize("mode", ["held", "store"])
-async def test_parallel_calls_are_serialized_not_lost(
+async def test_parallel_calls_all_run_and_every_result_reaches_claude(
     tmp_path: Path, mode: str
 ) -> None:
-    """Claude asks for two tools in one message: one pauses, the other is told to retry."""
-    wanted = ("A-1001", "A-1002")
+    """Claude calls three tools in one message: all three run, and the next step shows
+    Claude every call with its own result."""
     ref: list[FakeMessagesAPI] = []
 
-    def both_at_once(body: dict[str, Any]) -> list[dict[str, Any]]:
+    def all_at_once(body: dict[str, Any]) -> list[dict[str, Any]]:
         uses, _, history = history_of(body)
         if not uses:
-            return [ref[0].tool_use("look_up_order", {"order_id": o}) for o in wanted]
-        done = {
-            h.content["order_id"]
+            return [
+                ref[0].tool_use("look_up_order", {"order_id": "A-1001"}),
+                ref[0].tool_use("look_up_order", {"order_id": "A-1002"}),
+                ref[0].tool_use("email_customer", {"to": "maria@example.com"}),
+            ]
+        got = [
+            h.content.get("order_id", "sent") if isinstance(h.content, dict) else "?"
             for h in history
             if not h.is_error
-            and isinstance(h.content, dict)
-            and "order_id" in h.content
-        }
-        missing = [o for o in wanted if o not in done]
-        if missing:
-            return [ref[0].tool_use("look_up_order", {"order_id": missing[0]})]
-        return [{"type": "text", "text": "FINAL: looked up " + ", ".join(wanted)}]
+        ]
+        return [{"type": "text", "text": "FINAL: " + ", ".join(sorted(got))}]
 
-    api = FakeMessagesAPI(both_at_once)
+    api = FakeMessagesAPI(all_at_once)
     ref.append(api)
     api.start()
     try:
         runner = _make_runner(api, tmp_path, mode)
         paused, final = await _drive(
-            runner, "Check orders A-1001 and A-1002.", TOOLS[:1]
+            runner, "Check orders A-1001 and A-1002, and email Maria.", TOOLS
         )
     finally:
         api.stop()
-    assert sorted(args["order_id"] for _, args in paused) == ["A-1001", "A-1002"]
-    assert final.result == "FINAL: looked up A-1001, A-1002"
-    assert api.errors == []
+    assert [name for name, _ in paused] == [
+        "look_up_order",
+        "look_up_order",
+        "email_customer",
+    ]
+    assert final.result == "FINAL: A-1001, A-1002, sent"
+    assert len(api.requests) == 2  # the calls, then the answer: nothing was retried
+    assert api.errors == []  # each call had its own result
     assert runner.stub_calls == 0
+
+
+@pytest.mark.parametrize("mode", ["held", "store"])
+async def test_builtin_and_durable_calls_mixed_in_one_message(
+    tmp_path: Path, mode: str
+) -> None:
+    """[Glob, durable, durable, Glob]: the first Glob runs in the engine, both durable
+    calls run, and the Glob after them is denied, so Claude calls it again."""
+    (tmp_path / "found.txt").write_text("here")
+    ref: list[FakeMessagesAPI] = []
+
+    def glob() -> dict[str, Any]:
+        return {
+            "type": "tool_use",
+            "id": ref[0].next_id("toolu_glob"),
+            "name": "Glob",
+            "input": {"pattern": "*.txt"},
+        }
+
+    def mixed(body: dict[str, Any]) -> list[dict[str, Any]]:
+        uses, _, history = history_of(body)
+        globs = [h for h in history if h.name == "Glob" and not h.is_error]
+        if not uses:
+            return [
+                glob(),
+                ref[0].tool_use("look_up_order", {"order_id": "A-1001"}),
+                ref[0].tool_use("look_up_order", {"order_id": "A-1002"}),
+                glob(),
+            ]
+        if len(globs) < 2:
+            return [glob()]  # the one that did not run
+        orders = [h for h in history if h.name == "look_up_order" and not h.is_error]
+        denied = [h for h in history if h.name == "Glob" and h.is_error]
+        return [
+            {
+                "type": "text",
+                "text": f"FINAL orders={len(orders)} globs={len(globs)} "
+                f"denied={len(denied)}",
+            }
+        ]
+
+    api = FakeMessagesAPI(mixed)
+    ref.append(api)
+    api.start()
+    try:
+        runner = _make_runner(api, tmp_path, mode)
+        paused, final = await _drive(
+            runner, "Look around and check both orders.", TOOLS, builtin=["Glob"]
+        )
+    finally:
+        api.stop()
+    assert [args["order_id"] for _, args in paused] == ["A-1001", "A-1002"]
+    assert final.result == "FINAL orders=2 globs=2 denied=1"
+    assert api.errors == [] and runner.stub_calls == 0
 
 
 @pytest.mark.parametrize(

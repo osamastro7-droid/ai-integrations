@@ -8,7 +8,7 @@ import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
@@ -320,7 +320,8 @@ class DurableClaudeAgent:
         self._decisions: dict[str, bool] = {}
         self._waiting: dict[str, DeferredCall] = {}
         self._calls: dict[str, dict[str, Any]] = {}
-        self._unanswered: DeferredCall | None = None
+        self._outcomes: dict[str, ToolOutcome] = {}  # of unanswered calls that finished
+        self._unanswered: list[DeferredCall] = []
         self._running = False
         self._state = state if state is not None else AgentState()
         self._key: str | None = None  # names this agent in the conversation Query
@@ -708,28 +709,42 @@ class DurableClaudeAgent:
                 self._publish({"type": "done", "result": result})
                 await self._linger_if_live()
                 return result
-            call = seg.deferred
-            self._unanswered = call
-            if call.id in self._calls or call.id in state.recent_call_ids:
-                # A tool call runs at most once per agent, whatever Claude asks.
-                await self._fail(
-                    f"Claude asked again for tool call {call.id} ({call.name}), which "
-                    "already ran. Stopping so it cannot run twice."
-                )
+            # The paused call, and the other durable calls of the same message.
+            calls = [seg.deferred, *seg.siblings]
+            self._unanswered = calls
+            seen: set[str] = set()
+            for call in calls:
+                if call.id in seen or call.id in self._calls:
+                    again = True
+                else:
+                    again = call.id in state.recent_call_ids
+                seen.add(call.id)
+                if again:
+                    # A tool call runs at most once per agent, whatever Claude asks.
+                    await self._fail(
+                        f"Claude asked again for tool call {call.id} ({call.name}), "
+                        "which already ran. Stopping so it cannot run twice."
+                    )
             if (
                 self._max_segments is not None
                 and state.task_segments >= self._max_segments
             ):
-                # Its result could never reach Claude, so the call does not run.
+                # Their results could never reach Claude, so the calls do not run.
+                which = ", ".join(f"{c.id} ({c.name})" for c in calls)
+                plural = "s" if len(calls) > 1 else ""
                 await self._fail(
                     f"Stopped after {self._max_segments} segments, before running "
-                    f"tool call {call.id} ({call.name})."
+                    f"tool call{plural} {which}."
                 )
-            outcome = await self._run_tool(call)
-            state.pending = {call.id: outcome}
-            self._unanswered = None
-            state.recent_call_ids = [*state.recent_call_ids, call.id][-_RECENT_CALLS:]
-            state.tool_calls += 1
+            outcomes = await self._run_tools(calls)
+            state.pending = {c.id: o for c, o in zip(calls, outcomes)}
+            self._unanswered = []
+            self._outcomes.clear()  # they are pending now
+            state.recent_call_ids = [
+                *state.recent_call_ids,
+                *(c.id for c in calls),
+            ][-_RECENT_CALLS:]
+            state.tool_calls += len(calls)
             if self._auto_continue and self.should_continue_as_new():
                 await self._hand_over()
 
@@ -742,23 +757,32 @@ class DurableClaudeAgent:
         the next task.
         """
         state = self._state
-        call = self._unanswered
-        if call is not None:
-            status = self._calls.get(call.id, {}).get("status")
-            if status in ("started", "cancelled"):
-                text = (
-                    f"This tool call was interrupted ({reason}); whether it took "
-                    "effect is unknown. Check before running it again."
-                )
-            else:
-                text = f"This tool call did not run: {reason}."
-            state.pending = {call.id: ToolOutcome(content=text, is_error=True)}
-            self._unanswered = None
+        if self._unanswered:
+            state.pending = {
+                call.id: self._outcome_after_stop(call, reason)
+                for call in self._unanswered
+            }
+            self._unanswered = []
+            self._outcomes.clear()
         state.task_prompt = None
         state.task_segments = 0
         state.fork_next = True
         if state.checkpoint is None:
             state.session_id = None  # nothing committed: the next task starts afresh
+
+    def _outcome_after_stop(self, call: DeferredCall, reason: str) -> ToolOutcome:
+        """What Claude learns about a call it is still waiting for when its task stops."""
+        outcome = self._outcomes.get(call.id)
+        if outcome is not None:
+            return outcome  # it finished before the task stopped
+        if self._calls.get(call.id, {}).get("status") in ("started", "cancelled"):
+            text = (
+                f"This tool call was interrupted ({reason}); whether it took "
+                "effect is unknown. Check before running it again."
+            )
+        else:
+            text = f"This tool call did not run: {reason}."
+        return ToolOutcome(content=text, is_error=True)
 
     def _conversation_problem(self, seg: SegmentOutput) -> str | None:
         """Refuse a segment that keeps the conversation somewhere else than before."""
@@ -804,6 +828,22 @@ class DurableClaudeAgent:
         if self._stream is not None:
             self._topic.publish(cap_event({**event, "at": workflow.now().isoformat()}))
 
+    async def _run_tools(self, calls: list[DeferredCall]) -> list[ToolOutcome]:
+        """Run the calls at once, each its own Activity; return their outcomes in order.
+
+        If one is cancelled (the Workflow is), the others still finish or stop
+        before the cancellation goes on.
+        """
+        if len(calls) == 1:
+            return [await self._run_tool(calls[0])]
+        done = await asyncio.gather(
+            *(self._run_tool(c) for c in calls), return_exceptions=True
+        )
+        for item in done:
+            if isinstance(item, BaseException):
+                raise item
+        return cast("list[ToolOutcome]", done)
+
     async def _run_tool(self, call: DeferredCall) -> ToolOutcome:
         record: dict[str, Any] = {
             "id": call.id,
@@ -816,6 +856,7 @@ class DurableClaudeAgent:
             {"type": "tool_call", "id": call.id, "name": call.name, "input": call.input}
         )
         outcome = await self._execute_tool(call, record)
+        self._outcomes[call.id] = outcome
         self._publish(
             {
                 "type": "tool_result",

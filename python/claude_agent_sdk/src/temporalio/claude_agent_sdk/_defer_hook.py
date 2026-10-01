@@ -7,9 +7,11 @@ the engine down its auto-resume path, where a later "defer" is ignored.
 
 Parallel calls: the engine keeps only one paused call per run. So the first new
 durable call in a run is deferred, and any other call after it in the same run,
-durable or built-in, is denied with a clear message, so Claude asks again after the
-paused call's result. (A built-in call allowed to run after the pause would have its
-result cut from the session with the denials, and Claude would run it again.)
+durable or built-in, is denied. The Workflow runs the denied durable calls with the
+paused one, and the next segment puts their real results in place of the denials. A
+denied built-in call keeps the message, so Claude calls it again. (A built-in call
+allowed to run after the pause would have its result cut from the session, and
+Claude would run it again.)
 
 Stopped runs: when the segment Activity is cancelled or times out, the runner writes
 ``$TCA_HOOK_DIR/stop``, so an engine that is still shutting down cannot start another
@@ -26,11 +28,11 @@ import os
 import sys
 from typing import Any
 
-ONE_AT_A_TIME = (
-    "Only one tool call can run at a time. Your other tool call is running now. "
+NOT_RUN = (
+    "This call did not run: another tool call in this message paused the run. "
     "Call this tool again after you get that result."
 )
-"""The reason Claude sees when a second parallel call is denied."""
+"""The reason Claude sees for a built-in call denied after the pause."""
 
 STOPPED = "This step was stopped (cancelled or timed out). Do not call tools."
 """The reason Claude sees when the segment is no longer running (the runner looks for it)."""
@@ -40,7 +42,7 @@ DURABLE_PREFIX = "mcp__durable__"
 """Names of durable tools as the engine sees them (the runner's ``PREFIX``)."""
 
 
-def _deny(reason: str = ONE_AT_A_TIME) -> dict[str, Any]:
+def _deny(reason: str = NOT_RUN) -> dict[str, Any]:
     return {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",

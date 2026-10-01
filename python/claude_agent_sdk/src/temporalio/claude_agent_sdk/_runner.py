@@ -41,11 +41,18 @@ the call with an error placeholder and drops the delivered result. In a copy tha
 ends at the checkpoint, the paused call resumes normally. The same drop happens when a
 user row follows the paused call (anthropics/claude-code#97358), which is why the
 checkpoint after parallel calls is the deferral marker (see ``_resume_point``).
+
+Parallel calls: the engine keeps one paused call per run, so the hook defers the first
+durable call of a message and denies the calls after it. The segment reports the
+denied durable calls (``siblings``); the Workflow runs them with the paused one, and
+the next segment puts their results where the engine resumes (see ``_deliver``), so
+Claude sees every call of the message with its result.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import shutil
@@ -101,7 +108,7 @@ short-lived access token expires, resumed segments fail with "OAuth session expi
 SERVER = "durable"
 PREFIX = f"mcp__{SERVER}__"
 ONE_TOOL_HINT = "Call at most one tool per message, then wait for its result before calling another."
-"""With parallel calls the engine keeps only one paused call, so ask for one at a time."""
+"""Asks Claude for one call per message (``one_tool_at_a_time``; off by default)."""
 
 PAUSE_CONTRACT = (
     "Durable tools never run inside the engine (the in-engine tool only returns an "
@@ -366,6 +373,126 @@ def _resume_point(entries: list[Any], paused_call: str | None) -> str | None:
     return marker if marker is not None and user_after_marker else leaf
 
 
+def _result_ids(entry: Any) -> list[str]:
+    """The tool calls a transcript entry answers (a user entry with tool results)."""
+    if not isinstance(entry, dict) or entry.get("type") != "user":
+        return []
+    content = (entry.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        str(block.get("tool_use_id"))
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+
+
+def _marker_of(entry: Any) -> str | None:
+    """The paused call's id, if ``entry`` is a deferral marker."""
+    if not isinstance(entry, dict) or entry.get("type") != "attachment":
+        return None
+    attachment = entry.get("attachment")
+    if isinstance(attachment, dict) and attachment.get("type") == "hook_deferred_tool":
+        return str(attachment.get("toolUseID"))
+    return None
+
+
+def _siblings(entries: list[Any], paused_call: str) -> list[DeferredCall]:
+    """The other durable calls of the paused message, denied after the pause.
+
+    Their denials come after the paused call's deferral marker.
+    """
+    marker = None
+    for index, entry in enumerate(entries):
+        if _marker_of(entry) == paused_call:
+            marker = index
+    if marker is None:
+        return []
+    denied = {tid for entry in entries[marker + 1 :] for tid in _result_ids(entry)}
+    calls: list[DeferredCall] = []
+    for entry in entries[:marker]:
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        for block in (entry.get("message") or {}).get("content") or []:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("id") in denied
+                and str(block.get("name", "")).startswith(PREFIX)
+                and all(c.id != block["id"] for c in calls)
+            ):
+                calls.append(
+                    DeferredCall(
+                        id=block["id"],
+                        name=str(block["name"]).removeprefix(PREFIX),
+                        input=dict(block.get("input") or {}),
+                    )
+                )
+    return calls
+
+
+def _deliver(
+    entries: list[Any], checkpoint: str, results: dict[str, ToolOutcome]
+) -> tuple[list[Any], set[str]] | None:
+    """Put the results of the calls denied after a pause where the engine resumes.
+
+    After a pause in a message with several calls, the session ends with the paused
+    call's hook entries (the last is the deferral marker, the checkpoint), followed
+    by the denials of the calls after it. Resuming at the marker would drop those
+    calls: the engine strips tool calls whose results come after where it resumes.
+    So the denials move before the paused call's hook entries, and the denials of
+    durable calls get their real results. The engine's own links between entries
+    stay as they are. Tested on Claude Code 2.1.273 and 2.1.287, with built-in and
+    durable calls mixed in one message: Claude sees each call of the message with
+    its result (a built-in call denied after the pause keeps the denial, and Claude
+    calls it again).
+
+    Returns:
+        The entries to resume from, and the calls whose results they now hold; or
+        None if the checkpoint is not a deferral marker followed by denials.
+    """
+    marker = next(
+        (
+            i
+            for i, e in enumerate(entries)
+            if isinstance(e, dict) and e.get("uuid") == checkpoint
+        ),
+        None,
+    )
+    paused = _marker_of(entries[marker]) if marker is not None else None
+    if marker is None or paused is None:
+        return None
+    first = marker  # the paused call's hook entries end at the marker
+    while first > 0:
+        previous = entries[first - 1]
+        attachment = previous.get("attachment") if isinstance(previous, dict) else None
+        if not (isinstance(attachment, dict) and attachment.get("toolUseID") == paused):
+            break
+        first -= 1
+    moved: list[Any] = []
+    delivered: set[str] = set()
+    for entry in entries[marker + 1 :]:
+        ids = _result_ids(entry)
+        if not ids or paused in ids:
+            continue
+        entry = copy.deepcopy(entry)
+        for block in entry["message"]["content"]:
+            outcome = results.get(str(block.get("tool_use_id")))
+            if block.get("type") != "tool_result" or outcome is None:
+                continue
+            block["content"] = _text(outcome.content)
+            if outcome.is_error:
+                block["is_error"] = True
+            else:
+                block.pop("is_error", None)
+            entry["toolUseResult"] = block["content"]
+            delivered.add(str(block["tool_use_id"]))
+        moved.append(entry)
+    if not moved:
+        return None
+    return [*entries[:first], *moved, *entries[first : marker + 1]], delivered
+
+
 def _seed(committed: list[Any], checkpoint: str) -> list[Any] | None:
     """The committed conversation up to the checkpoint, where the next run resumes.
 
@@ -538,7 +665,7 @@ class ClaudeAgentSdkRunner:
         env: dict[str, str] | None = None,
         cli_path: str | None = None,
         extra_options: dict[str, Any] | None = None,
-        one_tool_at_a_time: bool = True,
+        one_tool_at_a_time: bool = False,
         model: str | None = None,
         max_budget_usd: float | None = None,
     ) -> None:
@@ -563,7 +690,8 @@ class ClaudeAgentSdkRunner:
                 the default for agents that set none. Options the agent or the plugin
                 sets itself, and ``extra_args`` for the same engine flags, are
                 refused.
-            one_tool_at_a_time: Ask Claude for one tool call per message.
+            one_tool_at_a_time: Ask Claude for one tool call per message. Not needed
+                for durable tools: when Claude calls several at once, they all run.
             model: Default model when the agent does not set one.
             max_budget_usd: Cost cap per segment.
 
@@ -646,27 +774,58 @@ class ClaudeAgentSdkRunner:
             self._versions[path] = reported
         return self._versions[path]
 
-    async def _start(self, inp: SegmentInput, attempt: int) -> tuple[str, bool]:
-        """Where a segment starts in the session store: ``(session_id, resume)``.
+    async def _start(
+        self, inp: SegmentInput, attempt: int, injected: dict[str, ToolOutcome]
+    ) -> tuple[str, bool, set[str]]:
+        """Where a segment starts in the session store.
 
         A segment that runs again continues in a copy of the session that ends at
         the checkpoint, because an unfinished attempt may have written after it.
+
+        Returns:
+            The session, whether to resume it, and the calls whose results are
+            already in it (see ``_copy``).
         """
         if inp.checkpoint is None:  # nothing committed yet: a new session
-            return _attempt_session_id(inp.session_id, attempt), False
+            return _attempt_session_id(inp.session_id, attempt), False, set()
         if attempt == 1 and not inp.fork:
-            return inp.session_id, True
-        return await self._copy(inp), True
+            return inp.session_id, True, set()
+        session_id, delivered = await self._copy(inp, injected)
+        return session_id, True, delivered
 
-    async def _copy(self, inp: SegmentInput) -> str:
-        """A copy of the session that ends at the checkpoint; returns its id."""
-        copy = await fork_session_via_store(
-            self._store,
-            inp.session_id,
-            directory=self._cwd,
-            up_to_message_id=inp.checkpoint,
+    async def _copy(
+        self, inp: SegmentInput, injected: dict[str, ToolOutcome]
+    ) -> tuple[str, set[str]]:
+        """A copy of the session that ends at the checkpoint.
+
+        After a pause in a message with several calls, the copy also holds the
+        results of the calls denied after the pause (see ``_deliver``).
+
+        Returns:
+            The copy's id, and the calls whose results it holds.
+        """
+        assert inp.checkpoint is not None
+        key = {
+            "project_key": project_key_for_directory(self._cwd),
+            "session_id": inp.session_id,
+        }
+        entries = cast("list[dict[str, Any]]", await self._store.load(key) or [])
+        moved = _deliver(entries, inp.checkpoint, injected)
+        if moved is None:
+            forked = await fork_session_via_store(
+                self._store,
+                inp.session_id,
+                directory=self._cwd,
+                up_to_message_id=inp.checkpoint,
+            )
+            return forked.session_id, set()
+        seed, delivered = moved
+        copy_id = str(uuid.uuid4())
+        await self._store.append(
+            {**key, "session_id": copy_id},
+            [{**e, "sessionId": copy_id} if "sessionId" in e else e for e in seed],
         )
-        return copy.session_id
+        return copy_id, delivered
 
     async def _checkpoint(
         self,
@@ -735,8 +894,8 @@ class ClaudeAgentSdkRunner:
                 "runner has a session store. Every Worker of a task queue needs the "
                 "same choice: create this runner without session_store. Retrying."
             )
-        session_id, resume = await self._start(inp, attempt)
-        if resume and not injected and inp.prompt is None:
+        session_id, resume, delivered = await self._start(inp, attempt, injected)
+        if resume and len(injected) == len(delivered) and inp.prompt is None:
             return SegmentOutput(
                 session_id=session_id,
                 is_error=True,
@@ -751,12 +910,15 @@ class ClaudeAgentSdkRunner:
                 resume,
                 self._store,
                 guard=inp.checkpoint if in_place else None,
+                delivered=delivered,
             )
         except _SessionMoved:
-            # The session went on after the checkpoint (for example, the Workflow
-            # was reset to an earlier point): continue in a copy that ends there.
+            # The session went on after the checkpoint (after a pause in a message
+            # with several calls, or a Workflow reset to an earlier point): continue
+            # in a copy that ends there.
+            session_id, delivered = await self._copy(inp, injected)
             return await self._run_engine(
-                inp, injected, await self._copy(inp), True, self._store
+                inp, injected, session_id, True, self._store, delivered=delivered
             )
 
     async def _run_held(
@@ -769,6 +931,7 @@ class ClaudeAgentSdkRunner:
         what the Workflow committed.
         """
         committed = await read_conversation(inp)
+        delivered: set[str] = set()  # results the seed already holds
         if inp.checkpoint is None:
             if committed:
                 return SegmentOutput(
@@ -793,7 +956,8 @@ class ClaudeAgentSdkRunner:
                     "this run. Give this Worker's runner the session store the "
                     "conversation started with. Retrying."
                 )
-            found = _seed(committed, inp.checkpoint)
+            moved = _deliver(committed, inp.checkpoint, injected)
+            found = moved[0] if moved is not None else _seed(committed, inp.checkpoint)
             if found is None:
                 return SegmentOutput(
                     session_id=inp.session_id,
@@ -803,8 +967,10 @@ class ClaudeAgentSdkRunner:
                         "Workflow holds, so it is unclear where Claude would continue."
                     ),
                 )
+            if moved is not None:
+                delivered = moved[1]
             session_id, seed, resume = inp.session_id, found, True
-        if resume and not injected and inp.prompt is None:
+        if resume and len(injected) == len(delivered) and inp.prompt is None:
             return SegmentOutput(
                 session_id=session_id,
                 is_error=True,
@@ -819,7 +985,13 @@ class ClaudeAgentSdkRunner:
             await store.append(key, seed)  # type: ignore[arg-type]
         try:
             return await self._run_engine(
-                inp, injected, session_id, resume, store, committed=committed
+                inp,
+                injected,
+                session_id,
+                resume,
+                store,
+                committed=committed,
+                delivered=delivered,
             )
         finally:
             if not resume:
@@ -861,6 +1033,7 @@ class ClaudeAgentSdkRunner:
         *,
         guard: str | None = None,
         committed: list[dict[str, Any]] | None = None,
+        delivered: set[str] | None = None,
     ) -> SegmentOutput:
         """Run the engine once, on the session in ``store``.
 
@@ -873,6 +1046,8 @@ class ClaudeAgentSdkRunner:
             guard: Resuming requires the session to end at this checkpoint.
             committed: The conversation the Workflow holds, when it holds one: the
                 output then says what changed in it.
+            delivered: Calls whose results the session already holds (see
+                ``_deliver``); the others go in the message that resumes it.
 
         Raises:
             _SessionMoved: If the session does not end at ``guard``.
@@ -925,10 +1100,11 @@ class ClaudeAgentSdkRunner:
             create_sdk_mcp_server(SERVER, tools=[make_stub(t) for t in inp.tools]),
         )
         prompt: Any
+        in_message = {k: v for k, v in injected.items() if k not in (delivered or ())}
         if not resume:
             prompt = inp.prompt or ""
-        elif injected:
-            prompt = self._user_message(session_id, injected, inp.prompt)
+        elif in_message:
+            prompt = self._user_message(session_id, in_message, inp.prompt)
         else:
             prompt = inp.prompt  # a new task on the session
 
@@ -1055,6 +1231,7 @@ class ClaudeAgentSdkRunner:
                 ),
                 checkpoint=checkpoint,
                 cost_usd=cost,
+                siblings=_siblings(entries, deferred.id),
             )
         else:
             out = SegmentOutput(
