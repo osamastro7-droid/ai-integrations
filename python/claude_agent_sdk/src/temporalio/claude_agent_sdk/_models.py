@@ -79,19 +79,6 @@ class ConversationRef:
 
 
 @dataclass
-class ConversationPage:
-    """One page of the conversation, as the Workflow Query returns it.
-
-    Attributes:
-        entries: Transcript entries, from the requested offset.
-        total: How many entries the conversation has.
-    """
-
-    entries: list[dict[str, Any]]
-    total: int
-
-
-@dataclass
 class SegmentInput:
     """Input of one model segment: from a prompt or a tool result to the next pause.
 

@@ -17,10 +17,10 @@ from typing import Any
 
 import pytest
 
+from temporalio.api.common.v1 import Payload
 from temporalio.claude_agent_sdk import (
     ClaudeAgentPlugin,
     ClaudeAgentSdkRunner,
-    ConversationPage,
     ConversationRef,
     FileSessionStore,
     SegmentInput,
@@ -30,7 +30,7 @@ from temporalio.claude_agent_sdk import (
     _runner,
 )
 from temporalio.claude_agent_sdk.testing import ScriptedClaude
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowQueryFailedError
 from temporalio.converter import DataConverter, ExternalStorage
 from temporalio.testing import ActivityEnvironment
 from temporalio.worker import Worker
@@ -48,6 +48,7 @@ from tests.storage.workflows import FetchWorkflow, fetch_document, pages_policy
 
 pytestmark = pytest.mark.timeout(240)
 QUERY = _conversation.QUERY
+PAGE = list[dict[str, Any]]
 COUNT_TOOLS = [ToolSpec("count", "Count one step.", {"type": "object"})]
 
 
@@ -85,13 +86,60 @@ def test_pages_hold_whole_entries_up_to_the_limit() -> None:
         {"uuid": str(i), "text": "x" * n} for i, n in enumerate((10, 10, 90, 10))
     ]
     sizes = [_conversation.entry_bytes(e) for e in entries]
-    first = _conversation.page(entries, sizes, 0, limit=sizes[0] + sizes[1] + 5)
-    assert [e["uuid"] for e in first.entries] == ["0", "1"] and first.total == 4
+    two = len(json.dumps(entries[:2], separators=(",", ":")))  # the page, as JSON
+    assert _conversation.page(entries, sizes, 0, limit=two) == entries[:2]
+    assert _conversation.page(entries, sizes, 0, limit=two - 1) == entries[:1]
     alone = _conversation.page(entries, sizes, 2, limit=10)  # over the limit, alone
-    assert [e["uuid"] for e in alone.entries] == ["2"]
-    rest = _conversation.page(entries, sizes, 3)
-    assert [e["uuid"] for e in rest.entries] == ["3"]
-    assert _conversation.page(entries, sizes, 4) == ConversationPage([], 4)
+    assert alone == entries[2:3]
+    assert _conversation.page(entries, sizes, 3) == entries[3:]
+    assert _conversation.page(entries, sizes, 4) == []
+
+
+def test_a_page_is_the_same_payload_however_long_the_conversation() -> None:
+    """A content-addressed store keeps a page over the threshold once, not per step."""
+    converter = DataConverter.default.payload_converter
+    short = [{"uuid": "a", "text": "y"}, {"uuid": "b", "text": "x" * 500}]
+    pages = []
+    for entries in (short, [*short, {"uuid": "c", "text": "z"}]):
+        sizes = [_conversation.entry_bytes(e) for e in entries]
+        pages.append(_conversation.page(entries, sizes, 1, limit=100))
+    first, second = (converter.to_payloads([p])[0].SerializeToString() for p in pages)
+    assert pages[0] == short[1:] and first == second
+    # page() counts the bytes as Temporal's converter writes them.
+    sizes = [_conversation.entry_bytes(e) for e in short]
+    data = converter.to_payloads([short])[0].data
+    assert len(data) == 1 + sum(n + 1 for n in sizes)
+    assert _conversation.page(short, sizes, 0, limit=len(data)) == short
+
+
+@pytest.mark.parametrize(
+    ("threshold", "limit"),
+    [
+        (None, _conversation.PAGE_BYTES),
+        (256 * 1024, 252 * 1024),
+        (16 * 1024, _conversation.SMALLEST_PAGE),
+        (8 * 1024 * 1024, _conversation.PAGE_BYTES),
+    ],
+    ids=["no-storage", "default-threshold", "low-threshold", "high-threshold"],
+)
+async def test_pages_stay_under_the_external_storage_threshold(
+    tmp_path: Path, threshold: int | None, limit: int
+) -> None:
+    converter = DataConverter.default
+    if threshold is not None:
+        converter = DataConverter(
+            external_storage=ExternalStorage(
+                drivers=[FolderStorageDriver(tmp_path)],
+                payload_size_threshold=threshold,
+            )
+        )
+    client = _FakeClient(_FakeHandle([], []), converter)
+    env = ActivityEnvironment(client=client)  # type: ignore[arg-type]
+
+    async def in_a_segment() -> int:  # the client is there for async Activities only
+        return _conversation.page_limit()
+
+    assert await env.run(in_a_segment) == limit
 
 
 def test_sizes_match_temporals_json_converter() -> None:
@@ -107,17 +155,21 @@ class _FakeHandle:
         self.entries, self.asked = entries, asked
 
     async def query(self, name: str, args: list[Any], result_type: Any) -> Any:
-        assert name == QUERY and result_type is ConversationPage
-        agent, start = args
-        assert agent == "0"
+        assert name == QUERY and result_type == PAGE
+        agent, start, total, limit = args
+        assert agent == "0" and limit == _conversation.PAGE_BYTES
         self.asked.append(start)
+        if total != len(self.entries):
+            raise WorkflowQueryFailedError(f"scheduled with {total}")
         sizes = [_conversation.entry_bytes(e) for e in self.entries]
         return _conversation.page(self.entries, sizes, start, limit=100)
 
 
 class _FakeClient:
-    def __init__(self, handle: _FakeHandle) -> None:
-        self.handle = handle
+    def __init__(
+        self, handle: _FakeHandle, converter: DataConverter = DataConverter.default
+    ) -> None:
+        self.handle, self.data_converter = handle, converter
 
     def get_workflow_handle(self, workflow_id: str, run_id: str | None = None) -> Any:
         assert workflow_id and run_id
@@ -138,7 +190,7 @@ async def test_a_step_reads_the_conversation_a_page_at_a_time() -> None:
     got = await env.run(_conversation.read_conversation, inp)
     assert got == entries and asked == [0, 1, 2, 3, 4]  # one 80-byte entry per page
     inp.conversation = ConversationRef(query=QUERY, agent="0", entries=4)
-    with pytest.raises(RuntimeError, match="scheduled with 4"):  # it changed: retry
+    with pytest.raises(RuntimeError, match="scheduled with 4. Retrying"):  # changed
         await env.run(_conversation.read_conversation, inp)
 
 
@@ -203,7 +255,11 @@ async def test_each_step_reads_the_conversation_and_records_only_what_it_added(
             task_queue=queue,
         )
         assert await asyncio.wait_for(handle.result(), 60) == "counted to 3"
-        held = await handle.query(QUERY, args=["0", 0], result_type=ConversationPage)
+        held = await handle.query(
+            QUERY, args=["0", 0, 4, _conversation.PAGE_BYTES], result_type=PAGE
+        )
+        with pytest.raises(WorkflowQueryFailedError, match="scheduled with 3"):
+            await handle.query(QUERY, args=["0", 0, 3, 1000], result_type=PAGE)
         steps_in: list[dict[str, Any]] = []
         steps_out: list[dict[str, Any]] = []
         scheduled: set[int] = set()
@@ -217,7 +273,7 @@ async def test_each_step_reads_the_conversation_and_records_only_what_it_added(
                 done = event.activity_task_completed_event_attributes
                 if done.scheduled_event_id in scheduled:
                     steps_out.append(json.loads(done.result.payloads[0].data))
-    assert held.total == 4  # one entry per step
+    assert len(held) == 4  # one entry per step
     assert [s["conversation"]["entries"] for s in steps_in] == [0, 1, 2, 3]
     assert all(s["transcript"] is None for s in steps_in)  # read, not copied in
     assert [(s["transcript_keep"], len(s["transcript_add"])) for s in steps_out] == [
@@ -226,7 +282,7 @@ async def test_each_step_reads_the_conversation_and_records_only_what_it_added(
         (2, 1),
         (3, 1),
     ]
-    assert held.entries == [e for s in steps_out for e in s["transcript_add"]]
+    assert held == [e for s in steps_out for e in s["transcript_add"]]
 
 
 @pytest.mark.usefixtures("shop_dir")
@@ -240,6 +296,49 @@ async def test_a_conversation_larger_than_one_query_result_reaches_every_step(
             FetchWorkflow.run, "fetch 900 KB 3 times", id=queue, task_queue=queue
         )
     assert answer == f"saw {3 * 900 * 1024} characters in 3 documents"
+
+
+@pytest.mark.usefixtures("shop_dir")
+async def test_with_external_storage_pages_stay_in_the_query_response(
+    client: Client, tmp_path: Path
+) -> None:
+    """Ten 60 KB results: about 600 KB of conversation, read at every step in pages
+    under the threshold, so none of it goes to the store again (and no other payload
+    reaches the 256 KiB threshold)."""
+    blobs = tmp_path / "blobs"
+    stored = with_external_storage(client, blobs)
+    queue = f"inline-{uuid.uuid4().hex[:8]}"
+    async with worker(stored, queue, ScriptedClaude(pages_policy)):
+        answer = await stored.execute_workflow(
+            FetchWorkflow.run, "fetch 60 KB 10 times", id=queue, task_queue=queue
+        )
+    assert answer == f"saw {10 * 60 * 1024} characters in 10 documents"
+    assert list(blobs.iterdir()) == []
+
+
+@pytest.mark.usefixtures("shop_dir")
+async def test_with_external_storage_a_large_entry_is_stored_once(
+    client: Client, tmp_path: Path
+) -> None:
+    """Four 300 KB results: each is a page of its own, over the threshold. Every
+    later step reads the same payload, so the store keeps one copy of each."""
+    blobs = tmp_path / "blobs"
+    stored = with_external_storage(client, blobs)
+    queue = f"large-{uuid.uuid4().hex[:8]}"
+    async with worker(stored, queue, ScriptedClaude(pages_policy)):
+        answer = await stored.execute_workflow(
+            FetchWorkflow.run, "fetch 300 KB 4 times", id=queue, task_queue=queue
+        )
+    assert answer == f"saw {4 * 300 * 1024} characters in 4 documents"
+    pages: list[list[Any]] = []
+    for blob in blobs.iterdir():
+        payload = Payload()
+        payload.ParseFromString(blob.read_bytes())
+        value = json.loads(payload.data)
+        if isinstance(value, list):
+            pages.append(value)
+    # Three results were read again (by 3, 2 and 1 later steps): one page each.
+    assert sorted(len(p) for p in pages) == [1, 1, 1]
 
 
 @pytest.mark.usefixtures("shop_dir")
@@ -325,7 +424,7 @@ async def test_an_explicit_continue_as_new_without_room_fails_clearly(
     if external:
         assert result == "continued with 3 entries"
     else:
-        assert result.startswith("fetched 2 documents; The agent's state (3.")
+        assert result.startswith("fetched 2 documents; The agent's state is 3.")
         assert "External Storage" in result
 
 

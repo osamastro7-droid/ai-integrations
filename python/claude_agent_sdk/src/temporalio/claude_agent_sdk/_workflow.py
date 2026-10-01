@@ -16,11 +16,10 @@ from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
 
-from ._conversation import PAYLOAD_LIMIT_BYTES, QUERY, entry_bytes, page
+from ._conversation import PAGE_BYTES, PAYLOAD_LIMIT_BYTES, QUERY, entry_bytes, page
 from ._events import TOPIC, cap_event
 from ._models import (
     AgentState,
-    ConversationPage,
     ConversationRef,
     DeferredCall,
     SegmentInput,
@@ -41,6 +40,13 @@ _TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,50}")
 """Tool names Claude Code keeps as they are: ``mcp__durable__<name>`` fits in 64 characters."""
 _RECENT_CALLS = 256  # tool calls remembered across runs for the run-once guard
 _HANDOVER_BYTES = 1536 * 1024  # live output's share keeps the new run's input small
+_HISTORY_EVENTS = 51_200
+_HISTORY_BYTES = 50 * 1024 * 1024
+"""Temporal's default limits for one run's history: the server ends a run past them."""
+_ROOM_EVENTS = 500
+_ROOM_BYTES = 3 * PAYLOAD_LIMIT_BYTES
+"""Least room kept for the next step (a result near the payload limit is stored three
+times), or twice the largest step so far, whichever is more."""
 
 
 def _is_cancellation(err: BaseException) -> bool:
@@ -95,12 +101,14 @@ class _Conversations:
     def __init__(self) -> None:
         self.agents: dict[str, DurableClaudeAgent] = {}
 
-    def serve(self, agent: str, start: int) -> ConversationPage:
+    def serve(
+        self, agent: str, start: int, total: int, limit: int
+    ) -> list[dict[str, Any]]:
         """Return a page of an agent's conversation (the segment Activity asks)."""
         held = self.agents.get(agent)
         if held is None:
             raise ValueError(f"This Workflow has no agent {agent!r}")
-        return held._page(start)  # pyright: ignore[reportPrivateUsage]
+        return held._page(start, total, limit)  # pyright: ignore[reportPrivateUsage]
 
 
 def _register(agent: DurableClaudeAgent) -> str:
@@ -320,7 +328,10 @@ class DurableClaudeAgent:
                 tool calls, when the server suggests it. The Workflow's run method
                 must accept the new arguments (see ``continue_as_new_args``), ``run``
                 must be called from that method, and no handler may wait for the
-                task (Continue-As-New waits for every handler to finish).
+                task (Continue-As-New waits for every handler to finish). If the
+                state cannot move to a new run (a long conversation without External
+                Storage), the agent keeps going in this run, and the task fails before
+                the next step could take the history past Temporal's limits.
             continue_as_new_after_events: Continue as new at this history length
                 instead of when the server suggests it.
             continue_as_new_args: Builds the new run's arguments from the state; it
@@ -379,6 +390,8 @@ class DurableClaudeAgent:
         self._key: str | None = None  # names this agent in the conversation Query
         self._sizes = [entry_bytes(e) for e in self._state.transcript]
         self._warned_handover = False
+        self._mark: tuple[int, int] | None = None  # history events and bytes then
+        self._largest_step = (0, 0)  # most events and bytes one step added
         self._keep = live_output_keep
         self._keep_bytes = live_output_keep_bytes
         self._linger = live_output_linger
@@ -511,9 +524,19 @@ class DurableClaudeAgent:
             external_storage=s.external_storage,
         )
 
-    def _page(self, start: int) -> ConversationPage:
-        """A page of the conversation the Workflow holds (read-only: Query handler)."""
-        return page(self._state.transcript, self._sizes, start)
+    def _page(self, start: int, total: int, limit: int) -> list[dict[str, Any]]:
+        """A page of the conversation the Workflow holds (read-only: Query handler).
+
+        A step scheduled with another number of entries is out of date (for example
+        an attempt that timed out and still runs): it gets no page.
+        """
+        entries = self._state.transcript
+        if total != len(entries):
+            raise ValueError(
+                f"The conversation has {len(entries)} entries, but the step that asks "
+                f"was scheduled with {total}."
+            )
+        return page(entries, self._sizes, start, min(max(limit, 1), PAGE_BYTES))
 
     # ---- Continue-As-New ----
     def should_continue_as_new(self) -> bool:
@@ -524,7 +547,9 @@ class DurableClaudeAgent:
         the agent's state fits in the new run's input. Without External Storage, a
         conversation the Workflow holds can outgrow one payload (2 MB by default);
         then this stays False, with a warning in the Worker's log, and the agent
-        keeps going in this run.
+        keeps going in this run (with ``auto_continue_as_new``, until the next step
+        could take the history past Temporal's limits: then the task fails with an
+        error that says what to change).
         """
         info = workflow.info()
         if self._continue_as_new_after_events is not None:
@@ -547,17 +572,20 @@ class DurableClaudeAgent:
         """Why the new run's input cannot carry this agent's state, or None if it can."""
         if self._state.external_storage:
             return None  # large payloads go to the store
-        payloads = workflow.payload_converter().to_payloads(
-            self._new_run_args(self.state())
-        )
-        size = sum(p.ByteSize() for p in payloads)
+        size = sum(self._sizes)  # the conversation alone: at most the state's size
         if size <= PAYLOAD_LIMIT_BYTES:
-            return None
+            payloads = workflow.payload_converter().to_payloads(
+                self._new_run_args(self.state())
+            )
+            size = sum(p.ByteSize() for p in payloads)
+            if size <= PAYLOAD_LIMIT_BYTES:
+                return None
         return (
-            f"The agent's state ({size / 1024 / 1024:.1f} MB, mostly the conversation) "
-            "is too large for the new run's input without External Storage (2 MB per "
-            "payload by default). Configure External Storage on the Client (see the "
-            "README), or give the runner a session store."
+            f"The agent's state is {size / 1024 / 1024:.2f} MB, mostly the "
+            "conversation: more than the new run's input can carry without External "
+            "Storage (Temporal refuses payloads over 2 MB by default). Configure "
+            "External Storage on the Client (see the README), or give the runner a "
+            "session store."
         )
 
     async def continue_as_new(self) -> NoReturn:
@@ -651,7 +679,8 @@ class DurableClaudeAgent:
             ApplicationError: If another task is running, Claude asks for a tool call
                 that already ran, a segment reports an error that retrying cannot fix,
                 ``max_segments`` is reached, or ``auto_continue_as_new`` is on and this
-                runs in a handler.
+                runs in a handler, or the history nearly reached Temporal's limits
+                while the state could not move to a new run.
             ActivityError: If a segment's Activity fails for good. Catch
                 ``temporalio.exceptions.FailureError`` for both.
         """
@@ -690,6 +719,7 @@ class DurableClaudeAgent:
         # A task sends its prompt with its first segment. A task handed over by
         # Continue-As-New already sent it, unless no segment of it committed.
         send_prompt = state.task_segments == 0
+        self._mark = None  # steps are measured within a task, not across idle time
         while True:
             index = state.segment_index
             state.segment_index = index + 1
@@ -798,8 +828,57 @@ class DurableClaudeAgent:
                 *(c.id for c in calls),
             ][-_RECENT_CALLS:]
             state.tool_calls += len(calls)
-            if self._auto_continue and self.should_continue_as_new():
-                await self._hand_over()
+            if self._auto_continue:
+                await self._continue_as_new_or_stop()
+
+    async def _continue_as_new_or_stop(self) -> None:
+        """Between two steps: continue as new when it is time, or stop in good order.
+
+        When the state cannot move to a new run (see :meth:`should_continue_as_new`),
+        the agent keeps going in this run until the next step could take the history
+        past Temporal's limits; then the task fails with an error that says what to
+        change, before the server ends the Workflow.
+        """
+        if self.should_continue_as_new():
+            await self._hand_over()
+        full = self._history_nearly_full()
+        if full is None:
+            return
+        problem = self._handover_problem()
+        if problem is None:
+            await self._hand_over()  # not suggested yet, but this run is nearly full
+        await self._fail(
+            f"{full}, and the agent cannot continue as new, so the task stops here "
+            f"instead of the server ending the Workflow. {problem}"
+        )
+
+    def _history_nearly_full(self) -> str | None:
+        """Describe a history the next step could take past the limits, or None.
+
+        Measured between the safe points of a task, so the margin grows with the
+        largest step: twice that step, and never less than ``_ROOM_EVENTS`` events and
+        ``_ROOM_BYTES`` bytes.
+        """
+        info = workflow.info()
+        now = (info.get_current_history_length(), info.get_current_history_size())
+        last, self._mark = self._mark, now
+        if last is not None:
+            self._largest_step = (
+                max(self._largest_step[0], now[0] - last[0]),
+                max(self._largest_step[1], now[1] - last[1]),
+            )
+        # A history length set for Continue-As-New past the default limit says the
+        # server allows more.
+        most_events = max(_HISTORY_EVENTS, self._continue_as_new_after_events or 0)
+        events = max(_ROOM_EVENTS, 2 * self._largest_step[0])
+        size = max(_ROOM_BYTES, 2 * self._largest_step[1])
+        if now[0] + events < most_events and now[1] + size < _HISTORY_BYTES:
+            return None
+        return (
+            f"This Workflow's history ({now[0]:,} events, {now[1] / 1024 / 1024:.1f} "
+            f"MB) is close to Temporal's limits ({most_events:,} events, "
+            f"{_HISTORY_BYTES // 1024 // 1024} MB by default)"
+        )
 
     def _end_task(self, reason: str) -> None:
         """Forget the stopped task, so the agent can take the next one.

@@ -21,12 +21,14 @@ from temporalio.claude_agent_sdk import (
     ClaudeAgentSdkRunner,
     FileSessionStore,
     SegmentRunner,
+    _workflow,
 )
 from temporalio.claude_agent_sdk.testing import ScriptedClaude
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.converter import DataConverter
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 from tests.conftest import LIMIT
 from tests.endless.activities import ALL
 from tests.endless.policy import count_policy
@@ -49,6 +51,17 @@ async def run_lengths(client: Client, workflow_id: str) -> list[int]:
         handle = client.get_workflow_handle(workflow_id, run_id=execution.run_id)
         lengths.append(len((await handle.fetch_history()).events))
     return lengths
+
+
+async def replay_every_run(client: Client, workflow_id: str) -> None:
+    """Replay each run's history: decisions taken from the history replay the same way."""
+    replayer = Replayer(
+        workflows=[LongTaskWorkflow],
+        plugins=[ClaudeAgentPlugin(ScriptedClaude(count_policy))],
+    )
+    async for execution in client.list_workflows(f'WorkflowId = "{workflow_id}"'):
+        handle = client.get_workflow_handle(workflow_id, run_id=execution.run_id)
+        await replayer.replay_workflow(await handle.fetch_history())
 
 
 def scripted_worker(
@@ -117,6 +130,63 @@ async def test_the_same_agent_without_continue_as_new_is_terminated_at_the_limit
     reason = f"{err.value} {err.value.cause}"
     assert "exceeds limit" in reason or "Terminated" in reason, reason
     assert 0 < len(counted()) < 120  # it stopped part way
+
+
+@pytest.mark.usefixtures("shop_dir")
+async def test_an_agent_that_cannot_continue_as_new_stops_before_the_limit(
+    limited: WorkflowEnvironment, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The conversation outgrows what a new run's input carries (here 2 KB stands in for
+    the 2 MB a long conversation outgrows without External Storage). The agent keeps
+    going in its run, then fails the task with an error that says what to change,
+    before the server ends the Workflow at its limit."""
+    monkeypatch.setattr(_workflow, "PAYLOAD_LIMIT_BYTES", 2000)
+    monkeypatch.setattr(_workflow, "_HISTORY_EVENTS", LIMIT)  # this server's limit
+    monkeypatch.setattr(_workflow, "_ROOM_EVENTS", 50)
+    client, queue = limited.client, f"full-{uuid.uuid4().hex[:8]}"
+    async with scripted_worker(client, queue, tmp_path):
+        handle = await client.start_workflow(
+            LongTaskWorkflow.run,
+            args=["count to 120", TaskOptions(), None],
+            id=queue,
+            task_queue=queue,
+        )
+        with pytest.raises(WorkflowFailureError) as err:
+            await asyncio.wait_for(handle.result(), 200)
+        lengths = await run_lengths(client, queue)
+        await replay_every_run(client, queue)
+    cause = err.value.cause
+    assert isinstance(cause, ApplicationError), cause
+    assert "close to Temporal's limits" in cause.message
+    assert "cannot continue as new" in cause.message
+    assert "External Storage" in cause.message
+    assert max(lengths) < LIMIT, lengths  # it failed in good order, not terminated
+    assert LIMIT - 100 < lengths[0], lengths  # and only near the limit
+    assert 0 < len(counted()) < 120
+
+
+@pytest.mark.usefixtures("shop_dir")
+async def test_an_agent_continues_as_new_when_its_run_is_nearly_full(
+    limited: WorkflowEnvironment, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Continue-As-New set for a history longer than the server allows: the agent
+    continues as new before the limit anyway, instead of being terminated."""
+    monkeypatch.setattr(_workflow, "_HISTORY_EVENTS", LIMIT)
+    monkeypatch.setattr(_workflow, "_ROOM_EVENTS", 50)
+    client, queue = limited.client, f"nearly-{uuid.uuid4().hex[:8]}"
+    async with scripted_worker(client, queue, tmp_path):
+        handle = await client.start_workflow(
+            LongTaskWorkflow.run,
+            args=["count to 120", TaskOptions(after_events=LIMIT - 1), None],
+            id=queue,
+            task_queue=queue,
+        )
+        result = await asyncio.wait_for(handle.result(), 200)
+        lengths = await run_lengths(client, queue)
+        await replay_every_run(client, queue)
+    assert result == "counted to 120"
+    assert counted() == [str(n) for n in range(1, 121)]
+    assert len(lengths) >= 2 and max(lengths) < LIMIT, lengths
 
 
 async def wait_for_approval(handle: WorkflowHandle[Any, Any]) -> dict[str, Any]:

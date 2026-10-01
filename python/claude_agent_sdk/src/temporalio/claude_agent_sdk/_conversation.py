@@ -7,6 +7,11 @@ copied into every step's input, and the history grows with what each step adds, 
 with the whole conversation), seeds an in-memory session store with it, and returns
 what it changed. Every attempt starts from the committed transcript, so nothing a
 failed attempt wrote can reach Claude, and any Worker can run any step.
+
+With External Storage, a Query result over its threshold goes to the store, at every
+step that reads it. So pages stay under the threshold, and a page holds nothing but
+its entries: an entry too large for a page of its own is the same payload at every
+read, which a content-addressed store (such as Temporal's S3 driver) keeps once.
 """
 
 from __future__ import annotations
@@ -16,14 +21,27 @@ import json
 from typing import Any
 
 from temporalio import activity
+from temporalio.client import WorkflowQueryFailedError
+from temporalio.converter import ExternalStorage
 
-from ._models import ConversationPage, SegmentInput, SegmentOutput, ToolStepInput
+from ._models import SegmentInput, SegmentOutput, ToolStepInput
 
 QUERY = "__temporal_claude_agent_transcript"
-"""The Workflow Query that returns the conversation, a page at a time."""
+"""The Workflow Query that returns the conversation, a page at a time.
+
+Arguments: the agent's key, the first entry, how many entries the asking step was
+scheduled with (the Query refuses a step that is out of date), and the most bytes of
+entries in the page. It returns the entries.
+"""
 
 PAGE_BYTES = 1024 * 1024
 """Most bytes of entries in one page (Temporal checks a Query result against 2 MiB)."""
+
+PAGE_ROOM = 4 * 1024
+"""Bytes a page leaves under External Storage's threshold for its own encoding."""
+
+SMALLEST_PAGE = 128 * 1024
+"""Fewest bytes a page may hold, so a low threshold does not mean many small Queries."""
 
 PAYLOAD_LIMIT_BYTES = 2 * 1024 * 1024 - 64 * 1024
 """Most bytes one payload may carry without External Storage.
@@ -52,24 +70,37 @@ def page(
     sizes: list[int],
     start: int,
     limit: int = PAGE_BYTES,
-) -> ConversationPage:
+) -> list[dict[str, Any]]:
     """The entries from ``start`` that fit in ``limit`` bytes (always at least one).
 
     Args:
         entries: The whole conversation.
         sizes: The size of each entry (``entry_bytes``).
         start: The first entry to return.
-        limit: Most bytes in the page.
+        limit: Most bytes in the page, as JSON (the list's brackets and commas too).
 
     Returns:
-        The page and the conversation's length.
+        The entries of the page.
     """
     end = start = max(0, start)
-    used = 0
-    while end < len(entries) and (end == start or used + sizes[end] <= limit):
-        used += sizes[end]
+    used = 1  # "[" and "]", less the comma the first entry does not need
+    while end < len(entries) and (end == start or used + sizes[end] + 1 <= limit):
+        used += sizes[end] + 1
         end += 1
-    return ConversationPage(entries=entries[start:end], total=len(entries))
+    return entries[start:end]
+
+
+def page_limit() -> int:
+    """Most bytes of entries in a page this step asks for.
+
+    With External Storage, just under its threshold, so pages stay in the Query's
+    response instead of going to the store at every step.
+    """
+    storage = _external_storage()
+    if storage is None:
+        return PAGE_BYTES
+    room = storage.payload_size_threshold - PAGE_ROOM
+    return min(PAGE_BYTES, max(SMALLEST_PAGE, room))
 
 
 async def read_conversation(
@@ -107,29 +138,41 @@ async def read_conversation(
     handle = activity.client().get_workflow_handle(
         info.workflow_id, run_id=info.workflow_run_id
     )
+    limit = page_limit()
     entries: list[dict[str, Any]] = []
     while len(entries) < ref.entries:
-        got = await handle.query(
-            ref.query, args=[ref.agent, len(entries)], result_type=ConversationPage
-        )
-        if not got.entries or got.total != ref.entries:
-            raise RuntimeError(
-                f"The Workflow has {got.total} conversation entries (page at "
-                f"{len(entries)}: {len(got.entries)}), but this step was scheduled "
-                f"with {ref.entries}. Retrying."
+        try:
+            got: list[dict[str, Any]] = await handle.query(
+                ref.query,
+                args=[ref.agent, len(entries), ref.entries, limit],
+                result_type=list[dict[str, Any]],
             )
-        entries.extend(got.entries)
+        except WorkflowQueryFailedError as err:
+            raise RuntimeError(
+                f"The Workflow did not serve the conversation: {err}. Retrying."
+            ) from err
+        if not got:
+            raise RuntimeError(
+                f"The Workflow served no entries at {len(entries)} of {ref.entries}. "
+                "Retrying."
+            )
+        entries.extend(got)
     return entries
+
+
+def _external_storage() -> ExternalStorage | None:
+    """This Worker's External Storage settings, or None without them."""
+    if not activity.in_activity():
+        return None
+    try:
+        return activity.client().data_converter.external_storage
+    except RuntimeError:  # no client, for example in an ActivityEnvironment
+        return None
 
 
 def external_storage_on() -> bool:
     """Whether this Worker's data converter moves large payloads to External Storage."""
-    if not activity.in_activity():
-        return False
-    try:
-        return activity.client().data_converter.external_storage is not None
-    except RuntimeError:  # no client, for example in an ActivityEnvironment
-        return False
+    return _external_storage() is not None
 
 
 def too_large(out: SegmentOutput) -> str | None:
