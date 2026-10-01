@@ -130,6 +130,23 @@ def test_extra_options_can_set_a_default_prompt_and_settings(tmp_path: Path) -> 
     assert prompt_for("You are a refund agent.") == f"You are a refund agent.\n\n{hint}"
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [({}, "default"), ({"permission_mode": "acceptEdits"}, "acceptEdits")],
+    ids=["unset", "set"],
+)
+def test_the_permission_mode_is_always_set(
+    tmp_path: Path, extra: dict[str, Any], expected: str
+) -> None:
+    """Claude Code 2.1.285+ uses auto mode when none is set (it blocked a subagent)."""
+    runner = _runner_in(tmp_path, extra_options=extra)
+    inp = SegmentInput(session_id="s", prompt="hi", tools=[])
+    options = runner._engine_options(  # type: ignore[reportPrivateUsage]
+        inp, {}, "s", False, None, str(tmp_path / "hook"), "server"
+    )
+    assert options["permission_mode"] == expected
+
+
 def test_extra_options_cannot_take_the_durable_servers_name(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="durable"):
         _runner_in(tmp_path, extra_options={"mcp_servers": {"durable": {}}})

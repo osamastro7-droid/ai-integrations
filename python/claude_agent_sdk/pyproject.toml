@@ -19,9 +19,11 @@ classifiers = [
 dependencies = [
   "temporalio>=1.33.0,<2",
   # 0.2.153 bundles the oldest Claude Code that keeps every tool result (see README).
-  "claude-agent-sdk>=0.2.153,<0.3",
-  # These releases ship no Windows wheel, so no bundled engine on Windows.
-  "claude-agent-sdk!=0.2.157,!=0.2.160,!=0.2.161; sys_platform == 'win32'",
+  "claude-agent-sdk>=0.2.153,<0.3; sys_platform != 'win32'",
+  # On Windows, skip the releases with no Windows wheel (the Windows engine is over
+  # PyPI's 100 MiB file limit): their sdist has no engine. Two requirements with opposite
+  # markers, so uv can lock a newer version elsewhere.
+  "claude-agent-sdk>=0.2.153,<0.3,!=0.2.157,!=0.2.160,!=0.2.161,!=0.2.162,!=0.2.163; sys_platform == 'win32'",
 ]
 
 [project.urls]
@@ -60,6 +62,17 @@ exclude-newer = "2 weeks"                        # org supply-chain cooldown for
 exclude-newer-package = { temporalio = false }   # the SDK is exempt: cutover releases must be adoptable on day one
 link-mode = "copy"
 cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src/**/*" }]
+# claude-agent-sdk's wheels bundle the Claude Code engine; its sdist does not. Never build
+# it from source, and lock a version with a wheel for each platform the SDK ships, so a
+# release that misses one platform's wheel is skipped there (the nightly newest lane too).
+no-build-package = ["claude-agent-sdk"]
+required-environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'darwin' and platform_machine == 'x86_64'",
+  "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

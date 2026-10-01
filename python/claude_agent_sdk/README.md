@@ -16,6 +16,8 @@ uv add temporalio-claude-agent-sdk
 
 It depends on `claude-agent-sdk>=0.2.153`, which bundles Claude Code 2.1.273 or newer (see [Requirements](#requirements-and-limits)).
 
+**Windows.** claude-agent-sdk 0.2.160 to 0.2.163 publish no Windows wheel (the bundled Windows engine is over PyPI's 100 MiB file limit), and their source package has no engine, so the plugin skips those versions on Windows. If a newer release misses its Windows wheel too, pin `claude-agent-sdk` to a version that has one, or install Claude Code natively and pass `cli_path` to the runner.
+
 ## Quick start
 
 A Workflow with an agent inside. Tools are ordinary Activities that take one dict argument:
@@ -94,7 +96,7 @@ The conversation lives in a session store that every Worker must reach. `FileSes
 
 Pass the plugin to the Worker, or to the Client the Worker is built from, not both. Each segment starts a Claude Code process: 0.7 to 0.9 seconds and up to about 270 MB of memory each (measured on Linux with an instant local model), so cap parallel segments with the Worker's `max_concurrent_activities`.
 
-Other [`ClaudeAgentOptions`](https://code.claude.com/docs/en/agent-sdk/python) go in the runner's `extra_options` (for example `permission_mode`, `agents`, `hooks`, `setting_sources`, `thinking`). `env`, `mcp_servers` and `allowed_tools` are merged with the plugin's own, and `system_prompt` (a string, or a preset such as Claude Code's own prompt) is the default for agents that set none. Options the agent or the plugin sets (`model`, `tools`, `max_turns`, `cwd`, `settings`, session and resume options, and the same engine flags in `extra_args`) are refused. External MCP servers run inside the segment, like built-in tools, and hooks from settings you load must not decide on the plugin's `mcp__durable__` tools.
+Other [`ClaudeAgentOptions`](https://code.claude.com/docs/en/agent-sdk/python) go in the runner's `extra_options` (for example `permission_mode`, `agents`, `hooks`, `setting_sources`, `thinking`). `env`, `mcp_servers` and `allowed_tools` are merged with the plugin's own, and `system_prompt` (a string, or a preset such as Claude Code's own prompt) is the default for agents that set none. Options the agent or the plugin sets (`model`, `tools`, `max_turns`, `cwd`, `settings`, session and resume options, and the same engine flags in `extra_args`) are refused. The runner sets `permission_mode="default"` unless you pass one: since Claude Code 2.1.285, a run without one uses auto mode when telemetry is off or the provider is Bedrock, Vertex or Foundry, and auto mode asks the model whether each tool call may run. External MCP servers run inside the segment, like built-in tools, and hooks from settings you load must not decide on the plugin's `mcp__durable__` tools.
 
 `approvers` checks the name the caller passes. It is not authentication: control who may send Updates with Temporal's own access control.
 

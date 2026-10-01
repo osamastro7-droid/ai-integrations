@@ -109,6 +109,16 @@ ENGINE_ENV = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
 """Set for every engine run. With background tasks (for example a subagent running in
 the background), the engine keeps working after it paused at a durable call."""
 
+DEFAULT_PERMISSION_MODE = "default"
+"""Permission mode unless ``extra_options`` sets one.
+
+Since Claude Code 2.1.285, a run with no permission mode uses auto mode when telemetry
+is off or the provider is Bedrock, Vertex or Foundry. Auto mode asks the model whether
+each tool call is safe, and blocked a subagent in this plugin's tests (claude-agent-sdk
+0.2.163). Setting the mode keeps every engine version on the same rules: tools in
+``allowed_tools`` run, others are refused.
+"""
+
 _RESERVED_OPTIONS = {
     "tools": "DurableClaudeAgent(builtin_tools=...)",
     "model": "DurableClaudeAgent(model=...) or ClaudeAgentSdkRunner(model=...)",
@@ -928,6 +938,7 @@ class ClaudeAgentSdkRunner:
                 "TCA_ANSWERED_IDS": " ".join(injected),
             },
             "cli_path": self._cli_path,
+            "permission_mode": DEFAULT_PERMISSION_MODE,  # extra_options may change it
             # The engine echoes each delivered result as one line: room for any result.
             "max_buffer_size": max(
                 MIN_BUFFER_BYTES,
