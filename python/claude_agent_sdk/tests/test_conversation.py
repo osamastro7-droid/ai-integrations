@@ -145,7 +145,9 @@ async def test_a_step_reads_the_conversation_a_page_at_a_time() -> None:
 # ---- the scripted runner holds its conversation too ----
 
 
-async def test_scripted_claude_keeps_its_state_in_the_conversation() -> None:
+async def test_scripted_claude_keeps_its_state_in_the_conversation(
+    tmp_path: Path,
+) -> None:
     runner = ScriptedClaude(count_policy)
     transcript: list[dict[str, Any]] = []
     out = await runner.run(
@@ -179,7 +181,7 @@ async def test_scripted_claude_keeps_its_state_in_the_conversation() -> None:
             SegmentInput(session_id="s", prompt="hi", tools=[], checkpoint="cp_x"), 1
         )
     with pytest.raises(RuntimeError, match="kept in its Workflow"):
-        await ScriptedClaude(count_policy, "unused").run(
+        await ScriptedClaude(count_policy, tmp_path / "folder").run(
             SegmentInput(session_id="s", prompt="hi", tools=[], transcript=transcript),
             1,
         )
