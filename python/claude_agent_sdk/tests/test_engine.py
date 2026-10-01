@@ -1,7 +1,8 @@
 """The real Claude Code engine (bundled in claude-agent-sdk) against a local fake Messages API.
 
 These tests drive ClaudeAgentSdkRunner directly, segment by segment, the way the
-Workflow does, so they pin down the engine behavior the plugin relies on.
+Workflow does (holding the conversation, by default, or with a session store), so they
+pin down the engine behavior the plugin relies on.
 """
 
 from __future__ import annotations
@@ -44,9 +45,11 @@ TOOLS = [
 ]
 
 
-def _make_runner(api: FakeMessagesAPI, tmp_path: Path) -> ClaudeAgentSdkRunner:
+def _make_runner(
+    api: FakeMessagesAPI, tmp_path: Path, mode: str = "held"
+) -> ClaudeAgentSdkRunner:
     return ClaudeAgentSdkRunner(
-        session_store=FileSessionStore(tmp_path / "store"),
+        session_store=FileSessionStore(tmp_path / "store") if mode == "store" else None,
         cwd=str(tmp_path),
         env=engine_env(api, str(tmp_path / "cfg")),
     )
@@ -61,34 +64,68 @@ def _fake_tool(name: str, args: dict[str, Any]) -> ToolOutcome:
 
 
 async def _drive(
-    runner: ClaudeAgentSdkRunner, prompt: str, tools: list[ToolSpec], limit: int = 8
+    runner: ClaudeAgentSdkRunner,
+    prompt: str,
+    tools: list[ToolSpec],
+    limit: int = 8,
+    added: list[int] | None = None,
 ) -> tuple[list[tuple[str, dict[str, Any]]], SegmentOutput]:
-    """Run segments like the Workflow does: pause, run the tool, resume with its result."""
-    seg = await runner.run(
-        SegmentInput(session_id=str(uuid.uuid4()), prompt=prompt, tools=tools), 1
+    """Run segments like the Workflow does: pause, run the tool, resume with its result.
+
+    Without a session store, it holds the conversation like the Workflow, and records
+    how many entries each segment added in ``added``.
+    """
+    held = runner._store is None  # type: ignore[reportPrivateUsage]
+    transcript: list[dict[str, Any]] = []
+
+    def hold(out: SegmentOutput) -> SegmentOutput:
+        nonlocal transcript
+        if held and not out.is_error:
+            assert out.transcript_keep is not None
+            transcript = transcript[: out.transcript_keep] + out.transcript_add
+            if added is not None:
+                added.append(len(out.transcript_add))
+        return out
+
+    seg = hold(
+        await runner.run(
+            SegmentInput(
+                session_id=str(uuid.uuid4()),
+                prompt=prompt,
+                tools=tools,
+                transcript=[] if held else None,
+            ),
+            1,
+        )
     )
     paused: list[tuple[str, dict[str, Any]]] = []
     while seg.deferred is not None and len(paused) < limit:
         call = seg.deferred
         paused.append((call.name, call.input))
-        seg = await runner.run(
-            SegmentInput(
-                session_id=seg.session_id,
-                prompt=None,
-                tools=tools,
-                checkpoint=seg.checkpoint,
-                injected={call.id: _fake_tool(call.name, call.input)},
-                segment_index=len(paused),
-            ),
-            1,
+        seg = hold(
+            await runner.run(
+                SegmentInput(
+                    session_id=seg.session_id,
+                    prompt=None,
+                    tools=tools,
+                    checkpoint=seg.checkpoint,
+                    injected={call.id: _fake_tool(call.name, call.input)},
+                    segment_index=len(paused),
+                    transcript=list(transcript) if held else None,
+                ),
+                1,
+            )
         )
     return paused, seg
 
 
-async def test_engine_pauses_at_every_durable_call_and_resumes(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["held", "store"])
+async def test_engine_pauses_at_every_durable_call_and_resumes(
+    tmp_path: Path, mode: str
+) -> None:
     api = start_with_policy(refund_policy)
     try:
-        runner = _make_runner(api, tmp_path)
+        runner = _make_runner(api, tmp_path, mode)
         paused, final = await _drive(
             runner, "Order A-1001 arrived broken, I want my money back.", TOOLS
         )
@@ -107,7 +144,10 @@ async def test_engine_pauses_at_every_durable_call_and_resumes(tmp_path: Path) -
     assert runner.stub_calls == 0  # the engine never ran a durable tool itself
 
 
-async def test_parallel_calls_are_serialized_not_lost(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["held", "store"])
+async def test_parallel_calls_are_serialized_not_lost(
+    tmp_path: Path, mode: str
+) -> None:
     """Claude asks for two tools in one message: one pauses, the other is told to retry."""
     wanted = ("A-1001", "A-1002")
     ref: list[FakeMessagesAPI] = []
@@ -132,7 +172,7 @@ async def test_parallel_calls_are_serialized_not_lost(tmp_path: Path) -> None:
     ref.append(api)
     api.start()
     try:
-        runner = _make_runner(api, tmp_path)
+        runner = _make_runner(api, tmp_path, mode)
         paused, final = await _drive(
             runner, "Check orders A-1001 and A-1002.", TOOLS[:1]
         )

@@ -120,7 +120,7 @@ def test_extra_options_can_set_a_default_prompt_and_settings(tmp_path: Path) -> 
             session_id="s", prompt="hi", tools=[], system_prompt=agent_prompt
         )
         options = runner._engine_options(  # type: ignore[reportPrivateUsage]
-            inp, {}, "s", False, None, str(tmp_path / "hook"), "server"
+            inp, {}, "s", False, None, None, str(tmp_path / "hook"), "server"
         )
         assert options["setting_sources"] == ["project"]
         assert options["session_store_flush"] == "eager"
@@ -142,7 +142,7 @@ def test_the_permission_mode_is_always_set(
     runner = _runner_in(tmp_path, extra_options=extra)
     inp = SegmentInput(session_id="s", prompt="hi", tools=[])
     options = runner._engine_options(  # type: ignore[reportPrivateUsage]
-        inp, {}, "s", False, None, str(tmp_path / "hook"), "server"
+        inp, {}, "s", False, None, None, str(tmp_path / "hook"), "server"
     )
     assert options["permission_mode"] == expected
 
@@ -170,7 +170,7 @@ def test_extra_options_are_merged_with_the_plugins_own(tmp_path: Path) -> None:
     )
     hook_dir = str(tmp_path / "hook")
     small = runner._engine_options(  # type: ignore[reportPrivateUsage]
-        inp, {}, inp.session_id, False, None, hook_dir, "server"
+        inp, {}, inp.session_id, False, None, None, hook_dir, "server"
     )
     env = small["env"]
     assert (
@@ -186,7 +186,7 @@ def test_extra_options_are_merged_with_the_plugins_own(tmp_path: Path) -> None:
     # A result the engine echoes as one long line still fits.
     big = ToolOutcome("x" * (9 * 1024 * 1024))
     large = runner._engine_options(  # type: ignore[reportPrivateUsage]
-        inp, {"toolu_1": big}, inp.session_id, True, None, hook_dir, "server"
+        inp, {"toolu_1": big}, inp.session_id, True, None, None, hook_dir, "server"
     )
     assert large["max_buffer_size"] >= 8 * 9 * 1024 * 1024
 

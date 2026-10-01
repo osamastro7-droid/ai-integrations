@@ -1,10 +1,12 @@
 """Test helpers: a scripted stand-in for Claude that needs no engine and no API key.
 
-``ScriptedClaude`` is a segment runner driven by a Python policy. It keeps each
-session in a folder, like the SDK's session store, so a new Worker process can
-continue a session that a crashed Worker started. Like the real runner, each segment
-ends at a checkpoint, and a segment that runs again starts over from the checkpoint
-it was given, so a retry makes Claude decide again (with a new tool call id).
+``ScriptedClaude`` is a segment runner driven by a Python policy. Like the real
+runner, it keeps each conversation in its Workflow by default, so a new Worker
+process can continue a conversation that a crashed Worker started, with no shared
+storage; or, given a folder, it keeps sessions there, like a session store. Each
+segment ends at a checkpoint, and a segment that runs again starts over from the
+checkpoint it was given, so a retry makes Claude decide again (with a new tool call
+id).
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ._conversation import external_storage_on, read_conversation
 from ._events import emit
 from ._models import DeferredCall, SegmentInput, SegmentOutput, ToolOutcome
 
@@ -78,13 +81,30 @@ def _as_outcome(value: Any) -> ToolOutcome:
     )
 
 
+def _new_state(prompt: str) -> dict[str, Any]:
+    return {"prompt": prompt, "history": [], "pending": None, "turn": 0}
+
+
+def _fold(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """The conversation's state after ``entries`` (one entry per segment)."""
+    state = _new_state("")
+    for entry in entries:
+        if "prompt" in entry:
+            state["prompt"] = entry["prompt"]
+        if "result" in entry and state["pending"] is not None:
+            state["history"].append({**state["pending"], **entry["result"]})
+        state["pending"] = entry.get("call")
+        state["turn"] = entry["turn"]
+    return state
+
+
 class ScriptedClaude:
     """A segment runner that plays Claude with a Python policy."""
 
     def __init__(
         self,
         policy: Policy,
-        state_dir: str | os.PathLike[str],
+        state_dir: str | os.PathLike[str] | None = None,
         *,
         cost_per_segment: float = 0.01,
         think_seconds: float = 0.0,
@@ -93,17 +113,22 @@ class ScriptedClaude:
 
         Args:
             policy: Decides each step.
-            state_dir: Folder for session state, shared by all Workers in a test.
+            state_dir: None (the default) keeps each conversation in its Workflow,
+                like ``ClaudeAgentSdkRunner`` without a session store. A folder keeps
+                sessions there instead, like a session store; share it between all
+                Workers of a test.
             cost_per_segment: Cost reported for each segment, in USD.
             think_seconds: Delay per segment, to leave time for a test to crash a Worker.
         """
         self._policy = policy
-        self._dir = Path(state_dir)
-        self._dir.mkdir(parents=True, exist_ok=True)
+        self._dir = Path(state_dir) if state_dir is not None else None
+        if self._dir is not None:
+            self._dir.mkdir(parents=True, exist_ok=True)
         self._cost = cost_per_segment
         self._think = think_seconds
 
     def _path(self, session_id: str, checkpoint: str) -> Path:
+        assert self._dir is not None
         return self._dir / session_id / f"{checkpoint}.json"
 
     def _load(self, session_id: str, checkpoint: str) -> dict[str, Any]:
@@ -116,6 +141,7 @@ class ScriptedClaude:
 
     def _save(self, session_id: str, state: dict[str, Any]) -> str:
         """Store the state as a new checkpoint (never changed afterwards)."""
+        assert self._dir is not None
         checkpoint = f"cp_{uuid.uuid4().hex[:12]}"
         folder = self._dir / session_id
         folder.mkdir(parents=True, exist_ok=True)
@@ -134,18 +160,36 @@ class ScriptedClaude:
 
         Returns:
             A pause at the policy's next tool call, or its final answer.
+
+        Raises:
+            RuntimeError: If the conversation is kept where this runner does not keep
+                it, or the Workflow did not serve it (Temporal retries).
         """
-        if inp.checkpoint is None:
-            state: dict[str, Any] = {
-                "prompt": inp.prompt or "",
-                "history": [],
-                "pending": None,
-                "turn": 0,
-            }
+        entries: list[dict[str, Any]] = []
+        if self._dir is None:
+            entries = await read_conversation(inp)
+            problem = self._held_problem(inp, entries)
+            if problem is not None:
+                return SegmentOutput(
+                    session_id=inp.session_id, is_error=True, error=problem
+                )
+            state = _fold(entries) if entries else _new_state(inp.prompt or "")
         else:
-            state = self._load(inp.session_id, inp.checkpoint)
-            if inp.prompt is not None:
-                state["prompt"] = inp.prompt  # a new task on the same session
+            if inp.transcript or (
+                inp.conversation is not None and inp.conversation.entries
+            ):
+                raise RuntimeError(
+                    f"Session {inp.session_id} is kept in its Workflow, but this "
+                    "ScriptedClaude keeps sessions in a folder. Retrying."
+                )
+            if inp.checkpoint is None:
+                state = _new_state(inp.prompt or "")
+            else:
+                state = self._load(inp.session_id, inp.checkpoint)
+        change: dict[str, Any] = {}  # what this segment adds to the conversation
+        if inp.prompt is not None:
+            state["prompt"] = inp.prompt  # a new task on the same session
+            change["prompt"] = inp.prompt
         pending = state["pending"]
         if pending is not None:
             raw = inp.injected.get(pending["id"])
@@ -156,44 +200,74 @@ class ScriptedClaude:
                     error=f"The paused call {pending['id']} got no result",
                 )
             outcome = _as_outcome(raw)
-            state["history"].append(
-                {**pending, "content": outcome.content, "is_error": outcome.is_error}
-            )
+            result = {"content": outcome.content, "is_error": outcome.is_error}
+            state["history"].append({**pending, **result})
             state["pending"] = None
+            change["result"] = result
         if self._think:
             await asyncio.sleep(self._think)
         action = self._policy(
             state["prompt"], [HistoryItem(**h) for h in state["history"]]
         )
         state["turn"] += 1
+        change["turn"] = state["turn"]
+        deferred: DeferredCall | None = None
+        answer: str | None = None
         if isinstance(action, Final):
             emit({"type": "text", "text": action.text})  # what Claude writes
-            return self._out(inp, self._save(inp.session_id, state), result=action.text)
-        retry = f"_{attempt}" if attempt > 1 else ""
-        call: dict[str, Any] = {
-            "id": f"toolu_{inp.session_id[:8]}_{state['turn']:02d}{retry}",
-            "name": action.name,
-            "input": action.input,
-        }
-        state["pending"] = call
-        checkpoint = self._save(inp.session_id, state)
-        return self._out(inp, checkpoint, deferred=DeferredCall(**call))
-
-    def _out(
-        self,
-        inp: SegmentInput,
-        checkpoint: str,
-        *,
-        result: str | None = None,
-        deferred: DeferredCall | None = None,
-    ) -> SegmentOutput:
-        return SegmentOutput(
+            answer = action.text
+            change["final"] = answer
+        else:
+            retry = f"_{attempt}" if attempt > 1 else ""
+            call: dict[str, Any] = {
+                "id": f"toolu_{inp.session_id[:8]}_{state['turn']:02d}{retry}",
+                "name": action.name,
+                "input": action.input,
+            }
+            state["pending"] = call
+            change["call"] = call
+            deferred = DeferredCall(**call)
+        if self._dir is not None:
+            checkpoint = self._save(inp.session_id, state)
+        else:
+            checkpoint = f"cp_{uuid.uuid4().hex[:12]}"
+        out = SegmentOutput(
             session_id=inp.session_id,
-            result=result,
+            result=answer,
             deferred=deferred,
             checkpoint=checkpoint,
             cost_usd=self._cost,
+            external_storage=external_storage_on(),
         )
+        if self._dir is None:
+            out.transcript_keep = len(entries)
+            out.transcript_add = [{"uuid": checkpoint, **change}]
+        return out
+
+    @staticmethod
+    def _held_problem(inp: SegmentInput, entries: list[dict[str, Any]]) -> str | None:
+        """Check that the conversation the Workflow holds ends at the checkpoint.
+
+        Raises:
+            RuntimeError: If the Workflow holds no conversation for a session that
+                has a checkpoint: it is kept in a folder this runner does not have.
+        """
+        if inp.checkpoint is None:
+            if entries:
+                return "The Workflow holds a conversation but no checkpoint"
+            return None
+        if not entries:
+            raise RuntimeError(
+                f"The Workflow holds no conversation for session {inp.session_id} "
+                f"(checkpoint {inp.checkpoint}): it is kept in a folder this "
+                "ScriptedClaude does not have. Retrying."
+            )
+        if entries[-1].get("uuid") != inp.checkpoint:
+            return (
+                f"The conversation the Workflow holds ends at "
+                f"{entries[-1].get('uuid')}, not at checkpoint {inp.checkpoint}"
+            )
+        return None
 
 
 __all__ = ["Final", "HistoryItem", "Policy", "ScriptedClaude", "ToolCall"]

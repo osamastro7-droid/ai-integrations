@@ -15,9 +15,12 @@ from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
 
+from ._conversation import PAYLOAD_LIMIT_BYTES, QUERY, entry_bytes, page
 from ._events import TOPIC, cap_event
 from ._models import (
     AgentState,
+    ConversationPage,
+    ConversationRef,
     DeferredCall,
     SegmentInput,
     SegmentOutput,
@@ -32,7 +35,7 @@ _OPEN_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": True}
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,50}")
 """Tool names Claude Code keeps as they are: ``mcp__durable__<name>`` fits in 64 characters."""
 _RECENT_CALLS = 256  # tool calls remembered across runs for the run-once guard
-_HANDOVER_BYTES = 1536 * 1024  # the new run's input stays well under the 2 MiB limit
+_HANDOVER_BYTES = 1536 * 1024  # live output's share keeps the new run's input small
 
 
 def _is_cancellation(err: BaseException) -> bool:
@@ -48,6 +51,39 @@ def _check_tool_name(name: str) -> None:
             f"Tool name {name!r}: use 1 to 50 letters, digits, '_' or '-'. Claude Code "
             "renames other tool names, and the call could never run."
         )
+
+
+class _Conversations:
+    """The agents of one Workflow whose conversation the Query serves.
+
+    One per Workflow instance: it lives on the Query handler itself, so it is never
+    shared between Workflows that run in the same Worker process.
+    """
+
+    def __init__(self) -> None:
+        self.agents: dict[str, DurableClaudeAgent] = {}
+
+    def serve(self, agent: str, start: int) -> ConversationPage:
+        """Return a page of an agent's conversation (the segment Activity asks)."""
+        held = self.agents.get(agent)
+        if held is None:
+            raise ValueError(f"This Workflow has no agent {agent!r}")
+        return held._page(start)  # pyright: ignore[reportPrivateUsage]
+
+
+def _register(agent: DurableClaudeAgent) -> str:
+    """Serve ``agent``'s conversation through the Workflow's Query; return its key.
+
+    Keys count agents in the order they first run, which replays the same way.
+    """
+    handler = workflow.get_query_handler(QUERY)
+    registry = getattr(handler, "__self__", None)
+    if not isinstance(registry, _Conversations):
+        registry = _Conversations()
+        workflow.set_query_handler(QUERY, registry.serve)
+    key = str(len(registry.agents))
+    registry.agents[key] = agent
+    return key
 
 
 def _handler_context() -> str | None:
@@ -177,7 +213,8 @@ class DurableClaudeAgent:
 
     Each model segment is one Activity. Each durable tool call is its own Activity.
     Tools marked ``needs_approval`` wait for :meth:`decide`. The agent runs one task
-    at a time.
+    at a time. The conversation lives in the Workflow, unless the Worker's runner
+    keeps it in a session store; segments read it with a Query.
 
     Long sessions can continue as new (:meth:`continue_as_new`), carrying an
     :class:`AgentState`; with ``auto_continue_as_new=True`` the agent does it by
@@ -286,6 +323,9 @@ class DurableClaudeAgent:
         self._unanswered: DeferredCall | None = None
         self._running = False
         self._state = state if state is not None else AgentState()
+        self._key: str | None = None  # names this agent in the conversation Query
+        self._sizes = [entry_bytes(e) for e in self._state.transcript]
+        self._warned_handover = False
         self._keep = live_output_keep
         self._keep_bytes = live_output_keep_bytes
         self._linger = live_output_linger
@@ -414,21 +454,58 @@ class DurableClaudeAgent:
             total_cost_usd=s.total_cost_usd,
             runs=s.runs,
             fork_next=s.fork_next,
+            transcript=list(s.transcript),
+            external_storage=s.external_storage,
         )
+
+    def _page(self, start: int) -> ConversationPage:
+        """A page of the conversation the Workflow holds (read-only: Query handler)."""
+        return page(self._state.transcript, self._sizes, start)
 
     # ---- Continue-As-New ----
     def should_continue_as_new(self) -> bool:
         """Whether it is time to continue as new.
 
         True when the server suggests it (it counts history events, history size
-        and Updates), or at ``continue_as_new_after_events`` when that is set.
+        and Updates), or at ``continue_as_new_after_events`` when that is set, and
+        the agent's state fits in the new run's input. Without External Storage, a
+        conversation the Workflow holds can outgrow one payload (2 MB by default);
+        then this stays False, with a warning in the Worker's log, and the agent
+        keeps going in this run.
         """
         info = workflow.info()
         if self._continue_as_new_after_events is not None:
-            return (
+            due = (
                 info.get_current_history_length() >= self._continue_as_new_after_events
             )
-        return info.is_continue_as_new_suggested()
+        else:
+            due = info.is_continue_as_new_suggested()
+        if not due:
+            return False
+        problem = self._handover_problem()
+        if problem is None:
+            return True
+        if not self._warned_handover:
+            self._warned_handover = True
+            workflow.logger.warning("%s The agent keeps going in this run.", problem)
+        return False
+
+    def _handover_problem(self) -> str | None:
+        """Why the new run's input cannot carry this agent's state, or None if it can."""
+        if self._state.external_storage:
+            return None  # large payloads go to the store
+        payloads = workflow.payload_converter().to_payloads(
+            self._new_run_args(self.state())
+        )
+        size = sum(p.ByteSize() for p in payloads)
+        if size <= PAYLOAD_LIMIT_BYTES:
+            return None
+        return (
+            f"The agent's state ({size / 1024 / 1024:.1f} MB, mostly the conversation) "
+            "is too large for the new run's input without External Storage (2 MB per "
+            "payload by default). Configure External Storage on the Client (see the "
+            "README), or give the runner a session store."
+        )
 
     async def continue_as_new(self) -> NoReturn:
         """Continue the Workflow as new, carrying this agent's state.
@@ -441,10 +518,15 @@ class DurableClaudeAgent:
         ``[prompt, state]``).
 
         Raises:
-            ApplicationError: If called from an Update or Signal handler.
+            ApplicationError: If called from an Update or Signal handler, or if the
+                state does not fit in the new run's input (see
+                :meth:`should_continue_as_new`).
         """
         self._refuse_in_handler("continue_as_new()")
         await workflow.wait_condition(lambda: not self._running)
+        problem = self._handover_problem()
+        if problem is not None:
+            raise ApplicationError(problem, non_retryable=True)
         await self._hand_over()
 
     def _refuse_in_handler(self, what: str) -> None:
@@ -465,13 +547,16 @@ class DurableClaudeAgent:
         state = self.state()
         state.runs += 1
         if self._stream is not None:
-            # The stream shares the new run's input with everything else in it. That is
-            # measured before any codec or External Storage, which can only overstate it.
-            payloads = workflow.payload_converter().to_payloads(
-                self._new_run_args(state)
-            )
-            rest = sum(p.ByteSize() for p in payloads)
-            self._trim_stream(max(0, min(self._keep_bytes, _HANDOVER_BYTES - rest)))
+            budget = self._keep_bytes
+            if not state.external_storage:
+                # The stream shares the new run's input with everything else in it.
+                # That is measured before any codec, which can only overstate it.
+                payloads = workflow.payload_converter().to_payloads(
+                    self._new_run_args(state)
+                )
+                rest = sum(p.ByteSize() for p in payloads)
+                budget = max(0, min(budget, _HANDOVER_BYTES - rest))
+            self._trim_stream(budget)
             state.stream = self._stream.get_state()
         workflow.continue_as_new(args=self._new_run_args(state))
 
@@ -524,6 +609,8 @@ class DurableClaudeAgent:
             )
         if self._auto_continue:
             self._refuse_in_handler("run() with auto_continue_as_new")
+        if self._key is None:
+            self._key = _register(self)
         state = self._state
         if state.task_prompt is None:
             if prompt is None:
@@ -569,6 +656,11 @@ class DurableClaudeAgent:
                         segment_index=index,
                         live_output=self._stream is not None,
                         fork=state.fork_next,
+                        conversation=ConversationRef(
+                            query=QUERY,
+                            agent=self._key or "",
+                            entries=len(state.transcript),
+                        ),
                     ),
                     result_type=SegmentOutput,
                     start_to_close_timeout=self._segment_timeout,
@@ -593,12 +685,22 @@ class DurableClaudeAgent:
                     "The segment runner returned no checkpoint, so a retry could not "
                     "continue this session safely."
                 )
+            mixed = self._conversation_problem(seg)
+            if mixed is not None:
+                await self._fail(mixed)
             # The segment committed: its tool results and prompt reached Claude.
             send_prompt = False
             state.pending = {}
             state.fork_next = False
             state.session_id = seg.session_id or state.session_id
             state.checkpoint = seg.checkpoint
+            state.external_storage = seg.external_storage
+            if seg.transcript_keep is not None:
+                keep = seg.transcript_keep
+                state.transcript = state.transcript[:keep] + list(seg.transcript_add)
+                self._sizes = self._sizes[:keep] + [
+                    entry_bytes(e) for e in seg.transcript_add
+                ]
             if seg.deferred is None:
                 state.task_prompt = None
                 state.task_segments = 0
@@ -634,9 +736,10 @@ class DurableClaudeAgent:
     def _end_task(self, reason: str) -> None:
         """Forget the stopped task, so the agent can take the next one.
 
-        The session may hold part of a segment that did not commit, so the next
-        segment continues from the checkpoint in a copy of the session. A tool call
-        Claude is still waiting for gets an error result, delivered with the next task.
+        The next segment continues from the checkpoint (with a session store, in a
+        copy of the session, which may hold part of a segment that did not commit).
+        A tool call Claude is still waiting for gets an error result, delivered with
+        the next task.
         """
         state = self._state
         call = self._unanswered
@@ -656,6 +759,36 @@ class DurableClaudeAgent:
         state.fork_next = True
         if state.checkpoint is None:
             state.session_id = None  # nothing committed: the next task starts afresh
+
+    def _conversation_problem(self, seg: SegmentOutput) -> str | None:
+        """Refuse a segment that keeps the conversation somewhere else than before."""
+        state = self._state
+        same_choice = (
+            "Every Worker of a task queue needs the same kind of runner (with or "
+            "without a session store)."
+        )
+        if seg.transcript_keep is None:
+            if state.transcript:
+                return (
+                    "The segment runner keeps conversations in a session store, but "
+                    f"this Workflow holds this one. {same_choice}"
+                )
+            return None
+        if state.checkpoint is not None and not state.transcript:
+            return (
+                "The segment runner returned a conversation for the Workflow to hold, "
+                f"but this one is kept in a session store. {same_choice}"
+            )
+        keep = seg.transcript_keep
+        if (
+            not 0 <= keep <= len(state.transcript)
+            or keep + len(seg.transcript_add) == 0
+        ):
+            return (
+                f"The segment runner kept {keep} of {len(state.transcript)} "
+                f"conversation entries and added {len(seg.transcript_add)}."
+            )
+        return None
 
     async def _fail(self, message: str) -> NoReturn:
         self._end_task(message)

@@ -2,9 +2,10 @@
 
 Run 1 is a normal refund with a manager's approval. Run 2 kills the Worker right after
 the refund, and a new Worker with an empty Claude config folder (a different machine)
-finishes the job from the shared session store. Then the Worker dies in the middle of
-a segment, and a segment attempt outlives its timeout: each time the segment runs
-again from its checkpoint, and every tool runs once.
+finishes the job: with the conversation in the Workflow, the Workers share nothing
+but the Temporal server; with a session store, they share the store. Then the Worker
+dies in the middle of a segment, and a segment attempt outlives its timeout: each time
+the segment runs again from its checkpoint, and every tool runs once.
 """
 
 from __future__ import annotations
@@ -44,17 +45,34 @@ PROMPT = "Order A-1001 arrived broken, I want my money back."
 pytestmark = pytest.mark.timeout(240)
 
 
-@pytest.mark.parametrize("crash", [False, True], ids=["clean", "crash-after-refund"])
+def shared_settings(tmp_path: Path, shop_dir: Path, mode: str) -> dict[str, str]:
+    """What every Worker process of a test shares: the shop, and the store if any."""
+    settings = {
+        "SHOP_DIR": str(shop_dir),
+        "ENGINE_CWD": str(tmp_path / "work"),
+        "RUNNER_MODE": mode,
+    }
+    if mode == "store":
+        settings["SESSION_DIR"] = str(tmp_path / "sessions")
+    return settings
+
+
+@pytest.mark.parametrize(
+    ("crash", "mode"),
+    [(False, "held"), (True, "held"), (True, "store")],
+    ids=["clean", "crash-after-refund", "crash-after-refund-store"],
+)
 async def test_real_engine_refund_with_approval(
-    client: Client, address: str, shop_dir: Path, tmp_path: Path, crash: bool
+    client: Client,
+    address: str,
+    shop_dir: Path,
+    tmp_path: Path,
+    crash: bool,
+    mode: str,
 ) -> None:
     api = start_with_policy(refund_policy)
     queue = f"e2e-{uuid.uuid4().hex[:8]}"
-    shared = {
-        "SHOP_DIR": str(shop_dir),
-        "SESSION_DIR": str(tmp_path / "sessions"),  # the store every Worker can reach
-        "ENGINE_CWD": str(tmp_path / "work"),
-    }
+    shared = shared_settings(tmp_path, shop_dir, mode)
     (tmp_path / "work").mkdir()
 
     def machine(n: int) -> dict[str, str]:
@@ -107,6 +125,9 @@ async def test_real_engine_refund_with_approval(
     assert len(shop.read("refunds.jsonl")) == 1
     assert len(shop.executions("issue_refund")) == 1
     assert api.errors == []  # every request followed the real API's tool rules
+    if mode == "held":  # nothing of the conversation stayed on the Workers' disks
+        for n in (1, 2):
+            assert not list((tmp_path / f"claude-config-{n}").glob("projects/*/*"))
 
 
 def hang_on_request(api: FakeMessagesAPI, number: int) -> tuple[Event, Event]:
@@ -127,18 +148,15 @@ def hang_on_request(api: FakeMessagesAPI, number: int) -> tuple[Event, Event]:
     return arrived, release
 
 
+@pytest.mark.parametrize("mode", ["held", "store"])
 async def test_real_engine_crash_in_the_middle_of_a_segment(
-    client: Client, address: str, shop_dir: Path, tmp_path: Path
+    client: Client, address: str, shop_dir: Path, tmp_path: Path, mode: str
 ) -> None:
     """The Worker dies while Claude is answering; a new Worker redoes that segment cleanly."""
     api = start_with_policy(refund_policy)
     arrived, release = hang_on_request(api, 2)  # the turn after look_up_order's result
     queue = f"midseg-{uuid.uuid4().hex[:8]}"
-    shared = {
-        "SHOP_DIR": str(shop_dir),
-        "SESSION_DIR": str(tmp_path / "sessions"),
-        "ENGINE_CWD": str(tmp_path / "work"),
-    }
+    shared = shared_settings(tmp_path, shop_dir, mode)
     (tmp_path / "work").mkdir()
 
     def machine(n: int) -> dict[str, str]:
@@ -183,8 +201,9 @@ async def test_real_engine_crash_in_the_middle_of_a_segment(
     assert api.errors == []
 
 
+@pytest.mark.parametrize("mode", ["held", "store"])
 async def test_real_engine_segment_that_times_out_is_retried_cleanly(
-    client: Client, shop_dir: Path, tmp_path: Path
+    client: Client, shop_dir: Path, tmp_path: Path, mode: str
 ) -> None:
     """Attempt 1 hangs past its timeout and keeps running; attempt 2 must not build on it."""
     del shop_dir
@@ -192,7 +211,9 @@ async def test_real_engine_segment_that_times_out_is_retried_cleanly(
     arrived, release = hang_on_request(api, 3)
     (tmp_path / "work").mkdir()
     runner = ClaudeAgentSdkRunner(
-        session_store=FileSessionStore(tmp_path / "sessions"),
+        session_store=(
+            FileSessionStore(tmp_path / "sessions") if mode == "store" else None
+        ),
         cwd=str(tmp_path / "work"),
         env=engine_env(api, str(tmp_path / "cfg")),
     )

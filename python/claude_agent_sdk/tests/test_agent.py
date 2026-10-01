@@ -1,4 +1,7 @@
-"""The durable agent loop in a Workflow, with a scripted stand-in for Claude (no engine)."""
+"""The durable agent loop in a Workflow, with a scripted stand-in for Claude (no engine).
+
+The conversation lives in the Workflow (the default) unless a test says ``store``.
+"""
 
 from __future__ import annotations
 
@@ -30,11 +33,13 @@ async def run_case(
     *,
     approve: bool | None = True,
     prompt: str = BROKEN_TEAPOT,
+    mode: str = "held",
 ) -> tuple[str, list[dict[str, Any]], float, WorkflowHistory]:
     """Run one refund request end to end and return what happened."""
     queue = f"tq-{uuid.uuid4().hex[:8]}"
+    folder = tmp / "fake" if mode == "store" else None
     plugin = ClaudeAgentPlugin(
-        ScriptedClaude(refund_policy, tmp / "fake"), heartbeat_every=1.0
+        ScriptedClaude(refund_policy, folder), heartbeat_every=1.0
     )
     async with Worker(
         client,
@@ -62,10 +67,11 @@ async def run_case(
 
 
 @pytest.mark.usefixtures("shop_dir")
+@pytest.mark.parametrize("mode", ["held", "store"])
 async def test_approved_refund_runs_each_tool_once(
-    client: Client, tmp_path: Path
+    client: Client, tmp_path: Path, mode: str
 ) -> None:
-    result, calls, cost, _ = await run_case(client, tmp_path)
+    result, calls, cost, _ = await run_case(client, tmp_path, mode=mode)
     assert result.startswith("Done. Refunded 49.99 EUR for order A-1001")
     assert [(c["name"], c["status"]) for c in calls] == [
         ("look_up_order", "done"),
@@ -108,11 +114,12 @@ async def test_tool_error_goes_back_to_claude(client: Client, tmp_path: Path) ->
 
 
 @pytest.mark.usefixtures("shop_dir")
+@pytest.mark.parametrize("mode", ["held", "store"])
 async def test_history_replays_without_nondeterminism(
-    client: Client, tmp_path: Path
+    client: Client, tmp_path: Path, mode: str
 ) -> None:
-    _, _, _, history = await run_case(client, tmp_path)
-    plugin = ClaudeAgentPlugin(ScriptedClaude(refund_policy, tmp_path / "replay"))
+    _, _, _, history = await run_case(client, tmp_path, mode=mode)
+    plugin = ClaudeAgentPlugin(ScriptedClaude(refund_policy))
     replayer = Replayer(workflows=[RefundAgentWorkflow], plugins=[plugin])
     await replayer.replay_workflow(history)
 
@@ -122,9 +129,8 @@ async def test_only_an_allowed_approver_can_approve(
     client: Client, tmp_path: Path
 ) -> None:
     queue = f"tq-{uuid.uuid4().hex[:8]}"
-    plugin = ClaudeAgentPlugin(
-        ScriptedClaude(refund_policy, tmp_path / "fake"), heartbeat_every=1.0
-    )
+    del tmp_path
+    plugin = ClaudeAgentPlugin(ScriptedClaude(refund_policy), heartbeat_every=1.0)
     async with Worker(
         client,
         task_queue=queue,

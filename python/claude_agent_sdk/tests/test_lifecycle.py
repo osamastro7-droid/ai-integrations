@@ -92,11 +92,11 @@ async def activity_types(handle: WorkflowHandle[Any, Any]) -> Counter[str]:
 
 @pytest.mark.usefixtures("shop_dir")
 async def test_quick_start_shape_never_continues_as_new_by_default(
-    limited: WorkflowEnvironment, tmp_path: Path
+    limited: WorkflowEnvironment,
 ) -> None:
     """A ``run(self, request)`` Workflow keeps working after the server suggests Continue-As-New."""
     client, queue = limited.client, f"oneshot-{uuid.uuid4().hex[:8]}"
-    async with scripted_worker(client, queue, ScriptedClaude(count_policy, tmp_path)):
+    async with scripted_worker(client, queue, ScriptedClaude(count_policy)):
         handle = await client.start_workflow(
             OneShotWorkflow.run, "count to 25", id=queue, task_queue=queue
         )
@@ -109,12 +109,10 @@ async def test_quick_start_shape_never_continues_as_new_by_default(
 
 
 @pytest.mark.usefixtures("shop_dir")
-async def test_update_chat_continues_as_new_between_messages(
-    client: Client, tmp_path: Path
-) -> None:
+async def test_update_chat_continues_as_new_between_messages(client: Client) -> None:
     """``run`` in an Update handler, and ``continue_as_new()`` from the run method."""
     queue = f"upchat-{uuid.uuid4().hex[:8]}"
-    async with scripted_worker(client, queue, ScriptedClaude(count_policy, tmp_path)):
+    async with scripted_worker(client, queue, ScriptedClaude(count_policy)):
         await client.start_workflow(
             UpdateChatWorkflow.run, args=[None, False], id=queue, task_queue=queue
         )
@@ -131,11 +129,11 @@ async def test_update_chat_continues_as_new_between_messages(
 
 @pytest.mark.usefixtures("shop_dir")
 async def test_auto_continue_as_new_refuses_to_run_in_an_update_handler(
-    client: Client, tmp_path: Path
+    client: Client,
 ) -> None:
     """It fails the Update at once instead of deadlocking at Continue-As-New."""
     queue = f"upauto-{uuid.uuid4().hex[:8]}"
-    async with scripted_worker(client, queue, ScriptedClaude(count_policy, tmp_path)):
+    async with scripted_worker(client, queue, ScriptedClaude(count_policy)):
         handle = await client.start_workflow(
             UpdateChatWorkflow.run, args=[None, True], id=queue, task_queue=queue
         )
@@ -150,13 +148,11 @@ async def test_auto_continue_as_new_refuses_to_run_in_an_update_handler(
 
 
 @pytest.mark.usefixtures("shop_dir")
-async def test_cancel_during_a_tool_cancels_the_workflow(
-    client: Client, tmp_path: Path
-) -> None:
+async def test_cancel_during_a_tool_cancels_the_workflow(client: Client) -> None:
     """The cancellation is not reported to Claude as a tool failure; no segment runs after it."""
     os.environ["REFUND_DELAY"] = "3"  # money moves, then the tool is slow to reply
     queue = f"cancel-{uuid.uuid4().hex[:8]}"
-    async with scripted_worker(client, queue, ScriptedClaude(refund_policy, tmp_path)):
+    async with scripted_worker(client, queue, ScriptedClaude(refund_policy)):
         handle = await client.start_workflow(
             RefundAgentWorkflow.run,
             "Order A-1001 arrived broken, I want my money back.",
@@ -193,12 +189,10 @@ class ExplodingRunner:
 
 
 @pytest.mark.usefixtures("shop_dir")
-async def test_a_failed_task_does_not_poison_the_next_one(
-    client: Client, tmp_path: Path
-) -> None:
+async def test_a_failed_task_does_not_poison_the_next_one(client: Client) -> None:
     """``max_segments`` stops before a tool runs; a failed segment ends its task; the next task works."""
     queue = f"tasks-{uuid.uuid4().hex[:8]}"
-    runner = ExplodingRunner(ScriptedClaude(count_policy, tmp_path))
+    runner = ExplodingRunner(ScriptedClaude(count_policy))
     async with scripted_worker(client, queue, runner):
         answers = await client.execute_workflow(
             TasksWorkflow.run,
@@ -216,11 +210,11 @@ async def test_a_failed_task_does_not_poison_the_next_one(
 
 @pytest.mark.usefixtures("shop_dir")
 async def test_a_chat_without_tool_calls_continues_as_new_between_messages(
-    client: Client, tmp_path: Path
+    client: Client,
 ) -> None:
     """Turns without tool calls never reach a point between tool calls; the chat hands over."""
     queue = f"notools-{uuid.uuid4().hex[:8]}"
-    async with scripted_worker(client, queue, ScriptedClaude(count_policy, tmp_path)):
+    async with scripted_worker(client, queue, ScriptedClaude(count_policy)):
         handle = await client.start_workflow(
             ChatWorkflow.run, 12, id=queue, task_queue=queue
         )
@@ -233,10 +227,10 @@ async def test_a_chat_without_tool_calls_continues_as_new_between_messages(
 
 
 async def test_auto_continue_as_new_refuses_to_run_in_a_signal_handler(
-    client: Client, tmp_path: Path
+    client: Client,
 ) -> None:
     queue = f"sigauto-{uuid.uuid4().hex[:8]}"
-    async with scripted_worker(client, queue, ScriptedClaude(count_policy, tmp_path)):
+    async with scripted_worker(client, queue, ScriptedClaude(count_policy)):
         handle = await client.start_workflow(
             SignalTaskWorkflow.run, id=queue, task_queue=queue
         )
@@ -292,10 +286,10 @@ async def park_subscribers(client: Client, workflow_id: str, how_many: int) -> N
 
 @pytest.mark.usefixtures("shop_dir")
 async def test_approval_by_signal_works_when_subscribers_use_up_the_update_limit(
-    client: Client, tmp_path: Path
+    client: Client,
 ) -> None:
     queue = f"many-{uuid.uuid4().hex[:8]}"
-    async with scripted_worker(client, queue, ScriptedClaude(count_policy, tmp_path)):
+    async with scripted_worker(client, queue, ScriptedClaude(count_policy)):
         handle = await client.start_workflow(
             LongTaskWorkflow.run,
             args=["count to 2 and publish", TaskOptions(live=True), None],
@@ -348,11 +342,9 @@ async def test_continue_as_new_input_stays_small_with_big_tool_inputs(
     assert all(c["truncated"] and len(c["input"]) == 32 * 1024 for c in calls)
 
 
-async def test_live_output_agent_must_be_created_during_init(
-    client: Client, tmp_path: Path
-) -> None:
+async def test_live_output_agent_must_be_created_during_init(client: Client) -> None:
     queue = f"late-{uuid.uuid4().hex[:8]}"
-    async with scripted_worker(client, queue, ScriptedClaude(count_policy, tmp_path)):
+    async with scripted_worker(client, queue, ScriptedClaude(count_policy)):
         handle = await client.start_workflow(
             LateLiveOutputWorkflow.run, "count to 1", id=queue, task_queue=queue
         )
@@ -377,10 +369,10 @@ def test_tool_names_must_be_unique() -> None:
 
 @pytest.mark.usefixtures("shop_dir")
 async def test_histories_with_continue_as_new_and_live_output_replay(
-    client: Client, tmp_path: Path
+    client: Client,
 ) -> None:
     queue = f"replay-{uuid.uuid4().hex[:8]}"
-    async with scripted_worker(client, queue, ScriptedClaude(count_policy, tmp_path)):
+    async with scripted_worker(client, queue, ScriptedClaude(count_policy)):
         handle = await client.start_workflow(
             LongTaskWorkflow.run,
             args=["count to 8", TaskOptions(after_events=40, live=True), None],

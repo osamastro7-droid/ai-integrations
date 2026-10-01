@@ -13,12 +13,22 @@ How one segment works:
 Checkpoints make retries clean. After a segment, the runner reads the session back
 from the session store and returns where the next segment must continue (the last
 transcript entry, or the paused call's deferral marker after parallel calls) as the
-segment's checkpoint; the Workflow stores it with the segment's result. Reading it
-back also proves the turn reached the store, so a segment only commits what every
-Worker can resume. A segment that runs again (a retry after a crash or a timeout,
-or the first segment after a failed task) cannot trust what an unfinished attempt
-wrote, so it continues in a copy of the session that ends at the checkpoint
-(``fork_session_via_store``), and Claude decides again from there.
+segment's checkpoint; the Workflow stores it with the segment's result.
+
+Where the conversation lives:
+
+- By default (no ``session_store``), in the Workflow. The segment reads the committed
+  transcript with a Query on its own Workflow, seeds a fresh in-memory session store
+  with it (up to the checkpoint), runs, and returns what changed
+  (``transcript_keep`` and ``transcript_add``); the Workflow splices it in. Every
+  attempt starts from what the Workflow committed, so a retry can never build on
+  an unfinished attempt, and any Worker can run any step with no shared storage.
+- With a ``session_store``, in the store. Reading the checkpoint back also proves
+  the turn reached the store, so a segment only commits what every Worker can
+  resume. A segment that runs again (a retry after a crash or a timeout, or the
+  first segment after a failed task) cannot trust what an unfinished attempt wrote,
+  so it continues in a copy of the session that ends at the checkpoint
+  (``fork_session_via_store``), and Claude decides again from there.
 
 Why not "resume and let the hook allow the deferred call"? On that auto-resume path
 the engine ignores a later "defer" when the resume also sends a user message, and the
@@ -52,6 +62,7 @@ from typing import Any, cast
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    InMemorySessionStore,
     MirrorErrorMessage,
     ResultError,
     ResultMessage,
@@ -68,6 +79,7 @@ from claude_agent_sdk import (
 )
 from temporalio import activity
 
+from ._conversation import external_storage_on, read_conversation, too_large
 from ._defer_hook import STOPPED
 from ._events import emit
 from ._models import DeferredCall, SegmentInput, SegmentOutput, ToolOutcome, ToolSpec
@@ -81,9 +93,9 @@ ENV_AUTH = (
 )
 """Logins that survive resumes.
 
-A Claude app login (Keychain OAuth) does not: when the SDK resumes a session from a
-session store it copies the login without its refresh token, so once the short-lived
-access token expires, resumed segments fail with "OAuth session expired".
+A Claude app login (Keychain OAuth) does not: when the SDK resumes a session (every
+segment after the first) it copies the login without its refresh token, so once the
+short-lived access token expires, resumed segments fail with "OAuth session expired".
 """
 
 SERVER = "durable"
@@ -354,6 +366,45 @@ def _resume_point(entries: list[Any], paused_call: str | None) -> str | None:
     return marker if marker is not None and user_after_marker else leaf
 
 
+def _seed(committed: list[Any], checkpoint: str) -> list[Any] | None:
+    """The committed conversation up to the checkpoint, where the next run resumes.
+
+    That is all of it, unless the checkpoint is the paused call's deferral marker
+    (see ``_resume_point``): then the entries after the marker are left out.
+
+    Returns:
+        The entries, or None if the checkpoint is not in the conversation.
+    """
+    if _last_entry(committed) == checkpoint:
+        return committed
+    for index in range(len(committed) - 1, -1, -1):
+        entry = committed[index]
+        if _is_transcript(entry) and entry["uuid"] == checkpoint:
+            return committed[: index + 1]
+    return None
+
+
+def _common_prefix(old: list[Any], new: list[Any]) -> int:
+    """How many entries at the start of ``old`` are unchanged in ``new``."""
+    count = 0
+    for before, after in zip(old, new):
+        if before is not after and before != after:
+            break
+        count += 1
+    return count
+
+
+def _attempt_session_id(session_id: str, attempt: int) -> str:
+    """The id of a new session: a fresh one for each attempt.
+
+    A failed attempt may have left a partial transcript, in the session store and
+    in the engine's own folder.
+    """
+    if attempt == 1:
+        return session_id
+    return str(uuid.uuid5(uuid.UUID(session_id), f"attempt-{attempt}"))
+
+
 class _SessionMoved(Exception):
     """The session no longer ends at the checkpoint (for example after a Workflow reset)."""
 
@@ -482,7 +533,7 @@ class ClaudeAgentSdkRunner:
     def __init__(
         self,
         *,
-        session_store: Any,
+        session_store: Any = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         cli_path: str | None = None,
@@ -494,12 +545,14 @@ class ClaudeAgentSdkRunner:
         """Create the runner.
 
         Args:
-            session_store: A Claude Agent SDK ``SessionStore`` that every Worker can
-                reach, so any Worker can resume any session. Each segment's
-                checkpoint is read back from it. ``FileSessionStore`` works for one
-                machine or a shared disk.
-            cwd: Working directory of the engine. The store keys sessions by it, so
-                give every Worker the same one.
+            session_store: None (the default) keeps each conversation in its
+                Workflow: nothing to set up, and any Worker can run any step. Or a
+                Claude Agent SDK ``SessionStore`` that every Worker can reach, to
+                keep conversations there instead (``FileSessionStore`` works for one
+                machine or a shared disk). Every Worker of a task queue needs the
+                same choice.
+            cwd: Working directory of the engine. Sessions are keyed by it, so give
+                every Worker the same one.
             env: Extra environment variables for the engine. The engine also
                 inherits the Worker's environment.
             cli_path: Path of a Claude Code executable to use instead of the bundled one.
@@ -550,8 +603,9 @@ class ClaudeAgentSdkRunner:
             warnings.warn(
                 "temporalio.claude_agent_sdk: no API key, cloud provider, or "
                 "CLAUDE_CODE_OAUTH_TOKEN is set. A Claude app login cannot refresh "
-                "itself when a session is resumed from a session store, so long-running "
-                "agents can fail with 'OAuth session expired'. Set ANTHROPIC_API_KEY, "
+                "itself when a session is resumed (every step after the first), so "
+                "long-running agents can fail with 'OAuth session expired'. Set "
+                "ANTHROPIC_API_KEY, "
                 "use Bedrock or Vertex, or run `claude setup-token` and set "
                 "CLAUDE_CODE_OAUTH_TOKEN.",
                 stacklevel=2,
@@ -593,18 +647,13 @@ class ClaudeAgentSdkRunner:
         return self._versions[path]
 
     async def _start(self, inp: SegmentInput, attempt: int) -> tuple[str, bool]:
-        """Where this segment starts: ``(session_id, resume)``.
+        """Where a segment starts in the session store: ``(session_id, resume)``.
 
         A segment that runs again continues in a copy of the session that ends at
         the checkpoint, because an unfinished attempt may have written after it.
         """
         if inp.checkpoint is None:  # nothing committed yet: a new session
-            if attempt == 1:
-                return inp.session_id, False
-            # The failed attempt may have left a partial transcript: start another.
-            return str(
-                uuid.uuid5(uuid.UUID(inp.session_id), f"attempt-{attempt}")
-            ), False
+            return _attempt_session_id(inp.session_id, attempt), False
         if attempt == 1 and not inp.fork:
             return inp.session_id, True
         return await self._copy(inp), True
@@ -621,14 +670,18 @@ class ClaudeAgentSdkRunner:
 
     async def _checkpoint(
         self,
+        store: Any,
         session_id: str,
         assistant_uuid: str | None,
         paused_call: str | None,
         resumed_at: str | None,
-    ) -> str:
+    ) -> tuple[str, list[dict[str, Any]]]:
         """Where the next segment continues, read back from the store (see ``_resume_point``).
 
         Reading it back also proves that the turn reached the session store.
+
+        Returns:
+            The checkpoint, and the session's entries.
 
         Raises:
             RuntimeError: If the store does not have the turn (Temporal retries).
@@ -637,17 +690,17 @@ class ClaudeAgentSdkRunner:
             "project_key": project_key_for_directory(self._cwd),
             "session_id": session_id,
         }
-        entries = cast("list[dict[str, Any]]", await self._store.load(key) or [])
+        entries = cast("list[dict[str, Any]]", await store.load(key) or [])
         stored = assistant_uuid is None or any(
             e.get("uuid") == assistant_uuid for e in entries
         )
         leaf = _resume_point(entries, paused_call)
         if not stored or leaf is None or leaf == resumed_at:  # nothing new stored
             raise RuntimeError(
-                f"The session store does not have this segment's turn (session "
-                f"{session_id}), so another Worker could not continue it. Retrying."
+                f"This segment's turn did not reach the session store (session "
+                f"{session_id}), so it could not be continued. Retrying."
             )
-        return leaf
+        return leaf, entries
 
     async def run(self, inp: SegmentInput, attempt: int) -> SegmentOutput:
         """Run one segment until Claude pauses at a durable tool call or finishes.
@@ -657,18 +710,31 @@ class ClaudeAgentSdkRunner:
             attempt: The Activity attempt number, starting at 1.
 
         Returns:
-            The pause or the final answer, with the segment's checkpoint. ``is_error``
+            The pause or the final answer, with the segment's checkpoint (and, when
+            the Workflow holds the conversation, what changed in it). ``is_error``
             is set when the engine broke the pause contract, or when retrying cannot
             help.
 
         Raises:
-            RuntimeError: If the transcript did not reach the session store (Temporal
-                retries the segment).
+            RuntimeError: If the transcript did not reach the session store, the
+                Workflow did not serve its conversation, or the conversation is kept
+                where this runner does not keep it (a session store, or the
+                Workflow). Temporal retries the segment.
         """
         reported = await self._engine_version()
         if reported is not None and _too_old(reported):
             return _too_old_output(inp.session_id, reported)  # before the engine starts
         injected = {k: _as_outcome(v) for k, v in inp.injected.items()}
+        if self._store is None:
+            return await self._run_held(inp, injected, attempt)
+        if inp.transcript or (
+            inp.conversation is not None and inp.conversation.entries
+        ):
+            raise RuntimeError(
+                f"Session {inp.session_id} is kept in its Workflow, but this Worker's "
+                "runner has a session store. Every Worker of a task queue needs the "
+                "same choice: create this runner without session_store. Retrying."
+            )
         session_id, resume = await self._start(inp, attempt)
         if resume and not injected and inp.prompt is None:
             return SegmentOutput(
@@ -679,12 +745,111 @@ class ClaudeAgentSdkRunner:
         in_place = resume and session_id == inp.session_id
         try:
             return await self._run_engine(
-                inp, injected, session_id, resume, inp.checkpoint if in_place else None
+                inp,
+                injected,
+                session_id,
+                resume,
+                self._store,
+                guard=inp.checkpoint if in_place else None,
             )
         except _SessionMoved:
             # The session went on after the checkpoint (for example, the Workflow
             # was reset to an earlier point): continue in a copy that ends there.
-            return await self._run_engine(inp, injected, await self._copy(inp), True)
+            return await self._run_engine(
+                inp, injected, await self._copy(inp), True, self._store
+            )
+
+    async def _run_held(
+        self, inp: SegmentInput, injected: dict[str, ToolOutcome], attempt: int
+    ) -> SegmentOutput:
+        """Run a segment of a conversation the Workflow holds.
+
+        The engine resumes from a fresh in-memory session store that holds the
+        committed conversation up to the checkpoint, so every attempt starts from
+        what the Workflow committed.
+        """
+        committed = await read_conversation(inp)
+        if inp.checkpoint is None:
+            if committed:
+                return SegmentOutput(
+                    session_id=inp.session_id,
+                    is_error=True,
+                    error=(
+                        f"The Workflow holds {len(committed)} conversation entries but "
+                        "no checkpoint, so it is unclear where Claude would continue."
+                    ),
+                )
+            session_id, seed, resume = (
+                _attempt_session_id(inp.session_id, attempt),
+                [],
+                False,
+            )
+        else:
+            if not committed:
+                raise RuntimeError(
+                    f"The Workflow holds no conversation for session {inp.session_id} "
+                    f"(checkpoint {inp.checkpoint}): it is kept in a session store this "
+                    "runner does not have, or AgentState.transcript was not carried to "
+                    "this run. Give this Worker's runner the session store the "
+                    "conversation started with. Retrying."
+                )
+            found = _seed(committed, inp.checkpoint)
+            if found is None:
+                return SegmentOutput(
+                    session_id=inp.session_id,
+                    is_error=True,
+                    error=(
+                        f"Checkpoint {inp.checkpoint} is not in the conversation the "
+                        "Workflow holds, so it is unclear where Claude would continue."
+                    ),
+                )
+            session_id, seed, resume = inp.session_id, found, True
+        if resume and not injected and inp.prompt is None:
+            return SegmentOutput(
+                session_id=session_id,
+                is_error=True,
+                error="Nothing to send: no tool result and no prompt",
+            )
+        store = InMemorySessionStore()
+        if seed:
+            key = {
+                "project_key": project_key_for_directory(self._cwd),
+                "session_id": session_id,
+            }
+            await store.append(key, seed)  # type: ignore[arg-type]
+        try:
+            return await self._run_engine(
+                inp, injected, session_id, resume, store, committed=committed
+            )
+        finally:
+            if not resume:
+                self._forget_local_copy(session_id)
+
+    def _forget_local_copy(self, session_id: str) -> None:
+        """Remove the engine's own copy of a new session from its config folder.
+
+        Claude Code writes a new session's transcript (and tool outputs too large to
+        show Claude in full) under ``<config folder>/projects``; resumed sessions run
+        in a temporary folder the SDK removes. With the conversation in the Workflow,
+        that copy is never read again, so it does not stay on the Worker's disk.
+        """
+        try:
+            uuid.UUID(session_id)  # only ever a session this runner started
+        except ValueError:
+            return
+        env = {**self._env, **(self._extra.get("env") or {})}
+        config = env.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_CONFIG_DIR")
+        base = Path(config) if config else Path.home() / ".claude"
+        folder = (
+            Path(unicodedata.normalize("NFC", str(base)))
+            / "projects"
+            / project_key_for_directory(self._cwd)
+        )
+        try:
+            (folder / f"{session_id}.jsonl").unlink(missing_ok=True)
+        except OSError:
+            pass  # best effort, for example a file still open on Windows
+        shutil.rmtree(folder / session_id, ignore_errors=True)
 
     async def _run_engine(
         self,
@@ -692,9 +857,22 @@ class ClaudeAgentSdkRunner:
         injected: dict[str, ToolOutcome],
         session_id: str,
         resume: bool,
+        store: Any,
+        *,
         guard: str | None = None,
+        committed: list[dict[str, Any]] | None = None,
     ) -> SegmentOutput:
-        """Run the engine once. With ``guard``, resuming requires the session to end there.
+        """Run the engine once, on the session in ``store``.
+
+        Args:
+            inp: The segment input.
+            injected: Tool results to deliver.
+            session_id: The session to start or resume.
+            resume: Whether to resume it.
+            store: The session store the SDK reads and writes.
+            guard: Resuming requires the session to end at this checkpoint.
+            committed: The conversation the Workflow holds, when it holds one: the
+                output then says what changed in it.
 
         Raises:
             _SessionMoved: If the session does not end at ``guard``.
@@ -741,6 +919,7 @@ class ClaudeAgentSdkRunner:
             injected,
             session_id,
             resume,
+            store,
             guard,
             hook_dir,
             create_sdk_mcp_server(SERVER, tools=[make_stub(t) for t in inp.tools]),
@@ -856,15 +1035,20 @@ class ClaudeAgentSdkRunner:
                 error=str(result.errors or result.subtype),
                 cost_usd=cost,
             )
-        checkpoint = await self._checkpoint(
+        # A run with nothing new after where it resumed did not reach the store.
+        resumed_at = (
+            guard if committed is None else (inp.checkpoint if resume else None)
+        )
+        checkpoint, entries = await self._checkpoint(
+            store,
             sid,
             last_assistant,
             deferred.id if deferred is not None else None,
-            guard,
+            resumed_at,
         )
         if deferred is not None:
             name = deferred.name.removeprefix(PREFIX)
-            return SegmentOutput(
+            out = SegmentOutput(
                 session_id=sid,
                 deferred=DeferredCall(
                     id=deferred.id, name=name, input=dict(deferred.input)
@@ -872,9 +1056,25 @@ class ClaudeAgentSdkRunner:
                 checkpoint=checkpoint,
                 cost_usd=cost,
             )
-        return SegmentOutput(
-            session_id=sid, result=result.result, checkpoint=checkpoint, cost_usd=cost
-        )
+        else:
+            out = SegmentOutput(
+                session_id=sid,
+                result=result.result,
+                checkpoint=checkpoint,
+                cost_usd=cost,
+            )
+        out.external_storage = external_storage_on()
+        if committed is not None:
+            # The engine only appends to what it resumed from, which is the committed
+            # conversation, cut after the checkpoint when that is the deferral marker.
+            keep = _common_prefix(committed, entries)
+            out.transcript_keep, out.transcript_add = keep, entries[keep:]
+            problem = too_large(out)
+            if problem is not None:
+                return SegmentOutput(
+                    session_id=sid, is_error=True, error=problem, cost_usd=cost
+                )
+        return out
 
     def _engine_options(
         self,
@@ -882,6 +1082,7 @@ class ClaudeAgentSdkRunner:
         injected: dict[str, ToolOutcome],
         session_id: str,
         resume: bool,
+        store: Any,
         guard: str | None,
         hook_dir: str,
         durable_server: Any,
@@ -925,9 +1126,7 @@ class ClaudeAgentSdkRunner:
             ),
             "settings": str(Path(hook_dir) / "settings.json"),
             "session_store": (
-                _guarded(self._store, session_id, guard)
-                if guard is not None
-                else self._store
+                _guarded(store, session_id, guard) if guard is not None else store
             ),
             "cwd": self._cwd,
             "env": {

@@ -52,6 +52,39 @@ class DeferredCall:
 
 
 @dataclass
+class ConversationRef:
+    """Where a segment finds the conversation the Workflow holds.
+
+    The segment Activity reads it with a Query on its own Workflow, so the
+    conversation adds nothing to the history of each step.
+
+    Attributes:
+        query: Name of the Workflow Query that returns the conversation, a page at a
+            time.
+        agent: The agent's key, the Query's first argument (a Workflow can hold
+            several agents).
+        entries: How many entries the committed conversation has.
+    """
+
+    query: str
+    agent: str
+    entries: int
+
+
+@dataclass
+class ConversationPage:
+    """One page of the conversation, as the Workflow Query returns it.
+
+    Attributes:
+        entries: Transcript entries, from the requested offset.
+        total: How many entries the conversation has.
+    """
+
+    entries: list[dict[str, Any]]
+    total: int
+
+
+@dataclass
 class SegmentInput:
     """Input of one model segment: from a prompt or a tool result to the next pause.
 
@@ -70,7 +103,12 @@ class SegmentInput:
         live_output: Publish Claude's text to the Workflow's stream while running.
         fork: Continue in a copy of the session that ends at ``checkpoint``, because
             an earlier segment that did not commit may have written to the session.
-            Retries (attempt 2 and later) always do this.
+            Retries (attempt 2 and later) always do this. (Session store only: a
+            conversation the Workflow holds is always the committed one.)
+        conversation: Where the conversation the Workflow holds can be read. The
+            runner reads it when it has no session store.
+        transcript: The committed conversation itself, for callers that drive a runner
+            directly (tests); the Workflow passes ``conversation`` instead.
     """
 
     session_id: str
@@ -85,6 +123,8 @@ class SegmentInput:
     segment_index: int = 0
     live_output: bool = False
     fork: bool = False
+    conversation: ConversationRef | None = None
+    transcript: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -100,6 +140,14 @@ class SegmentOutput:
         cost_usd: Model cost of this segment, as reported by the SDK.
         is_error: Whether the segment failed in a way retrying cannot fix.
         error: A description of that failure.
+        transcript_keep: When the Workflow holds the conversation: how many of its
+            entries stay as they are. None when the conversation lives in a session
+            store.
+        transcript_add: The entries that follow them: what this segment added (and any
+            entries it rewrote after the first ``transcript_keep``).
+        external_storage: Whether the Worker's data converter has External Storage,
+            which moves large payloads (such as a long conversation) out of the
+            history.
     """
 
     session_id: str
@@ -109,14 +157,18 @@ class SegmentOutput:
     cost_usd: float = 0.0
     is_error: bool = False
     error: str | None = None
+    transcript_keep: int | None = None
+    transcript_add: list[dict[str, Any]] = field(default_factory=list)
+    external_storage: bool = False
 
 
 @dataclass
 class AgentState:
     """What a new Workflow run needs to continue an agent after Continue-As-New.
 
-    The conversation itself stays in the SDK's session store, so this stays small.
-    Type the Workflow parameter that carries it as ``AgentState | None``.
+    By default the conversation lives in the Workflow, so it moves to the new run here
+    (``transcript``). With a session store, it stays in the store, and this stays
+    small. Type the Workflow parameter that carries it as ``AgentState | None``.
 
     Attributes:
         session_id: The Claude session.
@@ -134,6 +186,9 @@ class AgentState:
         fork_next: The last task stopped early, so the next segment continues in a
             copy of the session that ends at ``checkpoint``.
         stream: The live output stream's state, when live output is on.
+        transcript: The conversation, when the Workflow holds it (no session store).
+        external_storage: Whether the Workers reported External Storage, so a large
+            conversation can move to the next run.
     """
 
     session_id: str | None = None
@@ -149,3 +204,5 @@ class AgentState:
     runs: int = 1
     fork_next: bool = False
     stream: WorkflowStreamState | None = None
+    transcript: list[dict[str, Any]] = field(default_factory=list)
+    external_storage: bool = False

@@ -52,11 +52,17 @@ async def run_lengths(client: Client, workflow_id: str) -> list[int]:
 
 
 def scripted_worker(
-    client: Client, queue: str, tmp: Path, runner: SegmentRunner | None = None
+    client: Client,
+    queue: str,
+    tmp: Path,
+    runner: SegmentRunner | None = None,
+    mode: str = "held",
 ) -> Worker:
-    """A Worker for the long-running agents."""
+    """A Worker for the long-running agents (the scripted runner holds the
+    conversation in the Workflow, unless ``mode`` is ``store``)."""
+    folder = tmp / "fake" if mode == "store" else None
     plugin = ClaudeAgentPlugin(
-        runner or ScriptedClaude(count_policy, tmp / "fake"), heartbeat_every=1.0
+        runner or ScriptedClaude(count_policy, folder), heartbeat_every=1.0
     )
     return Worker(
         client,
@@ -72,11 +78,12 @@ def scripted_worker(
 
 
 @pytest.mark.usefixtures("shop_dir")
+@pytest.mark.parametrize("mode", ["held", "store"])
 async def test_endless_agent_runs_past_the_history_limit(
-    limited: WorkflowEnvironment, tmp_path: Path
+    limited: WorkflowEnvironment, tmp_path: Path, mode: str
 ) -> None:
     client, queue = limited.client, f"endless-{uuid.uuid4().hex[:8]}"
-    async with scripted_worker(client, queue, tmp_path):
+    async with scripted_worker(client, queue, tmp_path, mode=mode):
         handle = await client.start_workflow(
             LongTaskWorkflow.run,
             args=["count to 120", TaskOptions(), None],
@@ -144,11 +151,12 @@ async def test_an_approval_after_continue_as_new_reaches_the_new_run(
 
 
 @pytest.mark.usefixtures("shop_dir")
+@pytest.mark.parametrize("mode", ["held", "store"])
 async def test_a_chat_keeps_one_session_across_continue_as_new(
-    limited: WorkflowEnvironment, tmp_path: Path
+    limited: WorkflowEnvironment, tmp_path: Path, mode: str
 ) -> None:
     client, queue = limited.client, f"chat-{uuid.uuid4().hex[:8]}"
-    async with scripted_worker(client, queue, tmp_path):
+    async with scripted_worker(client, queue, tmp_path, mode=mode):
         handle = await client.start_workflow(
             ChatWorkflow.run, 3, id=queue, task_queue=queue
         )
@@ -173,6 +181,8 @@ async def test_agent_state_survives_the_data_converter() -> None:
         recent_call_ids=["toolu_1"],
         tool_calls=1,
         runs=2,
+        transcript=[{"uuid": "u1", "type": "user", "message": {"content": "مرحبا"}}],
+        external_storage=True,
     )
     converter = DataConverter.default
     payloads = await converter.encode([state])
@@ -183,14 +193,17 @@ async def test_agent_state_survives_the_data_converter() -> None:
 
 @pytest.mark.timeout(300)
 @pytest.mark.usefixtures("shop_dir")
+@pytest.mark.parametrize("mode", ["held", "store"])
 async def test_real_engine_session_continues_across_runs(
-    limited: WorkflowEnvironment, tmp_path: Path
+    limited: WorkflowEnvironment, tmp_path: Path, mode: str
 ) -> None:
     """The real engine resumes the same Claude session in each new run."""
     api = start_with_policy(count_policy)
     (tmp_path / "work").mkdir()
     runner = ClaudeAgentSdkRunner(
-        session_store=FileSessionStore(tmp_path / "sessions"),
+        session_store=(
+            FileSessionStore(tmp_path / "sessions") if mode == "store" else None
+        ),
         cwd=str(tmp_path / "work"),
         env=engine_env(api, str(tmp_path / "cfg")),
     )

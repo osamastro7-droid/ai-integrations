@@ -13,6 +13,8 @@ from temporalio.claude_agent_sdk._activity import SegmentRunner, make_segment_ac
 from temporalio.claude_agent_sdk._events import follow_agent
 from temporalio.claude_agent_sdk._models import (
     AgentState,
+    ConversationPage,
+    ConversationRef,
     DeferredCall,
     SegmentInput,
     SegmentOutput,
@@ -36,6 +38,8 @@ __all__ = [
     "AgentState",
     "ClaudeAgentPlugin",
     "ClaudeAgentSdkRunner",
+    "ConversationPage",
+    "ConversationRef",
     "DeferredCall",
     "DurableClaudeAgent",
     "DurableTool",

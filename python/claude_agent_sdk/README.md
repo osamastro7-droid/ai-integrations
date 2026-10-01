@@ -6,7 +6,7 @@ Temporal integration for Anthropic's [Claude Agent SDK](https://code.claude.com/
 
 - **Every durable tool call Claude makes is its own Temporal Activity.** Finished calls never run again after a crash, retries follow your retry policy, and the Activity ID (`tool-<tool_use_id>`) doubles as an idempotency key for the systems a tool touches.
 - **Tools can wait for a human.** Mark a tool `needs_approval=True` and the agent waits, for minutes or weeks, until someone approves or rejects the call.
-- **Crashes resume cleanly, on any Worker.** Each model step ends at a checkpoint that Temporal records. A step that runs again (after a crash, a timeout, or on another machine) starts from that checkpoint, so nothing a failed attempt added to the conversation reaches Claude.
+- **Crashes resume cleanly, on any Worker.** The conversation lives in the Workflow, like any other Workflow state: Workers share nothing but the Temporal server. Each model step ends at a checkpoint that Temporal records, and a step that runs again (after a crash, a timeout, or on another machine) starts from what the Workflow committed, so nothing a failed attempt added reaches Claude.
 
 ## Install
 
@@ -77,22 +77,18 @@ Tool names use 1 to 50 letters, digits, `_` or `-` (Claude Code renames anything
 The Worker runs Claude through the plugin:
 
 ```python
-from temporalio.claude_agent_sdk import ClaudeAgentPlugin, ClaudeAgentSdkRunner, FileSessionStore
+from temporalio.claude_agent_sdk import ClaudeAgentPlugin, ClaudeAgentSdkRunner
 
-runner = ClaudeAgentSdkRunner(
-    session_store=FileSessionStore("/shared/claude-sessions"),
-    cwd="/srv/agent",
-)
 worker = Worker(
     client,
     task_queue="agents",
     workflows=[RefundAgent],
     activities=[look_up_order, issue_refund],
-    plugins=[ClaudeAgentPlugin(runner)],
+    plugins=[ClaudeAgentPlugin(ClaudeAgentSdkRunner(cwd="/srv/agent"))],
 )
 ```
 
-The conversation lives in a session store that every Worker must reach. `FileSessionStore` is for tests and one machine; for production, implement `SessionStore` on your database or object storage (the Claude Agent SDK repository has example stores for S3, Redis and Postgres). The store keys sessions by the engine's working directory, so give every Worker the same `cwd`. The runner refuses a path for which Claude Code and the SDK would compute different keys (for example with decomposed Unicode or emoji).
+The runner refuses a `cwd` for which Claude Code and the SDK would compute different session keys (for example with decomposed Unicode or emoji).
 
 Pass the plugin to the Worker, or to the Client the Worker is built from, not both. Each segment starts a Claude Code process: 0.7 to 0.9 seconds and up to about 270 MB of memory each (measured on Linux with an instant local model), so cap parallel segments with the Worker's `max_concurrent_activities`.
 
@@ -100,9 +96,22 @@ Other [`ClaudeAgentOptions`](https://code.claude.com/docs/en/agent-sdk/python) g
 
 `approvers` checks the name the caller passes. It is not authentication: control who may send Updates with Temporal's own access control.
 
+## Where the conversation lives
+
+By default, in the Workflow. Each step reads the committed conversation with a Query on its own Workflow, a page of up to 1 MiB at a time, so the conversation is not copied into every step's input. The step resumes Claude Code from it in memory and returns only what it added (about 5 to 9 KB per step with small tool results, measured with Claude Code 2.1.273); the Workflow splices that in. So:
+
+- **No storage to run.** Workers share nothing but the Temporal server. Tested: each step of a conversation on a different Worker with its own working directory and config folder, and a Worker killed after the refund, replaced by one that never saw the conversation.
+- **Retries are clean by construction.** Every attempt starts from what the Workflow committed; whatever an unfinished attempt wrote never existed.
+- **Nothing stays on the Worker's disk.** Claude Code writes a new session to its config folder (`~/.claude/projects`, with tool outputs too large to show Claude in full); the runner removes that copy after the step. Resumed steps run in a temporary folder the SDK removes.
+- **One payload per step.** Without External Storage, what a step adds must fit in one Temporal payload (2 MB by default), or the step fails with a message that says so, instead of retrying forever. A tool result close to 2 MB needs [External Storage](#large-tool-results), which carries steps, Query pages and the conversation through Continue-As-New.
+
+To keep conversations outside Temporal instead, give the runner a Claude Agent SDK `SessionStore` that every Worker can reach (`ClaudeAgentSdkRunner(session_store=...)`). `FileSessionStore` is for tests and one machine; for production, implement `SessionStore` on your database or object storage (the Claude Agent SDK repository has example stores for S3, Redis and Postgres). The store keys sessions by the engine's working directory, so give every Worker the same `cwd`. Every segment then reads the whole session twice (the SDK to resume it, the runner to record the checkpoint), so reading grows with the session's length; a segment that runs again reads it once more and writes a copy, and the earlier copy stays in the store, so remove old sessions with your store's own retention.
+
+Every Worker of a task queue needs the same choice. A Worker set up the other way refuses the step with a message that says how to fix it, and Temporal retries the step until a matching Worker picks it up (tested).
+
 ## Long-running agents
 
-A Workflow's history holds at most 51,200 events or 50 MB (Temporal's default limits), and every durable tool call adds about 12 events. So one run fits about 4,000 tool calls, and fewer when results are large. Continue-As-New starts a fresh history. The conversation stays in the session store, so the agent's state is small.
+A Workflow's history holds at most 51,200 events or 50 MB (Temporal's default limits), and every durable tool call adds about 12 events. So one run fits about 4,000 tool calls, and fewer when results are large. Continue-As-New starts a fresh history, and carries the agent's state, with its conversation, in the new run's input.
 
 Turn on `auto_continue_as_new` and give the Workflow a `state` argument:
 
@@ -128,20 +137,21 @@ class ResearchAgent:
 - Call `agent.run()` from the Workflow's run method, not from a separate asyncio task, and let no handler wait for the task to finish: continuing as new waits for every handler to finish. With `auto_continue_as_new`, a call from a handler fails at once: an Update handler fails its Update, a Signal handler fails the Workflow.
 - **Chats.** Calling `agent.run(message)` again continues the same Claude session, so Claude remembers earlier turns. Turns without tool calls never reach a point between tool calls, so between messages, when no handler is waiting for an answer, call `await agent.continue_as_new()` from the run method if `agent.should_continue_as_new()` is true; `continue_as_new_args` carries your own state, such as an inbox. At the start of a new run, if `agent.busy` is true, `await agent.run()` finishes the task that was interrupted.
 - `max_segments` caps a task across all its runs (default 50). The task stops before it runs a tool whose result could no longer reach Claude. Use `None` for tasks that may take thousands of steps.
+- **Long conversations need External Storage.** Without it, the new run's input is one payload (2 MB by default), and a conversation outgrows it after a few hundred steps with small results. Then `should_continue_as_new()` stays false, with a warning in the Worker's log, and the agent keeps going in its run instead of failing to start the next one; `continue_as_new()` raises an `ApplicationError` that says so. With External Storage the conversation moves on at any size (tested with two 1.9 MB results). A runner with a session store keeps the state small.
 - **Start with every argument.** Temporal applies a Workflow's argument types only when the caller passes as many arguments as `run` declares. If `run` has other typed arguments besides `state`, start the Workflow with `state=None` included, or those arguments arrive as plain dicts.
 
 ## Failures and cancellation
 
-- A task fails with an `ApplicationError` at `max_segments`, when a step reports an error that running it again cannot fix (Claude Code's `max_turns` or `max_budget_usd`, a broken pause, or a Messages API request that would be refused again: invalid (400), an unknown model (404), too large (413), or a prompt too long for the model), or if the engine hands back a tool call that already ran. Other engine and API errors, such as a low credit balance, a rejected API key, rate limits or overload, fail the step's Activity, and Temporal retries it with `segment_retry_policy` (by default without limit, so the step continues once the cause is fixed; each retry copies the session). When the Activity fails for good, the task fails with an `ActivityError`. Catch `temporalio.exceptions.FailureError` for both.
+- A task fails with an `ApplicationError` at `max_segments`, when a step reports an error that running it again cannot fix (Claude Code's `max_turns` or `max_budget_usd`, a broken pause, or a Messages API request that would be refused again: invalid (400), an unknown model (404), too large (413), or a prompt too long for the model), or if the engine hands back a tool call that already ran. Other engine and API errors, such as a low credit balance, a rejected API key, rate limits or overload, fail the step's Activity, and Temporal retries it with `segment_retry_policy` (by default without limit, so the step continues once the cause is fixed; with a session store, each retry copies the session). When the Activity fails for good, the task fails with an `ActivityError`. Catch `temporalio.exceptions.FailureError` for both.
 - After a failed task, the agent can take the next one: it continues from the last checkpoint, and a tool call Claude was still waiting for gets an error result, delivered with the next prompt.
 - Cancelling the Workflow cancels the running step or tool call, and the Workflow ends as cancelled. By default Temporal does not wait for a cancelled Activity. `activity_as_tool(..., cancellation_type=workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED)` waits until the call finishes or acknowledges the cancellation through a heartbeat, so the history records what really happened; `segment_cancellation_type` does the same for a running step.
 - A running step hears of a cancel (or of its own timeout) with its next heartbeat: at most 0.8 × `segment_heartbeat_timeout` later (30 seconds by default, so up to 24 seconds). From then on the engine cannot start a built-in tool while the SDK stops it, which takes up to about 10 seconds (a durable call only pauses the run). If the Worker process dies, its engine runs until its current turn ends, built-in tools included, unless the Worker's child processes stop with it (as in a container or a systemd service).
 
 ## Large tool results
 
-Every tool result is stored in the Workflow's history twice: as the tool Activity's result, and in the next step's input. A single payload over 2 MB cannot be recorded at all (the SDK stops it with `[TMPRL1103] Attempted to upload payloads with size that exceeded the error limit`), and results of a few hundred KB fill the 50 MB history quickly.
+Every tool result is stored in the Workflow's history three times: as the tool Activity's result, in the next step's input, and in that step's output, as part of the conversation (twice with a session store). A single payload over 2 MB cannot be recorded at all (the SDK stops it with `[TMPRL1103] Attempted to upload payloads with size that exceeded the error limit`), and results of a few hundred KB fill the 50 MB history quickly.
 
-The plugin works with Temporal's [External Storage](https://docs.temporal.io/external-storage) unchanged. Payloads over a threshold (256 KiB by default) go to your store, and the history keeps small references. Configure it on the Client, as for any Temporal application; Workers built from that Client use it too:
+The plugin works with Temporal's [External Storage](https://docs.temporal.io/external-storage) unchanged. Payloads over a threshold (256 KiB by default) go to your store, and the history keeps small references; that includes the pages of the conversation Query, so Claude can read a conversation of any size (tested: two 2 MB results through the real engine). Configure it on the Client, as for any Temporal application; Workers built from that Client use it too:
 
 ```python
 from temporalio.converter import DataConverter, ExternalStorage
@@ -173,7 +183,7 @@ async for event in follow_agent(client, workflow_id):
 - A `text`, `result` or `error` longer than 32,768 characters, or a tool `input` longer than that as JSON, is cut, and the event gets `truncated: true`. The full answer is the Workflow's result.
 - After its final event, a task waits `live_output_linger` (500 ms) so subscribers receive it before the Workflow closes.
 - Measured on a local dev server, three runs of 203 events: 107 to 110 ms median and 161 to 162 ms at the 95th percentile, from event to subscriber. Workflow Streams is built for UIs and progress, not real-time voice.
-- Continue-As-New carries the stream in the new run's input, next to the agent's state. The stream shrinks to fit, so a large tool result waiting to be delivered still fits under Temporal's 2 MB payload limit. The rest of the input is measured before any codec or External Storage, which can only overstate it, so the stream may keep fewer events than would fit.
+- Continue-As-New carries the stream in the new run's input, next to the agent's state. Without External Storage, the stream shrinks to fit, so a large tool result waiting to be delivered still fits under Temporal's 2 MB payload limit; the rest of the input is measured before any codec, which can only overstate it, so the stream may keep fewer events than would fit.
 - **Every subscriber poll is an Update**, and a Workflow accepts at most 10 Updates in flight and 2,000 per run (Temporal's defaults). Idle subscribers hold Updates in flight, so with many direct subscribers an Update approval can be refused (tested: with 12, it failed with `RESOURCE_EXHAUSTED`). Approve by Signal instead (`decide()` ignores invalid decisions there), or fan events out to viewers through one subscriber in your backend. For long runs with live output, turn on `auto_continue_as_new`: the server counts the polls toward its suggestion.
 - Create the agent while the Workflow is being initialized (in its `__init__`), where Workflow Streams registers its handlers; later, the constructor raises.
 
@@ -186,7 +196,12 @@ The agent loop runs in *segments*. A segment is one Activity that runs the Claud
 3. The Workflow runs the call as its own Activity, after an approval if the tool needs one.
 4. The next segment resumes the session with the result as a normal `tool_result` message.
 
-**Checkpoints.** After a segment, the runner reads the session back from the store and returns its last transcript entry, where the engine would resume; the Workflow records that checkpoint with the segment's result. Reading it back also proves the turn reached the store. A segment that runs again continues in a copy of the session that ends at the checkpoint (`fork_session_via_store`), and Claude decides again from there, with new tool call ids. So does a segment whose session went on past its checkpoint, for example after a Workflow reset: the check rides on the load the SDK does anyway. After Claude sent several durable calls at once, the checkpoint is the paused call's deferral marker (the denied calls' results come after it, and the engine would not resume the paused call past them), so the next segment also continues in a copy. Tested on the real engine: a Worker killed while Claude is answering, an attempt that hangs past its timeout, and results lost after a step finished.
+**Checkpoints.** After a segment, the runner reads the session back and returns its last transcript entry, where the engine would resume; the Workflow records that checkpoint with the segment's result. After Claude sent several durable calls at once, the checkpoint is the paused call's deferral marker (the denied calls' results come after it, and the engine would not resume the paused call past them).
+
+- With the conversation in the Workflow, the next segment resumes from the committed conversation up to the checkpoint, in memory, and returns what it added. A segment that runs again does the same, so Claude decides again from the checkpoint, with new tool call ids; after a Workflow reset, the conversation goes back with the Workflow's state.
+- With a session store, reading the checkpoint back also proves the turn reached the store. A segment that runs again continues in a copy of the session that ends at the checkpoint (`fork_session_via_store`). So does a segment whose session went on past its checkpoint, for example after a Workflow reset (the check rides on the load the SDK does anyway), and the segment after a deferral marker.
+
+Tested on the real engine, both ways: a Worker killed while Claude is answering, an attempt that hangs past its timeout, results lost after a step finished, and a Workflow reset.
 
 **Fail closed.** If a Claude Code version ever runs a durable tool itself, or ignores a pause, the segment fails with a non-retryable error that names the engine version. Nothing runs outside Temporal. If the engine ever hands back a tool call id that already ran (the agent remembers every call of the current run and the last 256 before it), the Workflow stops instead of running it twice.
 
@@ -195,20 +210,20 @@ The agent loop runs in *segments*. A segment is one Activity that runs the Claud
 - **Claude Code 2.1.273 or newer.** Tested: when Claude calls two tools in one message, Claude Code 2.1.259 replaces the paused call's result with `[Tool result missing due to internal error]`, so Claude asks for the same tool again. The runner checks `claude -v` before starting the engine and refuses older engines.
 - **One durable tool call at a time.** The engine keeps one paused call per run. The runner asks Claude for one call per message; if Claude sends several, the first durable call pauses and every call after it in the same message, durable or built-in, is told to call again after its result.
 - **Claude Code's built-in tools** (Bash, Edit, and so on) are off unless you pass `builtin_tools`. When enabled, they run inside the segment Activity, not as their own Activities, on the Worker's disk in the runner's `cwd` (shared by every agent on that Worker). They can run again when a segment runs again, possibly on another Worker with a different disk, and files a failed attempt wrote are not rolled back. Give them work that is safe to repeat, or make the work a durable tool.
-- **A session store every Worker can reach**, and the same `cwd` on every Worker. Every segment reads the whole session twice (the SDK to resume it, the runner to record the checkpoint), so reading grows with the session's length. A segment that runs again reads it once more and writes a copy; the earlier copy stays in the store, so remove old sessions with your store's own retention.
+- **Each step reads the whole conversation** (with the Query, or from a session store), so reading grows with the conversation's length. Compaction does not shrink it: Claude Code keeps the entries from before a compaction, and resuming uses some of them (a preserved segment of recent messages; tested with `/compact`), so the plugin keeps them all.
 - **Subagents run in the foreground, without durable tools.** The runner turns off Claude Code's background tasks (a background subagent kept the engine working after it paused). A subagent (Claude Code's `Agent` tool) can use built-in tools; a durable tool call from a subagent cannot pause the run, so the step fails closed.
-- **Long conversations.** Continue-As-New keeps the Workflow's history small, but the conversation itself grows until Claude Code compacts it. A request the model refuses as too long fails the task.
-- **Logins that survive resumes.** Use `ANTHROPIC_API_KEY`, Amazon Bedrock, Google Vertex AI, Microsoft Foundry, or `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. A Claude app login cannot refresh itself when a session is resumed from a session store.
+- **Long conversations.** Continue-As-New keeps the Workflow's history small, but what Claude reads grows until Claude Code compacts it. A request the model refuses as too long fails the task.
+- **Logins that survive resumes.** Use `ANTHROPIC_API_KEY`, Amazon Bedrock, Google Vertex AI, Microsoft Foundry, or `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. Every step after the first resumes the session, and a Claude app login cannot refresh itself there.
 
 ## Security
 
 - Credentials stay on Workers: the engine inherits the Worker's environment (API keys, cloud credentials, proxies). They reach Workflow history only if a built-in tool shows them to Claude (for example Bash running `env`), so give Workers that enable built-in tools only the secrets they need.
-- The conversation does: prompts, Claude's text, tool arguments and results are in the Workflow's history and in the session store. Encrypt payloads with a codec and protect the store like any other data store.
+- The conversation does: prompts, Claude's text, tool arguments and results are in the Workflow's history (and in the session store, if you use one). Encrypt payloads with a codec, and protect a store like any other data store.
 - Claude chooses tool arguments. Treat them as untrusted input in your Activities, and require approval (`needs_approval=True`) for tools that move money or delete data.
 
 ## Testing your agents
 
-`temporalio.claude_agent_sdk.testing.ScriptedClaude` is a segment runner that plays Claude with a Python policy. It needs no engine and no API key. It keeps sessions in a folder, so tests can kill a Worker and continue on a new one, and its checkpoints behave like the real runner's: a segment that runs again decides again, with a new tool call id.
+`temporalio.claude_agent_sdk.testing.ScriptedClaude` is a segment runner that plays Claude with a Python policy. It needs no engine and no API key. Like the real runner, it keeps the conversation in the Workflow, so tests can kill a Worker and continue on a new one (give it a folder to keep sessions there instead, like a session store), and its checkpoints behave like the real runner's: a segment that runs again decides again, with a new tool call id.
 
 ## Documentation
 

@@ -72,10 +72,10 @@ def check_sequence(events: list[dict[str, Any]], steps: int) -> None:
 
 @pytest.mark.usefixtures("shop_dir")
 async def test_live_events_arrive_in_order_across_continue_as_new(
-    client: Client, tmp_path: Path
+    client: Client,
 ) -> None:
     queue = f"live-{uuid.uuid4().hex[:8]}"
-    async with worker(client, queue, ScriptedClaude(count_policy, tmp_path / "fake")):
+    async with worker(client, queue, ScriptedClaude(count_policy)):
         handle = await client.start_workflow(
             LongTaskWorkflow.run,
             args=["count to 12", TaskOptions(after_events=60, live=True), None],
@@ -91,14 +91,12 @@ async def test_live_events_arrive_in_order_across_continue_as_new(
 
 
 @pytest.mark.usefixtures("shop_dir")
-async def test_a_subscriber_that_reconnects_misses_nothing(
-    client: Client, tmp_path: Path
-) -> None:
+async def test_a_subscriber_that_reconnects_misses_nothing(client: Client) -> None:
     queue = f"reconnect-{uuid.uuid4().hex[:8]}"
     async with worker(
         client,
         queue,
-        ScriptedClaude(count_policy, tmp_path / "fake", think_seconds=0.05),
+        ScriptedClaude(count_policy, think_seconds=0.05),
     ):
         await client.start_workflow(
             LongTaskWorkflow.run,

@@ -21,15 +21,22 @@ from tests.refund.workflows import RefundAgentWorkflow
 
 
 def build_runner(real: bool) -> SegmentRunner:
-    """The real engine (with a fake model in tests), or the scripted runner."""
+    """The real engine (with a fake model in tests), or the scripted runner.
+
+    ``RUNNER_MODE=store`` keeps conversations in a store every Worker shares;
+    otherwise (the default) each Workflow holds its own, and no storage is shared.
+    """
+    shared = os.environ.get("RUNNER_MODE", "held") == "store"
     if real:
         return ClaudeAgentSdkRunner(
-            session_store=FileSessionStore(os.environ["SESSION_DIR"]),
+            session_store=FileSessionStore(os.environ["SESSION_DIR"])
+            if shared
+            else None,
             cwd=os.environ.get("ENGINE_CWD"),
         )
     return ScriptedClaude(
         refund_policy,
-        os.environ.get("FAKE_STATE_DIR", ".fake_claude"),
+        os.environ.get("FAKE_STATE_DIR", ".fake_claude") if shared else None,
         think_seconds=float(os.environ.get("FAKE_THINK", "0")),
     )
 

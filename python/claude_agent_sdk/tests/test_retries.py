@@ -3,7 +3,8 @@
 A segment attempt can write to the session and then never commit: the Worker dies,
 the attempt times out, or the Activity result is lost. The next attempt must not
 build on those writes. These tests drive ClaudeAgentSdkRunner segment by segment,
-the way the Workflow does, and throw an attempt's result away at the worst moments.
+the way the Workflow does, and throw an attempt's result away at the worst moments,
+with the conversation in the Workflow ("held", the default) and in a session store.
 """
 
 from __future__ import annotations
@@ -35,15 +36,22 @@ from tests.helpers.fake_messages_api import (
 
 TOOLS = [ToolSpec("count", "Count one step.", {"type": "object"})]
 pytestmark = pytest.mark.timeout(240)
+MODES = ["held", "store"]
 
 
 class Session:
-    """Drives one Claude session segment by segment, like the Workflow."""
+    """Drives one Claude session segment by segment, like the Workflow.
+
+    When the runner has no session store, it also holds the conversation and splices
+    in what each committed segment changed, like the Workflow.
+    """
 
     def __init__(self, runner: ClaudeAgentSdkRunner) -> None:
         self.runner = runner
+        self.held = runner._store is None  # type: ignore[reportPrivateUsage]
         self.session_id = str(uuid.uuid4())
         self.checkpoint: str | None = None
+        self.transcript: list[dict[str, Any]] = []
         self.index = 0
 
     def input(
@@ -60,12 +68,20 @@ class Session:
             injected=injected or {},
             segment_index=self.index,
             fork=fork,
+            transcript=list(self.transcript) if self.held else None,
         )
 
     def commit(self, out: SegmentOutput) -> SegmentOutput:
         assert not out.is_error, out.error
         assert out.checkpoint is not None
         self.session_id, self.checkpoint = out.session_id, out.checkpoint
+        if self.held:
+            assert out.transcript_keep is not None
+            self.transcript = self.transcript[: out.transcript_keep] + list(
+                out.transcript_add
+            )
+        else:
+            assert out.transcript_keep is None and out.transcript_add == []
         self.index += 1
         return out
 
@@ -88,10 +104,12 @@ def start_api(api_holder: list[FakeMessagesAPI]) -> FakeMessagesAPI:
     return api.start()
 
 
-def make_runner(api: FakeMessagesAPI, tmp_path: Path) -> ClaudeAgentSdkRunner:
+def make_runner(
+    api: FakeMessagesAPI, tmp_path: Path, mode: str = "held"
+) -> ClaudeAgentSdkRunner:
     (tmp_path / "work").mkdir(exist_ok=True)
     return ClaudeAgentSdkRunner(
-        session_store=FileSessionStore(tmp_path / "store"),
+        session_store=FileSessionStore(tmp_path / "store") if mode == "store" else None,
         cwd=str(tmp_path / "work"),
         env=engine_env(api, str(tmp_path / "cfg")),
     )
@@ -109,12 +127,15 @@ def check_clean(api: FakeMessagesAPI, runner: ClaudeAgentSdkRunner) -> None:
     assert runner.stub_calls == 0  # the engine never ran a durable tool itself
 
 
-async def test_retry_after_the_attempt_reached_the_next_pause(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", MODES)
+async def test_retry_after_the_attempt_reached_the_next_pause(
+    tmp_path: Path, mode: str
+) -> None:
     """The lost attempt paused at the next call; the retry decides again from the checkpoint."""
     holder: list[FakeMessagesAPI] = []
     api = start_api(holder)
     try:
-        runner = make_runner(api, tmp_path)
+        runner = make_runner(api, tmp_path, mode)
         s = Session(runner)
         first = await s.run(s.input("count to 3"))
         assert first.deferred is not None
@@ -137,7 +158,10 @@ async def test_retry_after_the_attempt_reached_the_next_pause(tmp_path: Path) ->
     check_clean(api, runner)
 
 
-async def test_retry_after_a_crash_during_the_model_call(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", MODES)
+async def test_retry_after_a_crash_during_the_model_call(
+    tmp_path: Path, mode: str
+) -> None:
     """The attempt delivered the tool result, then died waiting for Claude."""
     holder: list[FakeMessagesAPI] = []
     api = start_api(holder)
@@ -155,7 +179,7 @@ async def test_retry_after_a_crash_during_the_model_call(tmp_path: Path) -> None
 
     api.decide = hang_once
     try:
-        runner = make_runner(api, tmp_path)
+        runner = make_runner(api, tmp_path, mode)
         s = Session(runner)
         first = await s.run(s.input("count to 3"))
         assert first.deferred is not None
@@ -180,12 +204,15 @@ async def test_retry_after_a_crash_during_the_model_call(tmp_path: Path) -> None
     check_clean(api, runner)
 
 
-async def test_retry_of_a_new_task_on_the_same_session(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", MODES)
+async def test_retry_of_a_new_task_on_the_same_session(
+    tmp_path: Path, mode: str
+) -> None:
     """The second task's first segment is lost after it paused; the retry sends the prompt once."""
     holder: list[FakeMessagesAPI] = []
     api = start_api(holder)
     try:
-        runner = make_runner(api, tmp_path)
+        runner = make_runner(api, tmp_path, mode)
         s = Session(runner)
         done = await s.finish(await s.run(s.input("count to 2")))
         assert done.result == "counted to 2"
@@ -204,14 +231,15 @@ async def test_retry_of_a_new_task_on_the_same_session(tmp_path: Path) -> None:
     check_clean(api, runner)
 
 
+@pytest.mark.parametrize("mode", MODES)
 async def test_next_task_after_a_failed_one_answers_the_waiting_call(
-    tmp_path: Path,
+    tmp_path: Path, mode: str
 ) -> None:
     """A task stopped while Claude waited for a tool result: the next task answers it."""
     holder: list[FakeMessagesAPI] = []
     api = start_api(holder)
     try:
-        runner = make_runner(api, tmp_path)
+        runner = make_runner(api, tmp_path, mode)
         s = Session(runner)
         first = await s.run(s.input("count to 5"))
         assert first.deferred is not None
@@ -248,7 +276,7 @@ async def test_a_segment_whose_transcript_was_not_stored_does_not_commit(
     holder: list[FakeMessagesAPI] = []
     api = start_api(holder)
     try:
-        runner = make_runner(api, tmp_path)
+        runner = make_runner(api, tmp_path, "store")
         runner._store = LosingStore(tmp_path / "down")  # type: ignore[reportPrivateUsage]
         with pytest.raises(RuntimeError, match="session store"):
             await runner.run(
@@ -261,12 +289,18 @@ async def test_a_segment_whose_transcript_was_not_stored_does_not_commit(
         api.stop()
 
 
-async def test_a_stale_checkpoint_continues_in_a_copy(tmp_path: Path) -> None:
-    """After a Workflow reset, the session holds later turns than the checkpoint."""
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_stale_checkpoint_continues_in_a_copy(
+    tmp_path: Path, mode: str
+) -> None:
+    """After a Workflow reset, the session holds later turns than the checkpoint.
+
+    A conversation the Workflow holds goes back with the reset, so it simply continues.
+    """
     holder: list[FakeMessagesAPI] = []
     api = start_api(holder)
     try:
-        runner = make_runner(api, tmp_path)
+        runner = make_runner(api, tmp_path, mode)
         s = Session(runner)
         first = await s.run(s.input("count to 4"))
         assert first.deferred is not None
@@ -274,15 +308,16 @@ async def test_a_stale_checkpoint_continues_in_a_copy(tmp_path: Path) -> None:
         second = await s.run(s.input(injected={c1.id: ToolOutcome({"n": 1})}))
         assert second.deferred is not None
         c2 = second.deferred
-        at_reset = (s.session_id, s.checkpoint, s.index)
+        at_reset = (s.session_id, s.checkpoint, s.index, s.transcript)
         later = await s.run(s.input(injected={c2.id: ToolOutcome({"n": 2})}))
         assert later.deferred is not None  # the run that the reset throws away
-        s.session_id, s.checkpoint, s.index = at_reset  # the Workflow was reset
+        s.session_id, s.checkpoint, s.index, s.transcript = at_reset  # a reset
         before = len(api.requests)
         again = await s.run(s.input(injected={c2.id: ToolOutcome({"n": 2})}))
         assert len(api.requests) - before == 1  # one model call, no loop
         assert again.deferred is not None and again.deferred.input == {"n": 3}
-        assert again.session_id != at_reset[0]  # it continued in a copy
+        if mode == "store":
+            assert again.session_id != at_reset[0]  # it continued in a copy
         final = await s.finish(again)
     finally:
         api.stop()
@@ -293,11 +328,12 @@ async def test_a_stale_checkpoint_continues_in_a_copy(tmp_path: Path) -> None:
     check_clean(api, runner)
 
 
-async def test_an_empty_answer_is_a_final_answer(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", MODES)
+async def test_an_empty_answer_is_a_final_answer(tmp_path: Path, mode: str) -> None:
     """A model reply with no content ends the segment instead of retrying it forever."""
     api = FakeMessagesAPI(lambda body: []).start()
     try:
-        runner = make_runner(api, tmp_path)
+        runner = make_runner(api, tmp_path, mode)
         out = await runner.run(
             SegmentInput(
                 session_id=str(uuid.uuid4()), prompt="Say nothing.", tools=TOOLS
@@ -349,9 +385,10 @@ async def test_only_requests_refused_for_good_are_not_retried(
         api.stop()
 
 
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("retry_at", [None, 2], ids=["in-place", "retried"])
 async def test_parallel_calls_in_a_resumed_session_keep_every_result(
-    tmp_path: Path, retry_at: int | None
+    tmp_path: Path, retry_at: int | None, mode: str
 ) -> None:
     """Claude keeps sending two calls per message; each paused call's result must arrive."""
     ref: list[FakeMessagesAPI] = []
@@ -372,7 +409,7 @@ async def test_parallel_calls_in_a_resumed_session_keep_every_result(
     api.start()
     handed: list[int] = []
     try:
-        runner = make_runner(api, tmp_path)
+        runner = make_runner(api, tmp_path, mode)
         s = Session(runner)
         out = await s.run(s.input("count to 3"))
         while out.deferred is not None and len(handed) < 6:
@@ -394,8 +431,9 @@ async def test_parallel_calls_in_a_resumed_session_keep_every_result(
     check_clean(api, runner)
 
 
+@pytest.mark.parametrize("mode", MODES)
 async def test_a_builtin_call_after_a_pause_waits_for_its_result(
-    tmp_path: Path,
+    tmp_path: Path, mode: str
 ) -> None:
     """[durable, built-in] in one message: the built-in must not run before the paused call's result."""
     ref: list[FakeMessagesAPI] = []
@@ -423,7 +461,7 @@ async def test_a_builtin_call_after_a_pause_waits_for_its_result(
     ref.append(api)
     api.start()
     try:
-        runner = make_runner(api, tmp_path)
+        runner = make_runner(api, tmp_path, mode)
         s = Session(runner)
         first = await s.run(
             SegmentInput(
@@ -431,6 +469,7 @@ async def test_a_builtin_call_after_a_pause_waits_for_its_result(
                 prompt="count, then write a note",
                 tools=TOOLS,
                 builtin_tools=["Write"],
+                transcript=[] if s.held else None,
             )
         )
         assert first.deferred is not None
@@ -445,6 +484,7 @@ async def test_a_builtin_call_after_a_pause_waits_for_its_result(
                 checkpoint=s.checkpoint,
                 injected={call.id: ToolOutcome({"n": 1})},
                 segment_index=s.index,
+                transcript=list(s.transcript) if s.held else None,
             )
         )
     finally:

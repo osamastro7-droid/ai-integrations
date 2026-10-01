@@ -36,6 +36,18 @@ def fetch_policy(prompt: str, history: list[HistoryItem]) -> ToolCall | Final:
     return Final(f"got {len(body.group(1))} characters")
 
 
+def pages_policy(prompt: str, history: list[HistoryItem]) -> ToolCall | Final:
+    """'fetch N KB K times': fetch K documents, then report how much of them arrived."""
+    match = re.search(r"fetch (\d+) KB (\d+) times", prompt)
+    kb, times = (int(match.group(1)), int(match.group(2))) if match else (1, 1)
+    done = [h for h in history if h.name == "fetch_document" and not h.is_error]
+    if len(done) < times:
+        return ToolCall("fetch_document", {"kb": kb})
+    bodies = [re.search(r"<doc>(x*)</doc>", str(h.content)) for h in done]
+    seen = sum(len(b.group(1)) for b in bodies if b is not None)
+    return Final(f"saw {seen} characters in {len(done)} documents")
+
+
 @workflow.defn
 class FetchWorkflow:
     """Fetches one large document."""

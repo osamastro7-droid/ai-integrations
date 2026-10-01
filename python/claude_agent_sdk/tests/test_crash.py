@@ -1,4 +1,8 @@
-"""Kill the Worker process at the worst moments. Every run must finish; money moves once."""
+"""Kill the Worker process at the worst moments. Every run must finish; money moves once.
+
+Each test runs with the conversation in the Workflow (the default: the Workers share
+no storage at all) and in a store every Worker shares.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +24,10 @@ from tests.refund import shop
 from tests.refund.workflows import MANAGER, RefundAgentWorkflow
 
 PROMPT = "Order A-1001 arrived broken, I want my money back."
-pytestmark = pytest.mark.timeout(180)
+pytestmark = [
+    pytest.mark.timeout(180),
+    pytest.mark.parametrize("mode", ["held", "store"]),
+]
 
 
 async def start_worker(
@@ -91,16 +98,19 @@ async def activity_completed(
     return False
 
 
-def worker_env(tmp: Path, shop_dir: Path) -> dict[str, str]:
-    """Settings every Worker process in a test shares."""
-    return {"SHOP_DIR": str(shop_dir), "FAKE_STATE_DIR": str(tmp / "fake")}
+def worker_env(tmp: Path, shop_dir: Path, mode: str) -> dict[str, str]:
+    """Settings every Worker process in a test shares (only the shop, unless ``store``)."""
+    env = {"SHOP_DIR": str(shop_dir), "RUNNER_MODE": mode}
+    if mode == "store":
+        env["FAKE_STATE_DIR"] = str(tmp / "fake")
+    return env
 
 
 async def test_crash_right_after_refund_is_recorded(
-    client: Client, address: str, shop_dir: Path, tmp_path: Path
+    client: Client, address: str, shop_dir: Path, tmp_path: Path, mode: str
 ) -> None:
     queue = f"crash-{uuid.uuid4().hex[:8]}"
-    env = worker_env(tmp_path, shop_dir)
+    env = worker_env(tmp_path, shop_dir, mode)
     w1 = await start_worker(address, queue, env, tmp_path / "w1.log")
     handle = await client.start_workflow(
         RefundAgentWorkflow.run, PROMPT, id=queue, task_queue=queue
@@ -128,10 +138,10 @@ async def test_crash_right_after_refund_is_recorded(
 
 
 async def test_crash_after_money_moved_but_before_the_reply(
-    client: Client, address: str, shop_dir: Path, tmp_path: Path
+    client: Client, address: str, shop_dir: Path, tmp_path: Path, mode: str
 ) -> None:
     queue = f"crash-{uuid.uuid4().hex[:8]}"
-    env = worker_env(tmp_path, shop_dir)
+    env = worker_env(tmp_path, shop_dir, mode)
     w1 = await start_worker(
         address, queue, {**env, "REFUND_DELAY": "5"}, tmp_path / "w1.log"
     )
@@ -160,10 +170,10 @@ async def test_crash_after_money_moved_but_before_the_reply(
 
 
 async def test_crash_in_the_middle_of_a_claude_segment(
-    client: Client, address: str, shop_dir: Path, tmp_path: Path
+    client: Client, address: str, shop_dir: Path, tmp_path: Path, mode: str
 ) -> None:
     queue = f"crash-{uuid.uuid4().hex[:8]}"
-    env = worker_env(tmp_path, shop_dir)
+    env = worker_env(tmp_path, shop_dir, mode)
     w1 = await start_worker(
         address, queue, {**env, "FAKE_THINK": "4"}, tmp_path / "w1.log"
     )

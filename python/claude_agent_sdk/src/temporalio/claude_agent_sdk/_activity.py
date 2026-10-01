@@ -20,6 +20,12 @@ class SegmentRunner(Protocol):
     ``checkpoint``, and the next segment of the session receives it. A segment that
     runs again (``attempt`` > 1, or ``inp.fork``) must continue from
     ``inp.checkpoint`` and ignore anything an unfinished attempt wrote after it.
+
+    A runner that lets the Workflow hold the conversation reads it from
+    ``inp.conversation`` (or ``inp.transcript``) and returns what changed in
+    ``transcript_keep`` and ``transcript_add``; one that keeps it elsewhere returns
+    ``transcript_keep=None``. Both report ``external_storage``, so the Workflow knows
+    whether a large state can move to a new run.
     """
 
     async def run(self, inp: SegmentInput, attempt: int) -> SegmentOutput:
