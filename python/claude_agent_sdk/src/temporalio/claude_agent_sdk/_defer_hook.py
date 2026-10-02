@@ -49,17 +49,24 @@ import sys
 from typing import Any
 
 NOT_RUN = (
-    "This call did not run: another tool call in this message paused the run. "
-    "Call this tool again after you get that result."
+    "Not an error. This call did not run yet: another tool call in this message "
+    "paused the run. Call this tool again after you get that result."
 )
-"""The reason Claude sees for a built-in call denied after the pause."""
+"""The reason Claude sees for a built-in call denied after the pause.
+
+Since Claude Code 2.1.281 a denial reaches Claude as ``PreToolUse:<tool> hook error:
+<reason>``, and models often retry a call they see fail that way
+(anthropics/claude-code#85490). So the reasons Claude reads say first that nothing
+failed, then what to do.
+"""
 
 STOPPED = "This step was stopped (cancelled or timed out). Do not call tools."
 """The reason Claude sees when the segment is no longer running (the runner looks for it)."""
 
 MAIN_AGENT_ONLY = (
-    "This tool runs as its own Temporal Activity, so only the main agent can call "
-    "it, not a subagent. Finish and report back; the main agent can call it."
+    "Not an error, and calling it again will not help: this tool runs as its own "
+    "Temporal Activity, so only the main agent can call it, not a subagent. Finish "
+    "and report back; the main agent can call it."
 )
 """The reason a subagent sees when it calls a tool that runs as an Activity."""
 

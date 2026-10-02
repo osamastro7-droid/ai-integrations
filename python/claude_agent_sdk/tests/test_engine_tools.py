@@ -478,6 +478,18 @@ async def test_real_engine_read_only_commands_run_together_still_pause(
     expected = "notes.txt" if ran == "ls" else "written before the segment"
     assert expected in seen[ran]  # the paused call's own output
     assert "did not run" in seen[other]  # the other kept its denial
+    # Claude Code 2.1.281 and newer label it "hook error": it still opens with this.
+    assert denial_text(seen[other]).startswith("Not an error."), seen[other]
+
+
+def denial_text(seen: str) -> str:
+    """A denial as the hook wrote it, without the label Claude Code adds since 2.1.281.
+
+    Claude Code 2.1.273 shows Claude the reason alone; 2.1.281 and newer show
+    ``PreToolUse:<tool> hook error: <reason>``.
+    """
+    head, sep, rest = seen.partition(" hook error: ")
+    return rest if sep and head.startswith("PreToolUse:") else seen
 
 
 async def test_real_engine_an_edit_cannot_run_apart_from_its_segment(
@@ -625,6 +637,9 @@ async def test_real_engine_a_subagent_is_told_to_leave_durable_tools_to_the_main
         api.stop()
     assert second.result == "FINAL"
     assert seen_by_subagent and "only the main agent can call it" in seen_by_subagent[0]
+    assert denial_text(seen_by_subagent[0]).startswith(
+        "Not an error, and calling it again will not help"
+    ), seen_by_subagent[0]
     assert api.errors == [] and runner.stub_calls == 0
 
 
