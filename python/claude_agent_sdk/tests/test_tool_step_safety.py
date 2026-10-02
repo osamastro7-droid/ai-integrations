@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -453,15 +456,21 @@ async def test_a_session_already_on_disk_is_left_alone(tmp_path: Path) -> None:
     assert transcript.exists() and (folder / "kept.txt").exists()
 
 
-def test_the_command_env_file_is_a_posix_shell_script(tmp_path: Path) -> None:
+def test_the_command_env_file_is_a_posix_shell_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Claude Code runs it in Git Bash on Windows too, so it has LF line endings
-    there as well, and it holds names only: the values travel in the environment."""
+    there as well, and it holds names only: the values travel in the environment.
+    It runs quietly, even with a name in the Worker's environment no shell takes."""
+    monkeypatch.setenv("TCA_NOT-A-SHELL-NAME", "1")
     (tmp_path / "work").mkdir()
     runner = ClaudeAgentSdkRunner(
         cwd=str(tmp_path / "work"), env={"ANTHROPIC_API_KEY": "x"}
     )
     env = runner._step_env(  # type: ignore[reportPrivateUsage]
-        {"ANTHROPIC_BASE_URL": "https://example.invalid"}, str(tmp_path), "toolu_1"
+        {"ANTHROPIC_BASE_URL": "https://example.invalid", "TCA_HOOK_DIR": "x"},
+        str(tmp_path),
+        "toolu_1",
     )
     script = (tmp_path / "command_env.sh").read_bytes()
     assert env["CLAUDE_ENV_FILE"] == str(tmp_path / "command_env.sh")
@@ -469,6 +478,67 @@ def test_the_command_env_file_is_a_posix_shell_script(tmp_path: Path) -> None:
     assert b'export ANTHROPIC_BASE_URL="$TCA_KEEP_ANTHROPIC_BASE_URL"' in script
     assert b"example.invalid" not in script
     assert env["TCA_KEEP_ANTHROPIC_BASE_URL"] == "https://example.invalid"
+    unset = script.decode().splitlines()[-1].split()
+    assert unset[0] == "unset" and set(unset[1:]) >= {
+        "TCA_ALLOW_ID",
+        "TCA_HOOK_DIR",
+        "TCA_KEEP_ANTHROPIC_BASE_URL",
+    }
+    assert "TCA_NOT-A-SHELL-NAME" not in unset
+    assert env["ANTHROPIC_API_KEY"] == runner._stand_in.key  # type: ignore[reportPrivateUsage]
+    shell = shutil.which("sh")
+    if shell is not None:  # Git Bash's sh on Windows, when it is on PATH
+        ran = subprocess.run(
+            [shell, "-c", '. "$CLAUDE_ENV_FILE" && echo "$ANTHROPIC_BASE_URL" && env'],
+            env={**os.environ, **env},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert ran.returncode == 0 and ran.stderr == "", ran.stderr
+        first, *rest = ran.stdout.splitlines()
+        assert first == "https://example.invalid"  # the Worker's own value
+        assert runner._stand_in.key not in ran.stdout  # type: ignore[reportPrivateUsage]
+        plugins = [n.split("=", 1)[0] for n in rest if n.startswith("TCA_")]
+        assert [n for n in plugins if n.isidentifier()] == []
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+def test_your_own_env_file_runs_after_the_workers_values_are_back(
+    tmp_path: Path,
+) -> None:
+    """As Claude Code runs a ``CLAUDE_ENV_FILE`` of your own in a segment: last, so
+    it can set what it likes, and a relative name is found from the working
+    directory (not looked up in PATH)."""
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "user_env.sh").write_text(
+        "export FROM_USER=1\nexport ANTHROPIC_BASE_URL=https://user.invalid\n"
+    )
+    runner = ClaudeAgentSdkRunner(
+        cwd=str(work),
+        env={"ANTHROPIC_API_KEY": "x", "CLAUDE_ENV_FILE": "user_env.sh"},
+    )
+    env = runner._step_env(  # type: ignore[reportPrivateUsage]
+        {
+            "ANTHROPIC_BASE_URL": "https://worker.invalid",
+            "CLAUDE_ENV_FILE": "user_env.sh",
+        },
+        str(tmp_path),
+        "toolu_1",
+    )
+    ran = subprocess.run(
+        [str(shutil.which("sh")), "-c", '. "$CLAUDE_ENV_FILE" && env'],
+        env={**os.environ, **env},
+        cwd=str(tmp_path),  # not the working directory: the path must not depend on it
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert ran.returncode == 0 and ran.stderr == "", ran.stderr
+    seen = [line for line in ran.stdout.splitlines() if "=" in line]
+    assert "FROM_USER=1" in seen and "ANTHROPIC_BASE_URL=https://user.invalid" in seen
+    assert "CLAUDE_ENV_FILE=user_env.sh" in seen  # the Worker's own value is back
 
 
 def test_file_checkpointing_is_refused(tmp_path: Path) -> None:
@@ -481,14 +551,124 @@ def test_file_checkpointing_is_refused(tmp_path: Path) -> None:
         )
 
 
+def post_to(
+    stand_in: _stand_in.StandInModel,
+    body: bytes,
+    key: str | None,
+    length: int | str | None = None,
+) -> int:
+    """POST ``body`` to the stand-in (saying it is ``length`` bytes long); the status."""
+    headers = {"x-api-key": key} if key else {}
+    if length is not None:
+        headers["content-length"] = str(length)
+    request = urllib.request.Request(
+        f"{stand_in.base_url}/v1/messages", data=body, method="POST", headers=headers
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+            return int(response.status)
+    except urllib.error.HTTPError as err:
+        return err.code
+
+
 def test_the_stand_in_refuses_a_body_that_is_not_json() -> None:
     stand_in = _stand_in.StandInModel()
-    request = urllib.request.Request(
-        f"{stand_in.base_url}/v1/messages", data=b"not json", method="POST"
+    assert post_to(stand_in, b"not json", stand_in.key) == 400
+    assert stand_in.requests == 1
+
+
+@pytest.mark.parametrize("key", [None, "sk-ant-guess"], ids=["no-key", "wrong-key"])
+def test_the_stand_in_answers_only_its_own_engines(key: str | None) -> None:
+    """Any program on the machine can reach 127.0.0.1. Without the stand-in's key it
+    gets 401 at once: the stand-in does not wait for the body it says it sends."""
+    stand_in = _stand_in.StandInModel()
+    assert post_to(stand_in, b"{}", key, length=1000) == 401
+    assert stand_in.requests == 0
+    assert post_to(stand_in, b'{"model": "x", "messages": []}', stand_in.key) == 200
+    assert stand_in.requests == 1
+
+
+def test_the_stand_in_reads_no_body_over_its_limit_or_of_a_negative_length() -> None:
+    """Both answer at once (before, the stand-in waited for the body that never came)."""
+    stand_in = _stand_in.StandInModel()
+    assert post_to(stand_in, b"{}", stand_in.key, _stand_in.MAX_BODY_BYTES + 1) == 413
+    assert post_to(stand_in, b"{}", stand_in.key, -1) == 400
+    assert post_to(stand_in, b"{}", stand_in.key, "two") == 400
+
+
+@pytest.mark.parametrize("credential", ["key helper", "login", "token variables"])
+async def test_a_tool_steps_engine_sends_the_stand_ins_key_whatever_the_worker_has(
+    tmp_path: Path, credential: str
+) -> None:
+    """The stand-in answers only its own key. Other credentials on the Worker (a key
+    helper in the settings, a Claude login, token variables) must not take its place,
+    or every tool step's model calls would be refused."""
+    api = start_with_policy(shell_policy)
+    cfg = tmp_path / "cfg-x"
+    cfg.mkdir()
+    env = engine_env(api, str(cfg))
+    extra: dict[str, Any] = {}
+    if credential == "key helper":
+        helper = tmp_path / "helper.py"
+        helper.write_text("print('sk-ant-from-a-helper')\n", encoding="utf-8")
+        command = f'"{Path(sys.executable).as_posix()}" "{helper.as_posix()}"'
+        (cfg / "settings.json").write_text(json.dumps({"apiKeyHelper": command}))
+        extra = {"setting_sources": ["user"]}
+    elif credential == "login":
+        login = {
+            "accessToken": "sk-ant-oat01-not-real",
+            "refreshToken": "sk-ant-ort01-not-real",
+            "expiresAt": int(time.time() + 86400) * 1000,
+            "scopes": ["user:inference", "user:profile"],
+            "subscriptionType": "max",
+        }
+        (cfg / ".credentials.json").write_text(json.dumps({"claudeAiOauth": login}))
+    else:
+        env["ANTHROPIC_AUTH_TOKEN"] = "sk-ant-from-a-variable"
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = "sk-ant-oat01-from-a-variable"
+    plain = make_runner(tmp_path, api)
+    configured = ClaudeAgentSdkRunner(
+        cwd=str(tmp_path / "work"), env=env, extra_options=extra
     )
-    with pytest.raises(urllib.error.HTTPError) as err:
-        urllib.request.urlopen(request, timeout=10)  # noqa: S310 (local stand-in)
-    assert err.value.code == 400 and stand_in.requests == 1
+    try:
+        out = await pause_at_bash(plain, "echo local")
+        outcome = await configured.run_tool_step(step_for(out), 1)
+    finally:
+        api.stop()
+    assert outcome.content == "local" and not outcome.is_error
+    assert configured._stand_in.requests >= 1  # type: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("where", ["tool-step", "segment"])
+async def test_commands_see_none_of_the_plugins_variables(
+    tmp_path: Path, where: str
+) -> None:
+    """The hook's folder and the ids it keeps are the plugin's business: a command
+    cannot read them, whether it runs as its own Activity or inside the segment."""
+    api = start_with_policy(shell_policy)
+    runner = make_runner(tmp_path, api)
+    command = "env | grep '^TCA_' || echo none"
+    try:
+        if where == "tool-step":
+            out = await pause_at_bash(runner, command)
+            seen = (await runner.run_tool_step(step_for(out), 1)).content
+        else:
+            out = await runner.run(
+                SegmentInput(
+                    session_id=str(uuid.uuid4()),
+                    prompt=f"run: {command}",
+                    tools=TOOLS,
+                    builtin_tools=["Bash"],
+                    transcript=[],
+                    tool_activities=[],
+                ),
+                1,
+            )
+            assert not out.is_error, out.error
+            seen = out.result
+    finally:
+        api.stop()
+    assert seen == "none"
 
 
 async def test_a_tool_step_on_a_worker_set_up_the_other_way_is_retried(

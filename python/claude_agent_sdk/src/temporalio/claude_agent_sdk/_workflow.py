@@ -41,9 +41,14 @@ _TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,50}")
 """Tool names Claude Code keeps as they are: ``mcp__durable__<name>`` fits in 64 characters."""
 _RECENT_CALLS = 256  # tool calls remembered across runs for the run-once guard
 _HANDOVER_BYTES = 1536 * 1024  # live output's share keeps the new run's input small
+_STREAM_ITEM_BYTES = 34
+"""The JSON around one event the new run's input carries: ``{"data":"","offset":0,
+"topic":""}`` and a comma (measured with the default converter)."""
 _CHECKS_PATCH = "temporalio-claude-agent-sdk-continue-as-new-checks"
 """Patch ID of the Continue-As-New checks added after the first published version
 (766c647): Workflows that version started keep their decisions on replay."""
+_CARRY_PATCH = "temporalio-claude-agent-sdk-measured-stream-carry"
+"""Patch ID of the check of the new run's input with the live output stream in it."""
 _HISTORY_EVENTS = 51_200
 _HISTORY_BYTES = 50 * 1024 * 1024
 """Temporal's default limits for one run's history: the server ends a run past them."""
@@ -58,6 +63,11 @@ def _is_cancellation(err: BaseException) -> bool:
     if isinstance(err, asyncio.CancelledError):
         return True
     return isinstance(err, ActivityError) and isinstance(err.cause, CancelledError)
+
+
+def _event_bytes(item: Any) -> int:
+    """A live output event's size in the new run's input (a stream log item)."""
+    return len(item.data) + len(item.topic) + _STREAM_ITEM_BYTES
 
 
 _ENGINE_ACTIVITY_TOOLS = ("Bash", "PowerShell")
@@ -587,12 +597,12 @@ class DurableClaudeAgent:
             workflow.logger.warning("%s The agent keeps going in this run.", problem)
         return False
 
-    def _new_checks(self) -> bool:
+    def _new_checks(self, patch: str = _CHECKS_PATCH) -> bool:
         """Whether this run makes the checks added after the first published version.
 
         Called only where they change a decision, so most histories get no marker.
         """
-        return workflow.patched(_CHECKS_PATCH)
+        return workflow.patched(patch)
 
     def _handover_problem(self, measured: int | None = None) -> str | None:
         """Why the new run's input cannot carry this agent's state, or None if it can.
@@ -661,13 +671,40 @@ class DurableClaudeAgent:
         if problem is not None and self._new_checks():
             raise ApplicationError(problem, non_retryable=True)
         if self._stream is not None:
-            budget = self._keep_bytes
-            if rest is not None:
-                # The stream shares the new run's input with everything else in it.
-                budget = max(0, min(budget, _HANDOVER_BYTES - rest))
-            self._trim_stream(budget)
-            state.stream = self._stream.get_state()
+            problem = self._handover_problem(self._carry_stream(state, rest))
+            if problem is not None and self._new_checks(_CARRY_PATCH):
+                raise ApplicationError(problem, non_retryable=True)
         workflow.continue_as_new(args=self._new_run_args(state))
+
+    def _carry_stream(self, state: AgentState, rest: int | None) -> int | None:
+        """Put the newest live output events that fit into the new run's ``state``.
+
+        Args:
+            state: The new run's state, without the stream.
+            rest: The new run's input size without the stream, or None when External
+                Storage takes large payloads.
+
+        Returns:
+            The new run's input size with the stream, or None when not measured.
+        """
+        assert self._stream is not None
+        budget = self._keep_bytes
+        if rest is not None:
+            # The stream shares the new run's input with everything else in it.
+            budget = max(0, min(budget, _HANDOVER_BYTES - rest))
+        self._trim_stream(budget)
+        state.stream = self._stream.get_state()
+        if rest is None:
+            return None
+        # Measured again as the input carries it (with the stream's publishers, and
+        # whatever the converter adds): while over the share, carry fewer events.
+        total = self._input_bytes(state)
+        while total > _HANDOVER_BYTES and state.stream.log:
+            carried = sum(_event_bytes(item) for item in state.stream.log)
+            self._trim_stream(carried - (total - _HANDOVER_BYTES))
+            state.stream = self._stream.get_state()
+            total = self._input_bytes(state)
+        return total
 
     def _input_bytes(self, state: AgentState) -> int:
         """Size of the new run's input with ``state``, before any codec."""
@@ -685,7 +722,7 @@ class DurableClaudeAgent:
         snapshot = self._stream.get_state()
         kept = size = 0
         for item in reversed(snapshot.log):
-            item_size = len(item.data) + len(item.topic)
+            item_size = _event_bytes(item)
             if kept >= self._keep or size + item_size > max_bytes:
                 break
             kept += 1

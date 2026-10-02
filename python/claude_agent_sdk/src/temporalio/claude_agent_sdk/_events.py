@@ -33,7 +33,8 @@ def cap_event(event: dict[str, Any]) -> dict[str, Any]:
 
     ``text``, ``result`` and ``error`` keep their first :data:`FIELD_LIMIT`
     characters. A tool ``input`` longer than that as JSON becomes that much of its
-    JSON text. Either way the event gets ``truncated: True``.
+    JSON text. Either way the event gets ``truncated: True``. An ``input`` that is
+    already text is cut like the other texts, so a capped event stays as it is.
 
     Args:
         event: The event.
@@ -44,7 +45,7 @@ def cap_event(event: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     truncated = False
     for key, value in event.items():
-        if key in ("text", "result", "error") and isinstance(value, str):
+        if key in ("text", "result", "error", "input") and isinstance(value, str):
             if len(value) > FIELD_LIMIT:
                 value, truncated = value[:FIELD_LIMIT], True
         elif key == "input":

@@ -156,7 +156,6 @@ STEP_PROVIDER_ENV = {
     # Provider settings in settings files (user, project, .claude.json, managed) no
     # longer apply, so they cannot send a tool step's model calls elsewhere.
     "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "1",
-    "ANTHROPIC_API_KEY": "tool-step-stand-in",
     "ANTHROPIC_AUTH_TOKEN": "",
     "CLAUDE_CODE_OAUTH_TOKEN": "",
     "ANTHROPIC_UNIX_SOCKET": "",
@@ -169,7 +168,10 @@ STEP_PROVIDER_ENV = {
     "CLAUDE_CODE_USE_MANTLE": "",
     "CLAUDE_CODE_USE_GATEWAY": "",
 }
-"""A tool step talks to the local stand-in model only, whatever provider the Worker uses."""
+"""A tool step talks to the local stand-in model only, whatever provider the Worker uses.
+
+``ANTHROPIC_API_KEY`` is the stand-in's own key (``StandInModel.key``).
+"""
 
 SAVED_OUTPUT_TAIL = 4096
 """Bytes of the end of an output Claude Code saved to a file, added to the preview."""
@@ -1067,6 +1069,73 @@ def _write_launch_script(engine: str) -> str:
     return str(path)
 
 
+def _command_env(
+    env: dict[str, str],
+    hook_dir: str,
+    cwd: str | None,
+    overrides: dict[str, str],
+    extra: dict[str, str],
+) -> dict[str, str]:
+    """The engine's environment, with a file that gives each command the Worker's own.
+
+    Claude Code runs ``CLAUDE_ENV_FILE`` before each Bash command, in the command's
+    shell. This file puts back what the Worker had for every variable the engine
+    gets in ``overrides`` (the values travel in ``TCA_KEEP_*`` variables, never in
+    the file), then runs a ``CLAUDE_ENV_FILE`` of your own, as Claude Code would,
+    and removes every ``TCA_*`` variable: commands see none of the plugin's own.
+
+    Args:
+        env: The engine's environment so far.
+        hook_dir: The step's folder, where the file goes.
+        cwd: The engine's working directory (a relative ``CLAUDE_ENV_FILE`` of your
+            own is found from there, as Claude Code finds it).
+        overrides: Variables the engine gets but commands must not.
+        extra: The plugin's own variables to add for the engine (and its hook).
+
+    Returns:
+        The engine's environment.
+    """
+    before = {**os.environ, **env}
+    path = str(Path(hook_dir, "command_env.sh"))
+    overrides = {**overrides, "CLAUDE_ENV_FILE": path}
+    keep: dict[str, str] = {}
+    lines = [
+        "# temporalio.claude_agent_sdk: give the command the Worker's own environment."
+    ]
+    for name in overrides:
+        if before.get(name) is None:
+            lines.append(f"unset {name}")
+        else:
+            keep[f"TCA_KEEP_{name}"] = before[name]
+            lines.append(f'export {name}="$TCA_KEEP_{name}"')
+    user_file = before.get("CLAUDE_ENV_FILE")
+    if user_file:
+        user_file = os.path.join(cwd or os.getcwd(), user_file)
+        lines += [
+            'if [ -f "$TCA_USER_ENV_FILE" ] && [ -r "$TCA_USER_ENV_FILE" ]; then',
+            '  . "$TCA_USER_ENV_FILE"',
+            "fi",
+        ]
+    result = {
+        **env,
+        **overrides,
+        **keep,
+        **({"TCA_USER_ENV_FILE": user_file} if user_file else {}),
+        **extra,
+    }
+    # Names a shell takes (a stray name in the Worker's environment would print an
+    # error into every command's output).
+    hidden = sorted(
+        n
+        for n in {*os.environ, *result}
+        if n.startswith("TCA_") and n.isidentifier() and n.isascii()
+    )
+    lines.append("unset " + " ".join(hidden))
+    # Git Bash runs it on Windows too: LF line endings on every platform.
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    return result
+
+
 def _says_only(content: Any, reason: str) -> bool:
     """Whether a tool result is the hook's denial ``reason`` and nothing else.
 
@@ -1791,11 +1860,9 @@ class ClaudeAgentSdkRunner:
         """The engine's environment in a tool step, and the command's.
 
         The engine talks to the local stand-in model (``STEP_PROVIDER_ENV``,
-        ``ANTHROPIC_BASE_URL``). Claude Code runs ``CLAUDE_ENV_FILE`` before each Bash
-        command, in the command's shell: that file puts back what the Worker had (the
-        values travel in ``TCA_KEEP_*`` variables, never in the file), so a command
-        that calls the Anthropic API reaches the Worker's provider as it would in a
-        segment. A ``CLAUDE_ENV_FILE`` of your own runs first.
+        ``ANTHROPIC_BASE_URL``, and the stand-in's own key). The command gets the
+        Worker's own environment back (see ``_command_env``), so a command that calls
+        the Anthropic API reaches the Worker's provider as it would in a segment.
         """
         before = {**os.environ, **env}
         hosts: list[str] = []
@@ -1807,38 +1874,14 @@ class ClaudeAgentSdkRunner:
             hosts.append("127.0.0.1")
         overrides = {
             **STEP_PROVIDER_ENV,
+            "ANTHROPIC_API_KEY": self._stand_in.key,
             "ANTHROPIC_BASE_URL": self._stand_in.base_url,
             "NO_PROXY": ",".join(hosts),
             "no_proxy": ",".join(hosts),
-            "CLAUDE_ENV_FILE": str(Path(hook_dir, "command_env.sh")),
         }
-        keep: dict[str, str] = {}
-        lines = [
-            "# temporalio.claude_agent_sdk: this tool step's engine talks to a local",
-            "# stand-in model. Give the command the Worker's own environment back.",
-            'if [ -n "${TCA_USER_ENV_FILE:-}" ] && [ -f "$TCA_USER_ENV_FILE" ]; then',
-            '  . "$TCA_USER_ENV_FILE"',
-            "fi",
-        ]
-        for name in overrides:
-            if before.get(name) is None:
-                lines.append(f"unset {name}")
-            else:
-                keep[f"TCA_KEEP_{name}"] = before[name]
-                lines.append(f'export {name}="$TCA_KEEP_{name}"')
-        lines.append(f"unset TCA_ALLOW_ID TCA_USER_ENV_FILE {' '.join(keep)}")
-        # Git Bash runs it on Windows too: LF line endings on every platform.
-        Path(hook_dir, "command_env.sh").write_text(
-            "\n".join(lines) + "\n", encoding="utf-8", newline="\n"
+        return _command_env(
+            env, hook_dir, self._cwd, overrides, {"TCA_ALLOW_ID": call_id}
         )
-        user_file = before.get("CLAUDE_ENV_FILE")
-        return {
-            **env,
-            **overrides,
-            **keep,
-            **({"TCA_USER_ENV_FILE": user_file} if user_file else {}),
-            "TCA_ALLOW_ID": call_id,
-        }
 
     def _durable_server(self, tools: list[ToolSpec], ran_inside: list[str]) -> Any:
         """The durable tools as SDK MCP tools.
@@ -1946,6 +1989,8 @@ class ClaudeAgentSdkRunner:
             self._durable_server(inp.tools, ran_inside),
             violations,
         )
+        # A command that runs inside the segment sees none of the plugin's variables.
+        options["env"] = _command_env(options["env"], hook_dir, self._cwd, {}, {})
         prompt: Any
         in_message = {k: v for k, v in injected.items() if k not in (delivered or ())}
         if not resume:
