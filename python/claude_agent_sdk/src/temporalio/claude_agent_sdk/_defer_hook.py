@@ -33,9 +33,11 @@ which a tool controls.
 Stopped runs: when the segment Activity is cancelled or times out, the runner writes
 ``$TCA_HOOK_DIR/stop``, so an engine that is still shutting down cannot start another
 built-in tool (a durable call still defers: that ends the run, and no one runs it).
-If the folder is missing (the run ended, or the engine cannot see the Worker's
-temporary folder), every call is denied, and the runner fails a step that finished
-that way.
+The same holds once the Worker process is gone: while the engine runs, the Worker
+holds a lock on ``$TCA_HOOK_DIR/worker.lock``, and a hook that can take it knows the
+Worker died. If the folder is missing (the run ended, or the engine cannot see the
+Worker's temporary folder), every call is denied, and the runner fails a step that
+finished that way.
 """
 
 from __future__ import annotations
@@ -76,6 +78,9 @@ STEP_ONLY = "This step runs one tool call only."
 
 DURABLE_PREFIX = "mcp__durable__"
 """Names of durable tools as the engine sees them (the runner's ``PREFIX``)."""
+
+WORKER_LOCK = "worker.lock"
+"""The file in ``$TCA_HOOK_DIR`` that the Worker locks while its engine runs."""
 
 REASON_KEYS = {
     NOT_RUN: "not_run",
@@ -119,6 +124,41 @@ def _record(run_dir: str | None, tool_use_id: str, output: dict[str, Any]) -> No
         pass  # the folder is gone: the runner treats the step as stopped
 
 
+def _worker_gone(run_dir: str) -> bool:
+    """Whether the Worker that started this run is gone: nothing holds its lock.
+
+    The operating system releases a dead process's locks, so the hook can take the
+    lock only then. No lock file (an older runner, or a folder where locks do not
+    work): the Worker is taken to be there. Hooks that test at the same time take a
+    shared lock, so they do not take each other for the Worker (Windows has no
+    shared lock; there the job object ends the engine with the Worker).
+    """
+    try:
+        fd = os.open(os.path.join(run_dir, WORKER_LOCK), os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return False  # held: the Worker is alive
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            return True
+        import fcntl
+
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return False  # held: the Worker is alive
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(fd)
+
+
 def _runs_as_activity(name: str) -> bool:
     """Whether a tool call pauses the segment.
 
@@ -149,7 +189,9 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
     run_dir = os.environ.get("TCA_HOOK_DIR")
     marker = os.path.join(run_dir, "paused_call") if run_dir else None
     allow_id = os.environ.get("TCA_ALLOW_ID")
-    stopped = run_dir is not None and os.path.exists(os.path.join(run_dir, "stop"))
+    stopped = run_dir is not None and (
+        os.path.exists(os.path.join(run_dir, "stop")) or _worker_gone(run_dir)
+    )
     output: dict[str, Any]
     if run_dir is not None and not os.path.isdir(run_dir):
         output = _deny(STOPPED)  # the run ended, or this hook cannot see its folder
