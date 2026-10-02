@@ -10,6 +10,7 @@ again, a call can wait for approval, and Temporal records each call.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from pathlib import Path
 from typing import Any
@@ -383,7 +384,180 @@ async def test_real_engine_tool_step_never_reaches_the_workers_model_provider(
         api.stop()
     assert outcome.content == "local" and not outcome.is_error
     assert len(api.requests) == before  # no model call left the Worker
+    assert runner._stand_in.requests >= 1  # type: ignore[reportPrivateUsage]
     assert effects.read_text().split() == ["ran"]
+
+
+def tool_results(entries: list[dict[str, Any]]) -> list[str]:
+    """What Claude reads as tool results in transcript entries."""
+    found: list[str] = []
+    for entry in entries:
+        content = (entry.get("message") or {}).get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                found.append(json.dumps(block.get("content")))
+    return found
+
+
+async def test_real_engine_read_only_commands_run_together_still_pause(
+    tmp_path: Path,
+) -> None:
+    """Claude Code runs the read-only calls of one message together, as one batch, and
+    the hooks guide says defer is ignored when Claude makes several calls at once. The
+    engines tested still pause at one of them (Claude Code 2.1.286 not always at the
+    first) and deny the other, so neither runs inside the segment. The paused one
+    runs in its tool step, and Claude gets its output and the other's denial."""
+    from temporalio.claude_agent_sdk import SegmentInput, ToolSpec, ToolStepInput
+    from tests.helpers.fake_messages_api import FakeMessagesAPI, history_of
+
+    ref: list[FakeMessagesAPI] = []
+    seen: dict[str, str] = {}
+
+    def decide(body: dict[str, Any]) -> list[dict[str, Any]]:
+        _, _, history = history_of(body)
+        if not history:
+            return [
+                ref[0].call("Bash", {"command": "ls"}),
+                ref[0].call("Bash", {"command": "cat notes.txt"}),
+            ]
+        seen.update({h.input["command"]: str(h.content) for h in history})
+        return [{"type": "text", "text": "FINAL"}]
+
+    api = FakeMessagesAPI(decide).start()
+    ref.append(api)
+    runner = make_runner(tmp_path, api)
+    (tmp_path / "work" / "notes.txt").write_text("written before the segment")
+    tools = [ToolSpec("count", "Count one step.", {"type": "object"})]
+    first = SegmentInput(
+        session_id=str(uuid.uuid4()),
+        prompt="Look around.",
+        tools=tools,
+        builtin_tools=["Bash"],
+        transcript=[],
+        tool_activities=["Bash"],
+    )
+    try:
+        out = await runner.run(first, 1)
+        assert not out.is_error, out.error
+        paused = out.deferred
+        assert paused is not None and paused.kind == "engine" and out.siblings == []
+        inside = " ".join(tool_results(out.transcript_add))
+        assert "notes.txt" not in inside  # ls did not run in the segment
+        assert "written before" not in inside  # nor did cat
+        assert out.checkpoint is not None
+        outcome = await runner.run_tool_step(
+            ToolStepInput(
+                session_id=out.session_id,
+                checkpoint=out.checkpoint,
+                call=paused,
+                tools=tools,
+                builtin_tools=["Bash"],
+                transcript=out.transcript_add,
+            ),
+            1,
+        )
+        final = await runner.run(
+            SegmentInput(
+                session_id=out.session_id,
+                prompt=None,
+                tools=tools,
+                builtin_tools=["Bash"],
+                checkpoint=out.checkpoint,
+                injected={paused.id: outcome},
+                transcript=out.transcript_add,
+                tool_activities=["Bash"],
+                segment_index=1,
+            ),
+            1,
+        )
+    finally:
+        api.stop()
+    assert final.result == "FINAL" and api.errors == []
+    ran = paused.input["command"]
+    other = "cat notes.txt" if ran == "ls" else "ls"
+    expected = "notes.txt" if ran == "ls" else "written before the segment"
+    assert expected in seen[ran]  # the paused call's own output
+    assert "did not run" in seen[other]  # the other kept its denial
+
+
+async def test_real_engine_an_edit_cannot_run_apart_from_its_segment(
+    tmp_path: Path,
+) -> None:
+    """Why file tools stay in the segment (tool_activities refuses them). Run an Edit
+    in a tool step anyway, by driving the runner directly: the edit happens, but when
+    the next segment delivers its result, Claude Code checks the call again, finds the
+    file changed since Claude read it, and tells Claude the edit failed. If a newer
+    engine delivers the result, file tools could run as their own Activities."""
+    from temporalio.claude_agent_sdk import SegmentInput, ToolSpec, ToolStepInput
+    from tests.helpers.fake_messages_api import FakeMessagesAPI, history_of
+
+    notes = tmp_path / "work" / "notes.txt"
+    ref: list[FakeMessagesAPI] = []
+    seen: dict[str, str] = {}
+
+    def decide(body: dict[str, Any]) -> list[dict[str, Any]]:
+        _, _, history = history_of(body)
+        if not history:
+            return [ref[0].call("Read", {"file_path": str(notes)})]
+        if len(history) == 1:
+            edit = {"file_path": str(notes), "old_string": "hello", "new_string": "bye"}
+            return [ref[0].call("Edit", edit)]
+        seen.update({h.id: str(h.content) for h in history})
+        return [{"type": "text", "text": "FINAL"}]
+
+    api = FakeMessagesAPI(decide).start()
+    ref.append(api)
+    runner = make_runner(tmp_path, api)
+    notes.write_text("hello\n")
+    tools = [ToolSpec("count", "Count one step.", {"type": "object"})]
+    try:
+        out = await runner.run(
+            SegmentInput(
+                session_id=str(uuid.uuid4()),
+                prompt="Edit the notes.",
+                tools=tools,
+                builtin_tools=["Read", "Edit"],
+                transcript=[],
+                tool_activities=["Edit"],
+            ),
+            1,
+        )
+        call = out.deferred
+        assert call is not None and call.name == "Edit" and out.checkpoint, out
+        transcript = out.transcript_add
+        outcome = await runner.run_tool_step(
+            ToolStepInput(
+                session_id=out.session_id,
+                checkpoint=out.checkpoint,
+                call=call,
+                tools=tools,
+                builtin_tools=["Read", "Edit"],
+                transcript=transcript,
+            ),
+            1,
+        )
+        assert not outcome.is_error and notes.read_text() == "bye\n"  # it ran
+        final = await runner.run(
+            SegmentInput(
+                session_id=out.session_id,
+                prompt=None,
+                tools=tools,
+                builtin_tools=["Read", "Edit"],
+                checkpoint=out.checkpoint,
+                injected={call.id: outcome},
+                transcript=transcript,
+                tool_activities=["Edit"],
+                segment_index=1,
+            ),
+            1,
+        )
+    finally:
+        api.stop()
+    assert final.result == "FINAL"
+    assert "modified since read" in seen[call.id], (
+        f"Claude Code delivered the result of an Edit run apart ({seen[call.id]!r}): "
+        "file tools may now be able to run as their own Activities."
+    )
 
 
 async def test_real_engine_a_subagent_is_told_to_leave_durable_tools_to_the_main_agent(
@@ -450,9 +624,7 @@ async def test_real_engine_a_subagent_is_told_to_leave_durable_tools_to_the_main
     finally:
         api.stop()
     assert second.result == "FINAL"
-    assert (
-        seen_by_subagent and "only be called by the main agent" in seen_by_subagent[0]
-    )
+    assert seen_by_subagent and "only the main agent can call it" in seen_by_subagent[0]
     assert api.errors == [] and runner.stub_calls == 0
 
 
@@ -489,14 +661,40 @@ def test_hook_defers_the_tools_that_run_as_activities(
     assert (hook_env / "paused_call").read_text() == "t1"
 
 
-def test_hook_lets_subagents_run_engine_tools_but_not_durable_ones(
+def test_hook_leaves_tools_that_run_as_activities_to_the_main_agent(
     hook_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A subagent cannot pause the run, so its calls to such tools are denied: they
+    would run inside the segment, without their approvals."""
     monkeypatch.setenv("TCA_TOOL_ACTIVITIES", "Bash")
-    assert _decision("Bash", agent_id="sub-1") == "run"  # a subagent cannot pause
-    assert _decision("mcp__durable__count", agent_id="sub-1") == "deny"
+    assert _decision("Bash", "s1", agent_id="sub-1") == "deny"
+    assert _decision("mcp__durable__count", "s2", agent_id="sub-1") == "deny"
+    assert _decision("Glob", "s3", agent_id="sub-1") == "run"  # others as usual
     assert not (hook_env / "paused_call").exists()
     assert _decision("mcp__durable__count") == "defer"  # the main agent can
+    denied = {p.name: p.read_text() for p in (hook_env / "denied").iterdir()}
+    assert denied == {"s1": "main_agent_only", "s2": "main_agent_only"}
+
+
+def test_hook_records_its_denials(
+    hook_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner reads these records, not the tool output, which a tool controls."""
+    from temporalio.claude_agent_sdk import _defer_hook
+
+    monkeypatch.setenv("TCA_TOOL_ACTIVITIES", "Bash")
+    assert _decision("Bash", "t1") == "defer"
+    assert _decision("Bash", "t2") == "deny"
+    assert _decision("Bash", "toolu id/../x") == "deny"  # an unusual id: hashed
+    (hook_env / "stop").touch()
+    assert _decision("Glob", "t3") == "deny"
+    denied = {p.name: p.read_text() for p in (hook_env / "denied").iterdir()}
+    assert denied == {
+        "t2": "not_run",
+        _defer_hook.denial_name("toolu id/../x"): "not_run",
+        "t3": "stopped",
+    }
+    assert len(_defer_hook.denial_name("toolu id/../x")) == 64
 
 
 def test_hook_never_lets_an_answered_call_run_again(

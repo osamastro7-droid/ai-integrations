@@ -11,17 +11,24 @@ Tool steps: with ``$TCA_ALLOW_ID`` set, the engine resumed a session that paused
 Claude Code tool call, to run exactly that call; the hook allows it and denies
 anything else.
 
-Subagents (``agent_id`` in the event) cannot pause the run. A durable tool call from
-a subagent is denied with a hint to leave it to the main agent; Claude Code tools run
-in the subagent as usual.
+Subagents (``agent_id`` in the event) cannot pause the run. A subagent's call to a
+tool that runs as an Activity (a durable tool, or a Claude Code tool in
+``$TCA_TOOL_ACTIVITIES``) is denied with a hint to leave it to the main agent, so such
+calls always run as Activities, with their approvals. Other tools run in the subagent
+as usual.
 
-Parallel calls: the engine keeps only one paused call per run. So the first new
-durable call in a run is deferred, and any other call after it in the same run,
-durable or built-in, is denied. The Workflow runs the denied durable calls with the
-paused one, and the next segment puts their real results in place of the denials. A
-denied built-in call keeps the message, so Claude calls it again. (A built-in call
-allowed to run after the pause would have its result cut from the session, and
-Claude would run it again.)
+Parallel calls: the engine keeps only one paused call per run. So the first new call
+in a run that runs as an Activity is deferred, and any other call after it in the
+same run is denied. (Read-only calls that the engine runs together, as one batch,
+reach the hook at the same time: whichever claims ``paused_call`` first is deferred.) The Workflow runs the denied durable calls with the paused one,
+and the next segment puts their real results in place of the denials. A denied
+Claude Code call keeps the denial, so Claude calls it again. (A call allowed to run
+after the pause would have its result cut from the session, and Claude would run it
+again.)
+
+Every denial is also written to ``$TCA_HOOK_DIR/denied/<tool_use_id>`` (the reason's
+key), so the runner knows which calls the hook denied without reading tool output,
+which a tool controls.
 
 Stopped runs: when the segment Activity is cancelled or times out, the runner writes
 ``$TCA_HOOK_DIR/stop``, so an engine that is still shutting down cannot start another
@@ -34,8 +41,10 @@ that way.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
+import re
 import sys
 from typing import Any
 
@@ -49,10 +58,10 @@ STOPPED = "This step was stopped (cancelled or timed out). Do not call tools."
 """The reason Claude sees when the segment is no longer running (the runner looks for it)."""
 
 MAIN_AGENT_ONLY = (
-    "This tool can only be called by the main agent, not from a subagent. Finish "
-    "and report back; the main agent can call it."
+    "This tool runs as its own Temporal Activity, so only the main agent can call "
+    "it, not a subagent. Finish and report back; the main agent can call it."
 )
-"""The reason a subagent sees when it calls a durable tool."""
+"""The reason a subagent sees when it calls a tool that runs as an Activity."""
 
 STEP_ONLY = "This step runs one tool call only."
 """The reason for any other call in a tool step (the stand-in model makes none)."""
@@ -61,6 +70,23 @@ STEP_ONLY = "This step runs one tool call only."
 DURABLE_PREFIX = "mcp__durable__"
 """Names of durable tools as the engine sees them (the runner's ``PREFIX``)."""
 
+REASON_KEYS = {
+    NOT_RUN: "not_run",
+    STOPPED: "stopped",
+    MAIN_AGENT_ONLY: "main_agent_only",
+    STEP_ONLY: "step_only",
+}
+"""What the hook writes in ``denied/<tool_use_id>`` for each reason."""
+
+_SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def denial_name(tool_use_id: str) -> str:
+    """The file name of a call's denial record (the id, or its SHA-256 if unusual)."""
+    if _SAFE_ID.fullmatch(tool_use_id):
+        return tool_use_id
+    return hashlib.sha256(tool_use_id.encode("utf-8")).hexdigest()
+
 
 def _deny(reason: str = NOT_RUN) -> dict[str, Any]:
     return {
@@ -68,6 +94,22 @@ def _deny(reason: str = NOT_RUN) -> dict[str, Any]:
         "permissionDecision": "deny",
         "permissionDecisionReason": reason,
     }
+
+
+def _record(run_dir: str | None, tool_use_id: str, output: dict[str, Any]) -> None:
+    """Write the denial record of a call the hook denies (when the folder exists)."""
+    reason = REASON_KEYS.get(str(output.get("permissionDecisionReason")))
+    if output.get("permissionDecision") != "deny" or run_dir is None or reason is None:
+        return
+    try:
+        folder = os.path.join(run_dir, "denied")
+        os.makedirs(folder, exist_ok=True)
+        with open(
+            os.path.join(folder, denial_name(tool_use_id)), "w", encoding="utf-8"
+        ) as handle:
+            handle.write(reason)
+    except OSError:
+        pass  # the folder is gone: the runner treats the step as stopped
 
 
 def _runs_as_activity(name: str) -> bool:
@@ -115,7 +157,7 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
         # On resume the engine re-announces the call whose result was just delivered.
         # It must never run, whatever the tool (the settings may have changed since).
         output = {"hookEventName": "PreToolUse", "permissionDecision": "defer"}
-    elif event.get("agent_id") and name.startswith(DURABLE_PREFIX):
+    elif event.get("agent_id") and _runs_as_activity(name):
         output = _deny(MAIN_AGENT_ONLY)  # a subagent cannot pause the run
     elif event.get("agent_id") or not _runs_as_activity(name):
         # A tool that runs in the engine runs normally, unless the step was stopped
@@ -140,6 +182,8 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
                 with open(marker, encoding="utf-8") as handle:
                     if handle.read().strip() != tool_use_id:
                         output = _deny()
+    if run_dir is not None and os.path.isdir(run_dir):
+        _record(run_dir, tool_use_id, output)
     log = os.environ.get("TCA_HOOK_LOG")
     if log:  # debugging aid: one line per decision
         with open(log, "a", encoding="utf-8") as handle:

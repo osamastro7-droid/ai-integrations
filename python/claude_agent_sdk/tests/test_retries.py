@@ -418,8 +418,13 @@ async def test_parallel_calls_in_a_resumed_session_keep_every_result(
         out = await s.run(s.input("count to 3"))
         while out.deferred is not None and len(handed) < 12:
             handed += [c.input["n"] for c in [out.deferred, *out.siblings]]
-            attempt = 2 if s.index == retry_at else 1
-            out = await s.run(s.input(injected=results(out)), attempt)
+            inp = s.input(injected=results(out))
+            if s.index == retry_at:  # the first attempt ran, but its result was lost
+                lost = await runner.run(inp, 1)
+                assert lost.deferred is not None and len(lost.siblings) == 1
+                out = await s.run(inp, 2)
+            else:
+                out = await s.run(inp)
     finally:
         api.stop()
     assert out.result == "FINAL 6"

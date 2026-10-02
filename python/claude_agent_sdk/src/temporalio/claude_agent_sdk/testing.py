@@ -38,7 +38,8 @@ class ToolCall:
     """A policy's decision to call a tool.
 
     Attributes:
-        name: The durable tool to call.
+        name: The durable tool to call, or a Claude Code tool in ``tool_activities``
+            (such as ``Bash``), which ``engine_tools`` plays in its tool step.
         input: The call's arguments.
     """
 

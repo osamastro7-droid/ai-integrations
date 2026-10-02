@@ -34,7 +34,8 @@ class ClaudeAgentPlugin(SimplePlugin):
 
         Args:
             runner: Runs each model segment, for example ``ClaudeAgentSdkRunner``.
-            heartbeat_every: Seconds between heartbeats while a segment runs.
+            heartbeat_every: Seconds between heartbeats while a segment or a tool
+                step runs.
         """
         added = [make_segment_activity(runner, heartbeat_every=heartbeat_every)]
         if callable(getattr(runner, "run_tool_step", None)):

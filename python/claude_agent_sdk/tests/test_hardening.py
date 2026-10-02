@@ -124,7 +124,7 @@ def test_extra_options_can_set_a_default_prompt_and_settings(
             session_id="s", prompt="hi", tools=[], system_prompt=agent_prompt
         )
         options = runner._engine_options(  # type: ignore[reportPrivateUsage]
-            inp, {}, "s", False, None, None, str(tmp_path / "hook"), "server"
+            inp, {}, "s", False, None, None, str(tmp_path / "hook"), "server", []
         )
         assert options["setting_sources"] == ["project"]
         assert options["session_store_flush"] == "eager"
@@ -152,7 +152,7 @@ def test_the_permission_mode_is_always_set(
     runner = _runner_in(tmp_path, extra_options=extra)
     inp = SegmentInput(session_id="s", prompt="hi", tools=[])
     options = runner._engine_options(  # type: ignore[reportPrivateUsage]
-        inp, {}, "s", False, None, None, str(tmp_path / "hook"), "server"
+        inp, {}, "s", False, None, None, str(tmp_path / "hook"), "server", []
     )
     assert options["permission_mode"] == expected
 
@@ -180,7 +180,7 @@ def test_extra_options_are_merged_with_the_plugins_own(tmp_path: Path) -> None:
     )
     hook_dir = str(tmp_path / "hook")
     small = runner._engine_options(  # type: ignore[reportPrivateUsage]
-        inp, {}, inp.session_id, False, None, None, hook_dir, "server"
+        inp, {}, inp.session_id, False, None, None, hook_dir, "server", []
     )
     env = small["env"]
     assert (
@@ -196,8 +196,16 @@ def test_extra_options_are_merged_with_the_plugins_own(tmp_path: Path) -> None:
     # A result the engine echoes as one long line still fits.
     big = ToolOutcome("x" * (9 * 1024 * 1024))
     large = runner._engine_options(  # type: ignore[reportPrivateUsage]
-        inp, {"toolu_1": big}, inp.session_id, True, None, None, hook_dir, "server"
+        inp, {"toolu_1": big}, inp.session_id, True, None, None, hook_dir, "server", []
     )
+    # Tools that run as Activities are never pre-approved: the hook answers for them.
+    inp.builtin_tools, inp.tool_activities = ["Bash", "Read"], ["Bash", "mcp__*"]
+    shell = runner._engine_options(  # type: ignore[reportPrivateUsage]
+        inp, {}, inp.session_id, False, None, None, hook_dir, "server", []
+    )
+    assert shell["allowed_tools"] == [PREFIX + "count", "Read"]
+    assert shell["env"]["CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR"] == "1"
+    assert shell["system_prompt"] == _runner.SHELL_HINT
     assert large["max_buffer_size"] >= 8 * 9 * 1024 * 1024
 
 
@@ -283,9 +291,10 @@ def test_the_hook_stops_builtin_tools_once_the_step_stopped(
     (run_dir / "stop").touch()  # the Activity was cancelled or timed out
     assert _decision(BUILTIN_CALL) == "deny"
     assert _decision(DURABLE_CALL) == "defer"  # ends the run; no one will run it
-    (run_dir / "stop").unlink()
-    (run_dir / "paused_call").unlink()
-    run_dir.rmdir()  # the run ended, or the engine cannot see the folder
+    assert [p.name for p in (run_dir / "denied").iterdir()] == [
+        BUILTIN_CALL["tool_use_id"]
+    ]
+    shutil.rmtree(run_dir)  # the run ended, or the engine cannot see the folder
     assert _decision(BUILTIN_CALL) == "deny" and _decision(DURABLE_CALL) == "deny"
 
 

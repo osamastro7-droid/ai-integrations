@@ -3,12 +3,19 @@
 How one segment works:
 
 1. Durable tools are declared to Claude as in-process SDK MCP tools.
-2. A settings-file PreToolUse command hook answers "defer" when Claude calls one.
-   The run stops and the SDK returns ``ResultMessage.deferred_tool_use``. The
-   Workflow runs the tool as a Temporal Activity.
+2. A settings-file PreToolUse command hook answers "defer" when Claude calls one, or a
+   Claude Code tool in ``tool_activities``. The run stops and the SDK returns
+   ``ResultMessage.deferred_tool_use``. The Workflow runs the call as a Temporal
+   Activity: a durable tool's own Activity, or a tool step (``run_tool_step``).
 3. The next segment resumes the session and sends the stored result as a normal
    ``tool_result`` message for that ``tool_use_id``. Claude continues and can pause
-   again. The hook keeps answering "defer" (never "allow") for durable tools.
+   again. In a segment, the hook keeps answering "defer" (never "allow") for these
+   calls.
+
+A tool step resumes a copy of the session that ends where it paused at a Claude Code
+call, and the hook allows exactly that call, so Claude gets Claude Code's own result.
+The engine's model calls after the tool go to a stand-in on 127.0.0.1
+(``_stand_in``), and the command still sees the Worker's own environment.
 
 Checkpoints make retries clean. After a segment, the runner reads the session back
 from the session store and returns where the next segment must continue (the last
@@ -43,16 +50,19 @@ user row follows the paused call (anthropics/claude-code#97358), which is why th
 checkpoint after parallel calls is the deferral marker (see ``_resume_point``).
 
 Parallel calls: the engine keeps one paused call per run, so the hook defers the first
-durable call of a message and denies the calls after it. The segment reports the
-denied durable calls (``siblings``); the Workflow runs them with the paused one, and
-the next segment puts their results where the engine resumes (see ``_deliver``), so
-Claude sees every call of the message with its result.
+call of a message that runs as an Activity and denies the calls after it. The segment
+reports the denied durable calls (``siblings``); the Workflow runs them with the
+paused one, and the next segment puts their results where the engine resumes (see
+``_deliver``), so Claude sees every call of the message with its result. A denied
+Claude Code call keeps its denial, and Claude calls it again.
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
+import fnmatch
 import json
 import os
 import re
@@ -71,6 +81,7 @@ from typing import Any, cast
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    HookMatcher,
     InMemorySessionStore,
     MirrorErrorMessage,
     ResultError,
@@ -90,7 +101,8 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from ._conversation import external_storage_on, read_conversation, too_large
-from ._defer_hook import STEP_ONLY, STOPPED
+from ._defer_hook import NOT_RUN as NOT_RUN_REASON
+from ._defer_hook import REASON_KEYS, STOPPED, denial_name
 from ._events import emit
 from ._models import (
     DeferredCall,
@@ -136,6 +148,9 @@ SDK's default could never reach Claude.
 """
 
 STEP_PROVIDER_ENV = {
+    # Provider settings in settings files (user, project, .claude.json, managed) no
+    # longer apply, so they cannot send a tool step's model calls elsewhere.
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "1",
     "ANTHROPIC_API_KEY": "tool-step-stand-in",
     "ANTHROPIC_AUTH_TOKEN": "",
     "CLAUDE_CODE_OAUTH_TOKEN": "",
@@ -154,9 +169,27 @@ STEP_PROVIDER_ENV = {
 SAVED_OUTPUT_TAIL = 4096
 """Bytes of the end of an output Claude Code saved to a file, added to the preview."""
 
-ENGINE_ENV = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
-"""Set for every engine run. With background tasks (for example a subagent running in
-the background), the engine keeps working after it paused at a durable call."""
+ENGINE_ENV = {
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1",
+}
+"""Set for every engine run.
+
+With background tasks (for example a subagent running in the background), the engine
+keeps working after it paused at a durable call. And every shell command starts in the
+working directory: a ``cd`` would otherwise carry over inside one engine run but not
+to the next one (each segment and tool step is a new run), so a later command could
+run somewhere else than Claude expects.
+"""
+
+SHELL_HINT = (
+    "Each shell command starts in the working directory: a `cd` does not carry over "
+    "to the next command, so use absolute paths or `cd <dir> && <command>`."
+)
+"""Added to the system prompt when Bash or PowerShell is on: Claude Code's own tool
+description says the working directory persists, which is not so here."""
+
+_SHELL_TOOLS = ("Bash", "PowerShell")
 
 DEFAULT_PERMISSION_MODE = "default"
 """Permission mode unless ``extra_options`` sets one.
@@ -238,6 +271,11 @@ def _check_extra_options(extra: dict[str, Any]) -> None:
         for flag in sorted(flags)
         if flag.lstrip("-") in _MANAGED_FLAGS
     ]
+    if extra.get("enable_file_checkpointing"):
+        problems.append(
+            "enable_file_checkpointing (Claude Code cannot combine it with the session "
+            "store every engine run uses)"
+        )
     servers = extra.get("mcp_servers") or {}
     if not isinstance(servers, dict):
         problems.append("mcp_servers (pass a dict of servers; they are merged)")
@@ -427,10 +465,14 @@ def _marker_of(entry: Any) -> str | None:
     return None
 
 
-def _siblings(entries: list[Any], paused_call: str) -> list[DeferredCall]:
+def _siblings(
+    entries: list[Any], paused_call: str, denials: dict[str, str]
+) -> list[DeferredCall]:
     """The other durable calls of the paused message, denied after the pause.
 
-    Their denials come after the paused call's deferral marker.
+    Their denials come after the paused call's deferral marker, and the hook recorded
+    each one as "not run" (``denials``): a call denied for any other reason, or by
+    anything else, is never run.
     """
     marker = None
     for index, entry in enumerate(entries):
@@ -438,7 +480,13 @@ def _siblings(entries: list[Any], paused_call: str) -> list[DeferredCall]:
             marker = index
     if marker is None:
         return []
-    denied = {tid for entry in entries[marker + 1 :] for tid in _result_ids(entry)}
+    not_run = REASON_KEYS[NOT_RUN_REASON]
+    denied = {
+        tid
+        for entry in entries[marker + 1 :]
+        for tid in _result_ids(entry)
+        if denials.get(denial_name(tid)) == not_run
+    }
     calls: list[DeferredCall] = []
     for entry in entries[:marker]:
         if not isinstance(entry, dict) or entry.get("type") != "assistant":
@@ -669,20 +717,112 @@ async def _stop_hooks_when_cancelled(hook_dir: str) -> None:
         pass  # the folder is already gone, and the hook denies without it
 
 
+def _hook_denials(hook_dir: str) -> dict[str, str]:
+    """The calls the hook denied in this run: record name (``denial_name``) to reason key."""
+    try:
+        return {
+            path.name: path.read_text(encoding="utf-8").strip()
+            for path in Path(hook_dir, "denied").iterdir()
+        }
+    except OSError:
+        return {}
+
+
+def _says_only(content: Any, reason: str) -> bool:
+    """Whether a tool result is the hook's denial ``reason`` and nothing else.
+
+    Claude Code records the reason as it is (2.1.273), or after
+    ``PreToolUse:<tool> hook error: `` (2.1.287).
+    """
+    text = _text(content).strip() if content is not None else ""
+    if text == reason:
+        return True
+    head, sep, rest = text.partition(" hook error: ")
+    return bool(sep) and head.startswith("PreToolUse:") and rest == reason
+
+
 def _hook_said_stopped(message: UserMessage) -> bool:
-    """Whether a tool result in ``message`` is the hook's "step stopped" denial."""
+    """Whether a tool result in ``message`` is the hook's "step stopped" denial.
+
+    The hook writes no record when it cannot see its folder, so this matches the
+    denial itself: an error that is exactly the reason, never a tool's output that
+    merely contains it.
+    """
     if isinstance(message.content, str):
         return False
-    for block in message.content:
-        if isinstance(block, ToolResultBlock):
-            text = (
-                block.content
-                if isinstance(block.content, str)
-                else json.dumps(block.content, default=str)
-            )
-            if STOPPED in text:
-                return True
-    return False
+    return any(
+        isinstance(block, ToolResultBlock)
+        and bool(block.is_error)
+        and _says_only(block.content, STOPPED)
+        for block in message.content
+    )
+
+
+def _runs_as_activity(name: str, patterns: list[str]) -> bool:
+    """Whether a Claude Code tool runs as an Activity: it matches ``tool_activities``.
+
+    ``name`` can also be a permission rule, such as ``Bash(npm *)``.
+    """
+    tool = name.split("(", 1)[0].strip()
+    return any(fnmatch.fnmatchcase(tool, p) for p in patterns if p)
+
+
+def _decision_of(output: Any) -> str | None:
+    """The decision a PreToolUse hook's output makes, or None if it makes none."""
+    if not isinstance(output, dict):
+        return None
+    specific = output.get("hookSpecificOutput")
+    if isinstance(specific, dict) and specific.get("permissionDecision"):
+        return str(specific["permissionDecision"])
+    if output.get("decision") in ("block", "approve"):
+        return str(output["decision"])
+    if output.get("continue") is False:
+        return "stop"
+    return None
+
+
+def _guard_hooks(hooks: Any, decides_alone: Any, violations: list[str]) -> Any:
+    """Wrap ``extra_options["hooks"]`` so they cannot decide on calls the plugin decides.
+
+    A ``PreToolUse`` callback that returns a decision for a tool that runs as an
+    Activity (a durable tool, or one of ``tool_activities``) would override the
+    plugin's pause or approval: its decision is dropped, recorded in ``violations``,
+    and the step then fails (see ``_hook_violation``).
+    """
+    if not isinstance(hooks, dict) or not hooks.get("PreToolUse"):
+        return hooks
+
+    def wrap(callback: Any) -> Any:
+        async def guarded(input_data: Any, tool_use_id: Any, context: Any) -> Any:
+            output = await callback(input_data, tool_use_id, context)
+            name = str((input_data or {}).get("tool_name") or "")
+            decision = _decision_of(output)
+            if decision is not None and decides_alone(name):
+                violations.append(f"{decision} on {name}")
+                return {}
+            return output
+
+        return guarded
+
+    matchers = [
+        dataclasses.replace(m, hooks=[wrap(cb) for cb in m.hooks])
+        if isinstance(m, HookMatcher)
+        else m
+        for m in hooks["PreToolUse"]
+    ]
+    return {**hooks, "PreToolUse": matchers}
+
+
+def _hook_violation(violations: list[str]) -> str | None:
+    if not violations:
+        return None
+    return (
+        "A PreToolUse hook in extra_options decided on a call that runs as its own "
+        f"Activity ({', '.join(sorted(set(violations)))}). The Workflow decides on "
+        "those calls (needs_approval, tool_approvals), so make the hook return no "
+        "decision for durable tools and the tools in tool_activities. This step "
+        "stopped before any such call ran."
+    )
 
 
 def _as_outcome(value: Any) -> ToolOutcome:
@@ -763,9 +903,8 @@ class ClaudeAgentSdkRunner:
             session_store: None (the default) keeps each conversation in its
                 Workflow: nothing to set up, and any Worker can run any step. Or a
                 Claude Agent SDK ``SessionStore`` that every Worker can reach, to
-                keep conversations there instead (``FileSessionStore`` works for one
-                machine or a shared disk). Every Worker of a task queue needs the
-                same choice.
+                keep conversations there instead (``FileSessionStore`` is for tests
+                and one machine). Every Worker of a task queue needs the same choice.
             cwd: Working directory of the engine. Sessions are keyed by it, so give
                 every Worker the same one.
             env: Extra environment variables for the engine. The engine also
@@ -1072,6 +1211,9 @@ class ClaudeAgentSdkRunner:
                 "session_id": session_id,
             }
             await store.append(key, seed)  # type: ignore[arg-type]
+        # A copy that is already there is not this run's (Claude Code then refuses the
+        # session id), so it stays.
+        ours = not resume and not any(p.exists() for p in self._local_copy(session_id))
         try:
             return await self._run_engine(
                 inp,
@@ -1083,7 +1225,7 @@ class ClaudeAgentSdkRunner:
                 delivered=delivered,
             )
         finally:
-            if not resume:
+            if ours:
                 self._forget_local_copy(session_id)
 
     async def run_tool_step(self, step: ToolStepInput, attempt: int) -> ToolOutcome:
@@ -1095,6 +1237,10 @@ class ClaudeAgentSdkRunner:
         stand-in answers, so no real model call is made. Tested on Claude Code
         2.1.273 and 2.1.287: the tool runs once, with the engine's own result.
 
+        The command still sees the Worker's own environment (see ``_step_env``), and
+        a result the step already has is kept even if the engine fails afterwards,
+        so the Activity is not retried for a call that ran.
+
         Args:
             step: The call, and where its session paused.
             attempt: The Activity attempt number.
@@ -1103,9 +1249,11 @@ class ClaudeAgentSdkRunner:
             What the tool returned, as Claude Code would show it to Claude.
 
         Raises:
-            ApplicationError: If the session did not pause at this call, or the
-                engine did not run it (not retried: Claude sees the error).
-            RuntimeError: If the Workflow did not serve its conversation (retried).
+            ApplicationError: If the session did not pause at this call, the engine
+                did not run it, or a hook in ``extra_options`` tried to decide on it
+                (not retried: Claude sees the error).
+            RuntimeError: If the Workflow did not serve its conversation, or the
+                conversation is kept where this runner does not keep it (retried).
         """
         del attempt
         call = step.call
@@ -1113,6 +1261,21 @@ class ClaudeAgentSdkRunner:
             "project_key": project_key_for_directory(self._cwd),
             "session_id": step.session_id,
         }
+        held = step.transcript is not None or (
+            step.conversation is not None and step.conversation.entries > 0
+        )
+        if self._store is None and not held:
+            raise RuntimeError(
+                f"Session {step.session_id} is kept in a session store this runner "
+                "does not have. Every Worker of a task queue needs the same choice: "
+                "give this runner the session store. Retrying."
+            )
+        if self._store is not None and held:
+            raise RuntimeError(
+                f"Session {step.session_id} is kept in its Workflow, but this Worker's "
+                "runner has a session store. Every Worker of a task queue needs the "
+                "same choice: create this runner without session_store. Retrying."
+            )
         if self._store is None:
             entries = await read_conversation(step)
         else:
@@ -1134,6 +1297,7 @@ class ClaudeAgentSdkRunner:
             builtin_tools=step.builtin_tools,
             checkpoint=step.checkpoint,
         )
+        violations: list[str] = []
         options = self._engine_options(
             inp,
             {},
@@ -1143,23 +1307,13 @@ class ClaudeAgentSdkRunner:
             None,
             hook_dir,
             self._durable_server(step.tools, []),
+            violations,
         )
-        env = options["env"]
-        no_proxy = ",".join(
-            p
-            for p in (env.get("NO_PROXY") or os.environ.get("NO_PROXY"), "127.0.0.1")
-            if p
-        )
-        options["env"] = {
-            **env,
-            **STEP_PROVIDER_ENV,
-            "ANTHROPIC_BASE_URL": self._stand_in.base_url,
-            "NO_PROXY": no_proxy,
-            "no_proxy": no_proxy,
-            "TCA_ALLOW_ID": call.id,
-        }
+        options["env"] = self._step_env(options["env"], hook_dir, call.id)
         result: ToolResultBlock | None = None
         saved: str | None = None
+        failure: Exception | None = None
+        denials: dict[str, str] = {}
         stopper = (
             asyncio.ensure_future(_stop_hooks_when_cancelled(hook_dir))
             if activity.in_activity()
@@ -1184,16 +1338,38 @@ class ClaudeAgentSdkRunner:
                         saved = _saved_output_tail(
                             block.content, key["project_key"], step.session_id
                         )
+        except Exception as err:
+            if result is None:
+                raise
+            # The call ran; the engine failed afterwards (for example the model call
+            # that follows the tool). Running the step again would run it again.
+            failure = err
         finally:
             if stopper is not None:
                 stopper.cancel()
+            denials = _hook_denials(hook_dir)
             shutil.rmtree(hook_dir, ignore_errors=True)
+        violation = _hook_violation(violations)
+        if violation is not None:
+            raise ApplicationError(violation, non_retryable=True)
         text = _text(result.content) if result is not None else ""
-        if result is None or STOPPED in text or STEP_ONLY in text:
+        if (
+            result is None
+            or denial_name(call.id) in denials
+            or (bool(result.is_error) and _says_only(result.content, STOPPED))
+        ):
             raise ApplicationError(
                 f"Claude Code did not run tool call {call.id} ({call.name}) in its "
                 f"step: {text or 'no result'}",
                 non_retryable=True,
+            )
+        if failure is not None and activity.in_activity():
+            activity.logger.warning(
+                "Tool call %s (%s) ran; the engine failed after it (%s). Its result "
+                "is kept.",
+                call.id,
+                call.name,
+                failure,
             )
         is_error = bool(result.is_error)
         if isinstance(result.content, list):
@@ -1204,6 +1380,60 @@ class ClaudeAgentSdkRunner:
                 f"call ended. The output ends with:\n{saved}"
             )
         return ToolOutcome(content=text, is_error=is_error)
+
+    def _step_env(
+        self, env: dict[str, str], hook_dir: str, call_id: str
+    ) -> dict[str, str]:
+        """The engine's environment in a tool step, and the command's.
+
+        The engine talks to the local stand-in model (``STEP_PROVIDER_ENV``,
+        ``ANTHROPIC_BASE_URL``). Claude Code runs ``CLAUDE_ENV_FILE`` before each Bash
+        command, in the command's shell: that file puts back what the Worker had (the
+        values travel in ``TCA_KEEP_*`` variables, never in the file), so a command
+        that calls the Anthropic API reaches the Worker's provider as it would in a
+        segment. A ``CLAUDE_ENV_FILE`` of your own runs first.
+        """
+        before = {**os.environ, **env}
+        hosts: list[str] = []
+        for name in ("NO_PROXY", "no_proxy"):
+            for host in (before.get(name) or "").split(","):
+                if host.strip() and host.strip() not in hosts:
+                    hosts.append(host.strip())
+        if "127.0.0.1" not in hosts:
+            hosts.append("127.0.0.1")
+        overrides = {
+            **STEP_PROVIDER_ENV,
+            "ANTHROPIC_BASE_URL": self._stand_in.base_url,
+            "NO_PROXY": ",".join(hosts),
+            "no_proxy": ",".join(hosts),
+            "CLAUDE_ENV_FILE": str(Path(hook_dir, "command_env.sh")),
+        }
+        keep: dict[str, str] = {}
+        lines = [
+            "# temporalio.claude_agent_sdk: this tool step's engine talks to a local",
+            "# stand-in model. Give the command the Worker's own environment back.",
+            'if [ -n "${TCA_USER_ENV_FILE:-}" ] && [ -f "$TCA_USER_ENV_FILE" ]; then',
+            '  . "$TCA_USER_ENV_FILE"',
+            "fi",
+        ]
+        for name in overrides:
+            if before.get(name) is None:
+                lines.append(f"unset {name}")
+            else:
+                keep[f"TCA_KEEP_{name}"] = before[name]
+                lines.append(f'export {name}="$TCA_KEEP_{name}"')
+        lines.append(f"unset TCA_ALLOW_ID TCA_USER_ENV_FILE {' '.join(keep)}")
+        Path(hook_dir, "command_env.sh").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+        user_file = before.get("CLAUDE_ENV_FILE")
+        return {
+            **env,
+            **overrides,
+            **keep,
+            **({"TCA_USER_ENV_FILE": user_file} if user_file else {}),
+            "TCA_ALLOW_ID": call_id,
+        }
 
     def _durable_server(self, tools: list[ToolSpec], ran_inside: list[str]) -> Any:
         """The durable tools as SDK MCP tools.
@@ -1229,18 +1459,15 @@ class ClaudeAgentSdkRunner:
 
         return create_sdk_mcp_server(SERVER, tools=[make_stub(t) for t in tools])
 
-    def _forget_local_copy(self, session_id: str) -> None:
-        """Remove the engine's own copy of a new session from its config folder.
+    def _local_copy(self, session_id: str) -> tuple[Path, ...]:
+        """Where Claude Code writes a new session in its config folder.
 
-        Claude Code writes a new session's transcript (and tool outputs too large to
-        show Claude in full) under ``<config folder>/projects``; resumed sessions run
-        in a temporary folder the SDK removes. With the conversation in the Workflow,
-        that copy is never read again, so it does not stay on the Worker's disk.
+        Nothing for an id this runner would never start.
         """
         try:
             uuid.UUID(session_id)  # only ever a session this runner started
         except ValueError:
-            return
+            return ()
         env = {**self._env, **(self._extra.get("env") or {})}
         config = env.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_CONFIG_DIR")
         base = Path(config) if config else Path.home() / ".claude"
@@ -1249,11 +1476,26 @@ class ClaudeAgentSdkRunner:
             / "projects"
             / project_key_for_directory(self._cwd)
         )
+        return folder / f"{session_id}.jsonl", folder / session_id
+
+    def _forget_local_copy(self, session_id: str) -> None:
+        """Remove the engine's own copy of a new session from its config folder.
+
+        Claude Code writes a new session's transcript (and tool outputs too large to
+        show Claude in full) under ``<config folder>/projects``; resumed sessions run
+        in a temporary folder the SDK removes. With the conversation in the Workflow,
+        that copy is never read again, so it does not stay on the Worker's disk. Only
+        a copy this run created is removed (see ``_run_held``).
+        """
+        paths = self._local_copy(session_id)
+        if not paths:
+            return
+        transcript, folder = paths
         try:
-            (folder / f"{session_id}.jsonl").unlink(missing_ok=True)
+            transcript.unlink(missing_ok=True)
         except OSError:
             pass  # best effort, for example a file still open on Windows
-        shutil.rmtree(folder / session_id, ignore_errors=True)
+        shutil.rmtree(folder, ignore_errors=True)
 
     async def _run_engine(
         self,
@@ -1286,6 +1528,7 @@ class ClaudeAgentSdkRunner:
         """
         # Durable tools the engine ran itself (must stay empty).
         ran_inside: list[str] = []
+        violations: list[str] = []  # decisions hooks in extra_options tried to make
         hook_dir = _hook_folder()
         options = self._engine_options(
             inp,
@@ -1296,6 +1539,7 @@ class ClaudeAgentSdkRunner:
             guard,
             hook_dir,
             self._durable_server(inp.tools, ran_inside),
+            violations,
         )
         prompt: Any
         in_message = {k: v for k, v in injected.items() if k not in (delivered or ())}
@@ -1312,6 +1556,7 @@ class ClaudeAgentSdkRunner:
         last_assistant: str | None = None
         store_error: str | None = None
         stopped_by_hook = False
+        denials: dict[str, str] = {}
         # When the Activity is cancelled or times out, deny every later tool call
         # while the SDK shuts the engine down.
         stopper = (
@@ -1343,6 +1588,7 @@ class ClaudeAgentSdkRunner:
             marker = Path(hook_dir) / "paused_call"  # written when the hook defers
             if marker.exists():
                 paused_by_hook = marker.read_text(encoding="utf-8").strip() or None
+            denials = _hook_denials(hook_dir)
         except ResultError as err:
             final = err.subtype in FINAL_RESULT_ERRORS or _final_api_error(err)
             if not final:
@@ -1358,7 +1604,10 @@ class ClaudeAgentSdkRunner:
                 stopper.cancel()
             shutil.rmtree(hook_dir, ignore_errors=True)  # the hook denies from now on
 
-        if stopped_by_hook:
+        violation = _hook_violation(violations)
+        if violation is not None:
+            return SegmentOutput(session_id=session_id, is_error=True, error=violation)
+        if stopped_by_hook or REASON_KEYS[STOPPED] in denials.values():
             # Not cancelled, yet the hook denied a call as stopped: it could not see
             # this step's folder. Fail closed rather than commit what Claude said
             # without the tool.
@@ -1432,7 +1681,7 @@ class ClaudeAgentSdkRunner:
                 ),
                 checkpoint=checkpoint,
                 cost_usd=cost,
-                siblings=_siblings(entries, deferred.id),
+                siblings=_siblings(entries, deferred.id, denials),
             )
         else:
             out = SegmentOutput(
@@ -1464,11 +1713,23 @@ class ClaudeAgentSdkRunner:
         guard: str | None,
         hook_dir: str,
         durable_server: Any,
+        violations: list[str],
     ) -> dict[str, Any]:
         """The ``ClaudeAgentOptions`` fields of one engine run, ``extra_options`` merged in."""
         extra = dict(self._extra)
         default_prompt = extra.pop("system_prompt", None)
-        hint = ONE_TOOL_HINT if self._one_tool else None
+        hints = [
+            *([ONE_TOOL_HINT] if self._one_tool else []),
+            *([SHELL_HINT] if set(_SHELL_TOOLS) & set(inp.builtin_tools) else []),
+        ]
+        hint = "\n\n".join(hints) or None
+        activities = list(inp.tool_activities)
+
+        def decides_alone(name: str) -> bool:  # the plugin decides on these calls
+            return name.startswith(PREFIX) or _runs_as_activity(name, activities)
+
+        if "hooks" in extra:
+            extra["hooks"] = _guard_hooks(extra["hooks"], decides_alone, violations)
         system_prompt: Any
         if inp.system_prompt is None and isinstance(default_prompt, dict):
             preset = cast("dict[str, Any]", default_prompt)  # e.g. Claude Code's own
@@ -1493,12 +1754,22 @@ class ClaudeAgentSdkRunner:
             },
             "strict_mcp_config": True,
             "setting_sources": [],
+            # Tools that run as Activities are not pre-approved: the hook defers or
+            # allows them call by call, so if it ever gives no answer (it failed, or
+            # an engine ignores defer), Claude Code refuses a command that changes
+            # something instead of running it inside the segment.
             "allowed_tools": list(
                 dict.fromkeys(
                     [
                         *durable_names,
-                        *inp.builtin_tools,
-                        *(extra.pop("allowed_tools", None) or []),
+                        *(
+                            t
+                            for t in [
+                                *inp.builtin_tools,
+                                *(extra.pop("allowed_tools", None) or []),
+                            ]
+                            if not _runs_as_activity(t, activities)
+                        ),
                     ]
                 )
             ),

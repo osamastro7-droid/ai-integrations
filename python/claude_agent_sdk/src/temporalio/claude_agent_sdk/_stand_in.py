@@ -24,9 +24,9 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         del format, args
 
-    def _send(self, payload: dict[str, Any]) -> None:
+    def _send(self, payload: dict[str, Any], status: int = 200) -> None:
         data = json.dumps(payload).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data)))
         self.end_headers()
@@ -36,8 +36,14 @@ class _Handler(BaseHTTPRequestHandler):
         self._send({})
 
     def do_POST(self) -> None:
-        length = int(self.headers.get("content-length", 0))
-        body = json.loads(self.rfile.read(length) or b"{}")
+        try:
+            length = int(self.headers.get("content-length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("not an object")
+        except ValueError:
+            error = {"type": "invalid_request_error", "message": "not a JSON object"}
+            return self._send({"type": "error", "error": error}, status=400)
         if "count_tokens" in self.path:
             return self._send({"input_tokens": 1})
         if not self.path.startswith("/v1/messages"):
@@ -88,13 +94,19 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class StandInModel:
-    """A Messages API on 127.0.0.1 that answers every request with a short text."""
+    """A Messages API on 127.0.0.1 that answers every request with a short text.
+
+    One per runner: it starts with the first tool step and serves until the Worker
+    process ends.
+    """
 
     def __init__(self) -> None:
         """Create it; it starts on first use."""
         self._server: ThreadingHTTPServer | None = None
         self._lock = threading.Lock()
+        self._count_lock = threading.Lock()
         self.requests = 0
+        """POST requests answered (the engine's model calls in tool steps)."""
 
     @property
     def base_url(self) -> str:
@@ -105,7 +117,8 @@ class StandInModel:
 
                 class Counting(_Handler):
                     def do_POST(self) -> None:
-                        stand_in.requests += 1
+                        with stand_in._count_lock:  # handlers run in threads
+                            stand_in.requests += 1
                         super().do_POST()
 
                 self._server = ThreadingHTTPServer(("127.0.0.1", 0), Counting)
