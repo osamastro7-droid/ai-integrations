@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from typing import Any
 
@@ -71,3 +72,34 @@ class ParallelWorkflow:
     def tool_calls(self) -> list[dict[str, Any]]:
         """Every tool call of this run, with its status."""
         return self.agent.tool_calls
+
+
+@workflow.defn
+class SurviveCancelWorkflow:
+    """The first task is cancelled while the calls of one message are out; the
+    Workflow goes on with a second task."""
+
+    def __init__(self) -> None:
+        self.agent = DurableClaudeAgent(
+            tools=[
+                activity_as_tool(count, **TOOL),
+                activity_as_tool(publish, needs_approval=True, **TOOL),
+            ],
+            segment_retry_policy=FAST,
+        )
+
+    @workflow.run
+    async def run(self, first: str, second: str) -> list[str]:
+        """Run both tasks; report how the first one ended."""
+        answers: list[str] = []
+        try:
+            answers.append(await self.agent.run(first))
+        except asyncio.CancelledError:
+            answers.append("first task cancelled")
+        answers.append(await self.agent.run(second))
+        return answers
+
+    @workflow.query
+    def pending_approvals(self) -> list[dict[str, Any]]:
+        """Calls waiting for a decision."""
+        return self.agent.pending_approvals()

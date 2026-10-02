@@ -63,7 +63,8 @@ class ConversationRef:
     """Where a segment finds the conversation the Workflow holds.
 
     The segment Activity reads it with a Query on its own Workflow, so the
-    conversation adds nothing to the history of each step.
+    conversation is not copied into each step's input: the history records only what
+    each step adds.
 
     Attributes:
         query: Name of the Workflow Query that returns the conversation, a page at a
@@ -194,7 +195,7 @@ class AgentState:
     """What a new Workflow run needs to continue an agent after Continue-As-New.
 
     By default the conversation lives in the Workflow, so it moves to the new run here
-    (``transcript``). With a session store, it stays in the store, and this stays
+    (``conversation``). With a session store, it stays in the store, and this stays
     small. Type the Workflow parameter that carries it as ``AgentState | None``.
 
     Attributes:
@@ -207,13 +208,17 @@ class AgentState:
         recent_call_ids: The most recent tool calls that already ran, so none can run
             again in a later run.
         segments: Segments run by this agent across all runs.
-        tool_calls: Durable tool calls run by this agent across all runs.
+        tool_calls: Tool calls the Workflow handled for this agent across all runs
+            (durable tools and Claude Code tools in ``tool_activities``).
         total_cost_usd: Model cost reported by the SDK across all runs.
         runs: Workflow runs this agent has used, counting the current one.
         fork_next: The last task stopped early, so the next segment continues in a
             copy of the session that ends at ``checkpoint``.
         stream: The live output stream's state, when live output is on.
-        transcript: The conversation, when the Workflow holds it (no session store).
+        conversation: The conversation, when the Workflow holds it (no session
+            store): each transcript entry as JSON text. The Workflow never reads
+            inside an entry, and text moves to the next run much faster than nested
+            objects.
         external_storage: Whether the Workers reported External Storage, so a large
             conversation can move to the next run.
     """
@@ -231,5 +236,5 @@ class AgentState:
     runs: int = 1
     fork_next: bool = False
     stream: WorkflowStreamState | None = None
-    transcript: list[dict[str, Any]] = field(default_factory=list)
+    conversation: list[str] = field(default_factory=list)
     external_storage: bool = False

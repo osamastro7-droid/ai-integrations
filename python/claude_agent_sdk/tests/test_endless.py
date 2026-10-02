@@ -23,16 +23,23 @@ from temporalio.claude_agent_sdk import (
     SegmentRunner,
     _workflow,
 )
+from temporalio.claude_agent_sdk._conversation import entry_text
 from temporalio.claude_agent_sdk.testing import ScriptedClaude
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError
+from temporalio.service import RPCError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 from tests.conftest import LIMIT
 from tests.endless.activities import ALL
 from tests.endless.policy import count_policy
-from tests.endless.workflows import ChatWorkflow, LongTaskWorkflow, TaskOptions
+from tests.endless.workflows import (
+    AutoChatWorkflow,
+    ChatWorkflow,
+    LongTaskWorkflow,
+    TaskOptions,
+)
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
 from tests.refund import shop
 
@@ -56,7 +63,7 @@ async def run_lengths(client: Client, workflow_id: str) -> list[int]:
 async def replay_every_run(client: Client, workflow_id: str) -> None:
     """Replay each run's history: decisions taken from the history replay the same way."""
     replayer = Replayer(
-        workflows=[LongTaskWorkflow],
+        workflows=[LongTaskWorkflow, ChatWorkflow, AutoChatWorkflow],
         plugins=[ClaudeAgentPlugin(ScriptedClaude(count_policy))],
     )
     async for execution in client.list_workflows(f'WorkflowId = "{workflow_id}"'):
@@ -80,7 +87,7 @@ def scripted_worker(
     return Worker(
         client,
         task_queue=queue,
-        workflows=[LongTaskWorkflow, ChatWorkflow],
+        workflows=[LongTaskWorkflow, ChatWorkflow, AutoChatWorkflow],
         activities=ALL,
         plugins=[plugin],
     )
@@ -166,6 +173,61 @@ async def test_an_agent_that_cannot_continue_as_new_stops_before_the_limit(
 
 
 @pytest.mark.usefixtures("shop_dir")
+async def test_a_chat_that_cannot_continue_as_new_stops_before_the_limit(
+    limited: WorkflowEnvironment, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Turns without tool calls: the agent checks before every step, not only after
+    tool calls, so a chat is not terminated by the server either."""
+    monkeypatch.setattr(_workflow, "PAYLOAD_LIMIT_BYTES", 2000)
+    monkeypatch.setattr(_workflow, "_HISTORY_EVENTS", LIMIT)
+    monkeypatch.setattr(_workflow, "_ROOM_EVENTS", 50)
+    client, queue = limited.client, f"fullchat-{uuid.uuid4().hex[:8]}"
+    async with scripted_worker(client, queue, tmp_path):
+        handle = await client.start_workflow(
+            ChatWorkflow.run, 200, id=queue, task_queue=queue
+        )
+        for _ in range(200):
+            try:
+                await handle.signal(ChatWorkflow.send, "count to 0")
+            except RPCError:  # the run already closed
+                break
+        with pytest.raises(WorkflowFailureError) as err:
+            await asyncio.wait_for(handle.result(), 200)
+        lengths = await run_lengths(client, queue)
+    cause = err.value.cause
+    assert isinstance(cause, ApplicationError), cause
+    assert "close to Temporal's limits" in cause.message
+    assert max(lengths) < LIMIT, lengths
+
+
+@pytest.mark.usefixtures("shop_dir")
+async def test_an_agent_that_cannot_continue_as_new_stops_before_the_size_limit(
+    client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same, for the history's size (here 150 KB stands in for 50 MB)."""
+    monkeypatch.setattr(_workflow, "PAYLOAD_LIMIT_BYTES", 2000)
+    monkeypatch.setattr(_workflow, "_HISTORY_BYTES", 150 * 1024)
+    monkeypatch.setattr(_workflow, "_ROOM_BYTES", 10 * 1024)
+    queue = f"fullsize-{uuid.uuid4().hex[:8]}"
+    async with scripted_worker(client, queue, tmp_path):
+        handle = await client.start_workflow(
+            LongTaskWorkflow.run,
+            args=["count to 500", TaskOptions(after_events=30), None],
+            id=queue,
+            task_queue=queue,
+        )
+        with pytest.raises(WorkflowFailureError) as err:
+            await asyncio.wait_for(handle.result(), 200)
+        description = await handle.describe()
+    cause = err.value.cause
+    assert isinstance(cause, ApplicationError), cause
+    assert "close to Temporal's limits" in cause.message and "MB)" in cause.message
+    size = description.raw_description.workflow_execution_info.history_size_bytes
+    assert size < 150 * 1024, size
+    assert 0 < len(counted()) < 500
+
+
+@pytest.mark.usefixtures("shop_dir")
 async def test_an_agent_continues_as_new_when_its_run_is_nearly_full(
     limited: WorkflowEnvironment, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -240,6 +302,38 @@ async def test_a_chat_keeps_one_session_across_continue_as_new(
     assert progress["runs"] > 1
 
 
+@pytest.mark.usefixtures("shop_dir")
+@pytest.mark.parametrize("mode", ["held", "store"])
+async def test_a_chat_hands_over_at_the_start_of_a_message(
+    client: Client, tmp_path: Path, mode: str
+) -> None:
+    """Messages without tool calls, and no check between them in the Workflow: the
+    agent continues as new before a message's first step, and the new run sends that
+    message to Claude, once."""
+    seen: list[str] = []
+
+    def answer(prompt: str, history: list[Any]) -> Any:
+        seen.append(prompt)
+        return count_policy(prompt, history)
+
+    folder = tmp_path / "fake" if mode == "store" else None
+    queue = f"autochat-{uuid.uuid4().hex[:8]}"
+    messages = [f"message {n}" for n in range(1, 9)]
+    runner = ScriptedClaude(answer, folder)
+    async with scripted_worker(client, queue, tmp_path, runner=runner):
+        handle = await client.start_workflow(
+            AutoChatWorkflow.run, 8, id=queue, task_queue=queue
+        )
+        for text in messages:
+            await handle.signal(AutoChatWorkflow.send, text)
+        replies = await asyncio.wait_for(handle.result(), 100)
+        progress = await handle.query(AutoChatWorkflow.progress)
+        await replay_every_run(client, queue)
+    assert replies == ["counted to 0"] * 8
+    assert seen == messages  # each message reached Claude once, in order
+    assert progress["runs"] > 1  # with no tool calls, only at the start of a message
+
+
 async def test_agent_state_survives_the_data_converter() -> None:
     from temporalio.claude_agent_sdk import ToolOutcome
 
@@ -251,7 +345,9 @@ async def test_agent_state_survives_the_data_converter() -> None:
         recent_call_ids=["toolu_1"],
         tool_calls=1,
         runs=2,
-        transcript=[{"uuid": "u1", "type": "user", "message": {"content": "مرحبا"}}],
+        conversation=[
+            entry_text({"uuid": "u1", "type": "user", "message": {"content": "مرحبا"}})
+        ],
         external_storage=True,
     )
     converter = DataConverter.default

@@ -71,7 +71,7 @@ class HandOverWorkflow:
     async def run(self, prompt: str | None, state: AgentState | None = None) -> str:
         """Run the task and hand the conversation over, or report what arrived."""
         if state is not None:
-            return f"continued with {len(state.transcript)} entries"
+            return f"continued with {len(state.conversation)} entries"
         answer = await self.agent.run(prompt)
         try:
             await self.agent.continue_as_new()

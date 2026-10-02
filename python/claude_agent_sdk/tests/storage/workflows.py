@@ -69,3 +69,39 @@ class FetchWorkflow:
     async def run(self, prompt: str) -> str:
         """Run the request."""
         return await self.agent.run(prompt)
+
+
+def parallel_fetch_policy(
+    prompt: str, history: list[HistoryItem]
+) -> list[ToolCall] | Final:
+    """'fetch N KB K at once': K fetches in one message, then what arrived."""
+    match = re.search(r"fetch (\d+) KB (\d+) at once", prompt)
+    kb, k = (int(match.group(1)), int(match.group(2))) if match else (1, 1)
+    done = [h for h in history if h.name == "fetch_document"]
+    if not done:
+        return [ToolCall("fetch_document", {"kb": kb}) for _ in range(k)]
+    notes = sum(1 for h in done if h.is_error and "too large" in str(h.content))
+    return Final(f"got {len(done) - notes} documents and {notes} notes")
+
+
+@workflow.defn
+class ParallelFetchWorkflow:
+    """Fetches several large documents in one message."""
+
+    def __init__(self) -> None:
+        self.agent = DurableClaudeAgent(
+            tools=[
+                activity_as_tool(
+                    fetch_document,
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=RetryPolicy(maximum_attempts=2),
+                )
+            ],
+            segment_timeout=timedelta(minutes=2),
+            segment_retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        """Run the request."""
+        return await self.agent.run(prompt)

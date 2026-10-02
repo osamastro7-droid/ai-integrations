@@ -26,7 +26,7 @@ from temporalio.converter import ExternalStorage
 
 from ._models import SegmentInput, SegmentOutput, ToolStepInput
 
-QUERY = "__temporal_claude_agent_transcript"
+QUERY = "__claude_agent_conversation"
 """The Workflow Query that returns the conversation, a page at a time.
 
 Arguments: the agent's key, the first entry, how many entries the asking step was
@@ -34,11 +34,12 @@ scheduled with (the Query refuses a step that is out of date), and the most byte
 entries in the page. It returns the entries.
 """
 
-PAGE_BYTES = 1024 * 1024
-"""Most bytes of entries in one page (Temporal checks a Query result against 2 MiB)."""
-
 PAGE_ROOM = 4 * 1024
-"""Bytes a page leaves under External Storage's threshold for its own encoding."""
+"""Bytes a page leaves under a size limit for its own encoding."""
+
+PAGE_BYTES = 512 * 1024 - PAGE_ROOM
+"""Most bytes of entries in one page: under 512 KiB, where Temporal starts to log a
+warning about a payload's size (on the Worker and on the server)."""
 
 SMALLEST_PAGE = 128 * 1024
 """Fewest bytes a page may hold, so a low threshold does not mean many small Queries."""
@@ -60,21 +61,32 @@ def json_bytes(value: Any) -> int:
     return len(json.dumps(value, separators=(",", ":"), default=str))
 
 
+def entry_text(entry: Any) -> str:
+    """One transcript entry as JSON text, the way the Workflow keeps it.
+
+    Its length is the entry's size in a payload. The Workflow never reads inside an
+    entry, and text moves through Continue-As-New much faster than nested objects:
+    Temporal's converter copies every object of a dataclass field one by one, in the
+    Workflow task, before it writes the JSON.
+    """
+    return json.dumps(entry, separators=(",", ":"), default=str)
+
+
 def entry_bytes(entry: Any) -> int:
     """Size of one transcript entry in a payload, in bytes."""
-    return json_bytes(entry)
+    return len(entry_text(entry))
 
 
 def page(
-    entries: list[dict[str, Any]],
+    entries: list[Any],
     sizes: list[int],
     start: int,
     limit: int = PAGE_BYTES,
-) -> list[dict[str, Any]]:
+) -> list[Any]:
     """The entries from ``start`` that fit in ``limit`` bytes (always at least one).
 
     Args:
-        entries: The whole conversation.
+        entries: The whole conversation (entries, or their JSON texts).
         sizes: The size of each entry (``entry_bytes``).
         start: The first entry to return.
         limit: Most bytes in the page, as JSON (the list's brackets and commas too).

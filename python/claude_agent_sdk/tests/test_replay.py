@@ -1,14 +1,17 @@
 """Golden histories: recorded Workflows must replay the same way.
 
-``python -m tests.record_histories`` recorded them with the scripted runner: a refund
-with approval (with the conversation in the Workflow, and in a store), calls in one
-message, Continue-As-New in a long task and in a chat, a Claude Code tool with
-approval, and a task stopped by ``max_segments``. A change to the Workflow code that
-would break Workflows already running fails here.
+``python -m tests.record_histories`` recorded them with the scripted runner (see its
+``SCENARIOS``): refunds approved, rejected, for an unknown order, and cancelled during
+the tool or while waiting for approval; calls in one message; Continue-As-New in a
+long task, with live output, and in chats over Signals and Updates; approval by
+Signal; a Claude Code tool with approval; and tasks that fail. A change to the
+Workflow code that would break Workflows already running fails here.
 
 The ``first-version-*`` histories were recorded with the plugin as first published
-(commit 766c647: one call at a time, the conversation in a session store), so
-Workflows started with it keep running after an upgrade.
+(commit 766c647: one call at a time, the conversation in a session store). They
+replay with this code, so Workflows started with that version keep their decisions
+after an upgrade (on Workers that keep the session store they started with). New
+decisions since then are behind ``workflow.patched``.
 """
 
 from __future__ import annotations
@@ -32,13 +35,14 @@ def test_every_scenario_has_a_golden_history() -> None:
     names = {name.split("-run-")[0].removesuffix(".json") for name in FILES}
     first = {n for n in names if n.startswith(FIRST_VERSION)}
     assert names - first == set(SCENARIOS)
-    # The first version had no calls in parallel, no Claude Code tools as
-    # Activities, and no conversation in the Workflow.
-    assert {n.removeprefix(FIRST_VERSION) for n in first} == {
-        "refund-approval",
-        "continue-as-new",
-        "chat-continue-as-new",
-        "failed-task",
+    # Every scenario the first version could run (it had no calls in parallel, no
+    # Claude Code tools as Activities, and no conversation in the Workflow).
+    first_version = {n.removeprefix(FIRST_VERSION) for n in first}
+    assert first_version <= set(SCENARIOS)
+    assert set(SCENARIOS) - first_version == {
+        "refund-approval-store",
+        "parallel-approval",
+        "bash-approval",
     }
 
 

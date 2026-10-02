@@ -17,8 +17,11 @@ from typing import Any
 
 import pytest
 
-from temporalio.api.common.v1 import Payload
+from temporalio.api.common.v1 import Payload, WorkflowExecution
+from temporalio.api.enums.v1 import EventType
+from temporalio.api.workflowservice.v1 import ResetWorkflowExecutionRequest
 from temporalio.claude_agent_sdk import (
+    AgentState,
     ClaudeAgentPlugin,
     ClaudeAgentSdkRunner,
     ConversationRef,
@@ -44,7 +47,13 @@ from tests.lifecycle.policy import big_result_policy
 from tests.lifecycle.workflows import BigResultWorkflow
 from tests.refund import shop
 from tests.refund.policy import refund_policy
-from tests.storage.workflows import FetchWorkflow, fetch_document, pages_policy
+from tests.storage.workflows import (
+    FetchWorkflow,
+    ParallelFetchWorkflow,
+    fetch_document,
+    pages_policy,
+    parallel_fetch_policy,
+)
 
 pytestmark = pytest.mark.timeout(240)
 QUERY = _conversation.QUERY
@@ -63,6 +72,7 @@ def worker(client: Client, queue: str, runner: Any) -> Worker:
             HandOverWorkflow,
             BigResultWorkflow,
             FetchWorkflow,
+            ParallelFetchWorkflow,
         ],
         activities=[*COUNTING, fetch_document],
         plugins=[ClaudeAgentPlugin(runner, heartbeat_every=1.0)],
@@ -286,6 +296,102 @@ async def test_each_step_reads_the_conversation_and_records_only_what_it_added(
 
 
 @pytest.mark.usefixtures("shop_dir")
+async def test_a_reset_takes_the_conversation_back_with_the_workflow(
+    client: Client,
+) -> None:
+    """Reset to the Workflow task after the first count: the new run holds the
+    conversation as it was then, and Claude decides again from there."""
+    queue = f"reset-{uuid.uuid4().hex[:8]}"
+    async with worker(client, queue, ScriptedClaude(count_policy)):
+        handle = await client.start_workflow(
+            LongTaskWorkflow.run,
+            args=["count to 3", TaskOptions(continue_as_new=False), None],
+            id=queue,
+            task_queue=queue,
+        )
+        assert await asyncio.wait_for(handle.result(), 60) == "counted to 3"
+        before = await handle.query(QUERY, args=["0", 0, 4, 1 << 19], result_type=PAGE)
+        kinds: dict[int, str] = {}
+        counted_at = reset_to = None
+        async for event in handle.fetch_history_events():
+            if event.HasField("activity_task_scheduled_event_attributes"):
+                attrs = event.activity_task_scheduled_event_attributes
+                kinds[event.event_id] = attrs.activity_type.name
+            done = event.activity_task_completed_event_attributes
+            if (
+                event.HasField("activity_task_completed_event_attributes")
+                and counted_at is None
+                and kinds.get(done.scheduled_event_id) == "count"
+            ):
+                counted_at = event.event_id
+            if (
+                event.HasField("workflow_task_completed_event_attributes")
+                and counted_at is not None
+                and reset_to is None
+            ):
+                reset_to = event.event_id
+        assert reset_to is not None
+        reset = await client.workflow_service.reset_workflow_execution(
+            ResetWorkflowExecutionRequest(
+                namespace=client.namespace,
+                workflow_execution=WorkflowExecution(
+                    workflow_id=queue, run_id=handle.result_run_id or ""
+                ),
+                reason="test",
+                workflow_task_finish_event_id=reset_to,
+                request_id=str(uuid.uuid4()),
+            )
+        )
+        again = client.get_workflow_handle(queue, run_id=reset.run_id)
+        assert await asyncio.wait_for(again.result(), 60) == "counted to 3"
+        after = await again.query(QUERY, args=["0", 0, 4, 1 << 19], result_type=PAGE)
+    assert [e["detail"] for e in shop.executions("count")] == ["1", "2", "3", "2", "3"]
+    assert after[0] == before[0]  # committed before the reset point
+    assert {e["uuid"] for e in after[1:]}.isdisjoint(e["uuid"] for e in before[1:])
+
+
+@pytest.mark.usefixtures("shop_dir")
+async def test_a_long_conversation_moves_on_within_a_workflow_task(
+    client: Client, tmp_path: Path
+) -> None:
+    """30,000 entries of many small objects (7 MB) through Continue-As-New, with
+    External Storage: no Workflow task fails. The Workflow keeps each entry as JSON
+    text; kept as objects, Temporal's converter copied them one by one in the
+    Workflow task (3 seconds here), and Python's deadlock detection failed it."""
+    stored = with_external_storage(client, tmp_path / "blobs")
+    blocks = [{"type": "text", "n": [1, 2, 3]} for _ in range(8)]
+    entries = [
+        {"uuid": f"cp_{i:012x}", "turn": i + 1, "blocks": blocks} for i in range(30_000)
+    ]
+    state = AgentState(
+        session_id="s",
+        checkpoint=f"cp_{len(entries) - 1:012x}",
+        task_prompt="count to 2",
+        conversation=[_conversation.entry_text(e) for e in entries],
+        external_storage=True,
+    )
+    queue = f"long-{uuid.uuid4().hex[:8]}"
+    async with worker(stored, queue, ScriptedClaude(count_policy)):
+        handle = await stored.start_workflow(
+            LongTaskWorkflow.run,
+            args=["count to 2", TaskOptions(after_events=10), state],
+            id=queue,
+            task_queue=queue,
+        )
+        result = await asyncio.wait_for(handle.result(), 180)
+        runs, failed = 0, []
+        async for execution in stored.list_workflows(f'WorkflowId = "{queue}"'):
+            runs += 1
+            run = stored.get_workflow_handle(queue, run_id=execution.run_id)
+            async for event in run.fetch_history_events():
+                if event.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED:
+                    failure = event.workflow_task_failed_event_attributes.failure
+                    failed.append(failure.message)
+    assert result == "counted to 2"
+    assert runs >= 2 and failed == []
+
+
+@pytest.mark.usefixtures("shop_dir")
 async def test_a_conversation_larger_than_one_query_result_reaches_every_step(
     client: Client,
 ) -> None:
@@ -339,6 +445,34 @@ async def test_with_external_storage_a_large_entry_is_stored_once(
             pages.append(value)
     # Three results were read again (by 3, 2 and 1 later steps): one page each.
     assert sorted(len(p) for p in pages) == [1, 1, 1]
+
+
+@pytest.mark.usefixtures("shop_dir")
+@pytest.mark.parametrize("external", [False, True], ids=["inline", "external"])
+async def test_results_too_large_to_deliver_together_become_notes(
+    client: Client, tmp_path: Path, external: bool
+) -> None:
+    """Two 1.1 MB results of one message: each fits a payload, both together do not.
+    The Workflow task that schedules the next step used to fail again and again.
+    Without External Storage, the larger result becomes a note for Claude; with it,
+    both arrive."""
+    if external:
+        client = with_external_storage(client, tmp_path / "blobs")
+    queue = f"together-{uuid.uuid4().hex[:8]}"
+    async with worker(client, queue, ScriptedClaude(parallel_fetch_policy)):
+        answer = await asyncio.wait_for(
+            client.execute_workflow(
+                ParallelFetchWorkflow.run,
+                "fetch 1100 KB 2 at once",
+                id=queue,
+                task_queue=queue,
+            ),
+            120,
+        )
+    assert answer == (
+        "got 2 documents and 0 notes" if external else "got 1 documents and 1 notes"
+    )
+    assert len(shop.executions("fetch_document")) == 2  # both ran, once
 
 
 @pytest.mark.usefixtures("shop_dir")

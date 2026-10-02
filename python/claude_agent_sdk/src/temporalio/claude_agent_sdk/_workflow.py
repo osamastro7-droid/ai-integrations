@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import inspect
+import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
 
-from ._conversation import PAGE_BYTES, PAYLOAD_LIMIT_BYTES, QUERY, entry_bytes, page
+from ._conversation import PAGE_BYTES, PAYLOAD_LIMIT_BYTES, QUERY, entry_text, page
 from ._events import TOPIC, cap_event
 from ._models import (
     AgentState,
@@ -40,6 +41,9 @@ _TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,50}")
 """Tool names Claude Code keeps as they are: ``mcp__durable__<name>`` fits in 64 characters."""
 _RECENT_CALLS = 256  # tool calls remembered across runs for the run-once guard
 _HANDOVER_BYTES = 1536 * 1024  # live output's share keeps the new run's input small
+_CHECKS_PATCH = "temporalio-claude-agent-sdk-continue-as-new-checks"
+"""Patch ID of the Continue-As-New checks added after the first published version
+(766c647): Workflows that version started keep their decisions on replay."""
 _HISTORY_EVENTS = 51_200
 _HISTORY_BYTES = 50 * 1024 * 1024
 """Temporal's default limits for one run's history: the server ends a run past them."""
@@ -64,9 +68,10 @@ def _check_tool_activities(patterns: Sequence[str], approvals: Sequence[str]) ->
     """Refuse Claude Code tools that cannot run as their own Activities.
 
     A tool step answers the engine's model calls with a stand-in, and Claude Code
-    re-checks file edits against what it read in its own step (tested: a deferred Edit
-    is refused on resume), so file tools, tools that call the model themselves (such
-    as WebFetch) and subagents stay in the segment.
+    checks a file tool call again when the next segment delivers its result: an Edit
+    run in a tool step happens, but Claude is told it failed, because the file changed
+    since Claude read it (tested). So file tools, tools that call the model themselves
+    (such as WebFetch) and subagents stay in the segment.
     """
     for pattern in patterns:
         if pattern not in _ENGINE_ACTIVITY_TOOLS and not pattern.startswith("mcp__"):
@@ -258,7 +263,7 @@ class DurableClaudeAgent:
 
     Long sessions can continue as new (:meth:`continue_as_new`), carrying an
     :class:`AgentState`; with ``auto_continue_as_new=True`` the agent does it by
-    itself, between tool calls, when the server suggests it.
+    itself, before a step, when the server suggests it.
     """
 
     def __init__(
@@ -303,29 +308,36 @@ class DurableClaudeAgent:
             tool_activities: Claude Code tools that run as their own Activities, like
                 durable tools: ``Bash``, ``PowerShell``, and MCP tools (name patterns
                 such as ``mcp__github__*``). Each call is an Activity
-                ``run_claude_tool_step`` with ID ``tool-<tool_use_id>``. Calls from a
-                subagent run inside the segment.
+                ``run_claude_tool_step`` with ID ``tool-<tool_use_id>``. A subagent
+                cannot call them: its call is denied with a hint to leave it to the
+                main agent.
             tool_approvals: Patterns of ``tool_activities`` whose calls wait for a
-                human decision first, like ``needs_approval`` tools.
+                human decision first, like ``needs_approval`` tools. Each must fall
+                within a ``tool_activities`` pattern.
             tool_activity_timeout: Timeout of each attempt of such a call.
-            tool_activity_retry_policy: Retry policy of such a call (a failing command
-                is a result for Claude, not a failed Activity).
+            tool_activity_retry_policy: Retry policy of such a call. A failing command
+                is a result for Claude, not a failed Activity: the Activity fails only
+                when the step breaks before it has the call's result. By default
+                Temporal retries it without limit, so the command can run again then;
+                ``maximum_attempts=1`` runs it at most once.
             segment_timeout: Timeout of each model segment attempt.
-            segment_heartbeat_timeout: Heartbeat timeout of each segment attempt.
-                It also bounds how late a cancel reaches a running segment: the
-                Worker hears of it with a heartbeat, at most every 0.8 x this.
+            segment_heartbeat_timeout: Heartbeat timeout of each segment attempt, and
+                of each tool step. It also bounds how late a cancel reaches a running
+                step: the Worker hears of it with a heartbeat, at most every 0.8 x
+                this.
             segment_retry_policy: Retry policy of the segment Activity.
             segment_cancellation_type: What cancelling the Workflow does to a running
-                segment. ``WAIT_CANCELLATION_COMPLETED`` waits until the engine
-                stopped, so nothing runs after the Workflow reports cancelled.
+                segment or tool step. ``WAIT_CANCELLATION_COMPLETED`` waits until the
+                engine stopped, so nothing runs after the Workflow reports cancelled.
             max_segments: A task fails after this many segments, counted across
                 Continue-As-New, before it runs another tool. None means no limit.
             approvers: If set, only these names may decide on tool calls. The name is
                 whatever the caller passes; authenticate callers with Temporal
                 (for example API keys and namespace permissions), not with this list.
             state: The state a previous run handed over, or None on first start.
-            auto_continue_as_new: Continue as new by itself, at a safe point between
-                tool calls, when the server suggests it. The Workflow's run method
+            auto_continue_as_new: Continue as new by itself, before a step (between
+                tool calls, or before a task's first step), when the server suggests
+                it. The Workflow's run method
                 must accept the new arguments (see ``continue_as_new_args``), ``run``
                 must be called from that method, and no handler may wait for the
                 task (Continue-As-New waits for every handler to finish). If the
@@ -349,7 +361,9 @@ class DurableClaudeAgent:
 
         Raises:
             ValueError: If two tools share a name, a tool name is not 1 to 50 letters,
-                digits, ``_`` or ``-``, or ``max_segments`` is below 1.
+                digits, ``_`` or ``-``, ``max_segments`` is below 1,
+                ``tool_activities`` names a tool that cannot run as its own Activity,
+                or a ``tool_approvals`` pattern falls outside ``tool_activities``.
             RuntimeError: If ``live_output`` is on and the Workflow is already
                 initialized, or another agent in this Workflow already uses it.
         """
@@ -388,7 +402,7 @@ class DurableClaudeAgent:
         self._running = False
         self._state = state if state is not None else AgentState()
         self._key: str | None = None  # names this agent in the conversation Query
-        self._sizes = [entry_bytes(e) for e in self._state.transcript]
+        self._sizes = [len(t) for t in self._state.conversation]
         self._warned_handover = False
         self._mark: tuple[int, int] | None = None  # history events and bytes then
         self._largest_step = (0, 0)  # most events and bytes one step added
@@ -426,7 +440,11 @@ class DurableClaudeAgent:
 
     @property
     def total_tool_calls(self) -> int:
-        """Durable tool calls run, across all runs."""
+        """Tool calls Claude asked for that the Workflow handled, across all runs.
+
+        Durable tools and Claude Code tools in ``tool_activities``, including calls
+        that were rejected or failed.
+        """
         return self._state.tool_calls
 
     @property
@@ -520,7 +538,7 @@ class DurableClaudeAgent:
             total_cost_usd=s.total_cost_usd,
             runs=s.runs,
             fork_next=s.fork_next,
-            transcript=list(s.transcript),
+            conversation=list(s.conversation),
             external_storage=s.external_storage,
         )
 
@@ -530,13 +548,14 @@ class DurableClaudeAgent:
         A step scheduled with another number of entries is out of date (for example
         an attempt that timed out and still runs): it gets no page.
         """
-        entries = self._state.transcript
-        if total != len(entries):
+        texts = self._state.conversation
+        if total != len(texts):
             raise ValueError(
-                f"The conversation has {len(entries)} entries, but the step that asks "
+                f"The conversation has {len(texts)} entries, but the step that asks "
                 f"was scheduled with {total}."
             )
-        return page(entries, self._sizes, start, min(max(limit, 1), PAGE_BYTES))
+        limit = min(max(limit, 1), PAGE_BYTES)
+        return [json.loads(t) for t in page(texts, self._sizes, start, limit)]
 
     # ---- Continue-As-New ----
     def should_continue_as_new(self) -> bool:
@@ -561,23 +580,31 @@ class DurableClaudeAgent:
         if not due:
             return False
         problem = self._handover_problem()
-        if problem is None:
+        if problem is None or not self._new_checks():
             return True
         if not self._warned_handover:
             self._warned_handover = True
             workflow.logger.warning("%s The agent keeps going in this run.", problem)
         return False
 
-    def _handover_problem(self) -> str | None:
-        """Why the new run's input cannot carry this agent's state, or None if it can."""
+    def _new_checks(self) -> bool:
+        """Whether this run makes the checks added after the first published version.
+
+        Called only where they change a decision, so most histories get no marker.
+        """
+        return workflow.patched(_CHECKS_PATCH)
+
+    def _handover_problem(self, measured: int | None = None) -> str | None:
+        """Why the new run's input cannot carry this agent's state, or None if it can.
+
+        Args:
+            measured: The new run's input size, if the caller just measured it.
+        """
         if self._state.external_storage:
             return None  # large payloads go to the store
         size = sum(self._sizes)  # the conversation alone: at most the state's size
         if size <= PAYLOAD_LIMIT_BYTES:
-            payloads = workflow.payload_converter().to_payloads(
-                self._new_run_args(self.state())
-            )
-            size = sum(p.ByteSize() for p in payloads)
+            size = measured if measured is not None else self._input_bytes(self.state())
             if size <= PAYLOAD_LIMIT_BYTES:
                 return None
         return (
@@ -606,7 +633,7 @@ class DurableClaudeAgent:
         self._refuse_in_handler("continue_as_new()")
         await workflow.wait_condition(lambda: not self._running)
         problem = self._handover_problem()
-        if problem is not None:
+        if problem is not None and self._new_checks():
             raise ApplicationError(problem, non_retryable=True)
         await self._hand_over()
 
@@ -627,19 +654,25 @@ class DurableClaudeAgent:
         await workflow.wait_condition(workflow.all_handlers_finished)
         state = self.state()
         state.runs += 1
+        # Measured once, here: a handler that ran meanwhile may have grown the state.
+        # Before any codec, which can only overstate it.
+        rest = None if state.external_storage else self._input_bytes(state)
+        problem = self._handover_problem(rest)
+        if problem is not None and self._new_checks():
+            raise ApplicationError(problem, non_retryable=True)
         if self._stream is not None:
             budget = self._keep_bytes
-            if not state.external_storage:
+            if rest is not None:
                 # The stream shares the new run's input with everything else in it.
-                # That is measured before any codec, which can only overstate it.
-                payloads = workflow.payload_converter().to_payloads(
-                    self._new_run_args(state)
-                )
-                rest = sum(p.ByteSize() for p in payloads)
                 budget = max(0, min(budget, _HANDOVER_BYTES - rest))
             self._trim_stream(budget)
             state.stream = self._stream.get_state()
         workflow.continue_as_new(args=self._new_run_args(state))
+
+    def _input_bytes(self, state: AgentState) -> int:
+        """Size of the new run's input with ``state``, before any codec."""
+        payloads = workflow.payload_converter().to_payloads(self._new_run_args(state))
+        return sum(p.ByteSize() for p in payloads)
 
     def _new_run_args(self, state: AgentState) -> list[Any]:
         if self._continue_as_new_args is not None:
@@ -720,32 +753,41 @@ class DurableClaudeAgent:
         # Continue-As-New already sent it, unless no segment of it committed.
         send_prompt = state.task_segments == 0
         self._mark = None  # steps are measured within a task, not across idle time
+        first = True
         while True:
+            if self._auto_continue:
+                await self._continue_as_new_or_stop(first_of_task=first)
+            first = False
             index = state.segment_index
+
+            def segment_input(index: int = index) -> SegmentInput:
+                return SegmentInput(
+                    session_id=state.session_id or "",
+                    prompt=state.task_prompt if send_prompt else None,
+                    tools=[t.spec() for t in self._tools.values()],
+                    system_prompt=self._system_prompt,
+                    model=self._model,
+                    max_turns=self._max_turns,
+                    builtin_tools=self._builtin_tools,
+                    tool_activities=self._tool_activities,
+                    checkpoint=state.checkpoint,
+                    injected=dict(state.pending),
+                    segment_index=index,
+                    live_output=self._stream is not None,
+                    fork=state.fork_next,
+                    conversation=ConversationRef(
+                        query=QUERY,
+                        agent=self._key or "",
+                        entries=len(state.conversation),
+                    ),
+                )
+
+            seg_input = await self._fit_results(segment_input)
             state.segment_index = index + 1
             try:
                 seg: SegmentOutput = await workflow.execute_activity(
                     SEGMENT_ACTIVITY_NAME,
-                    SegmentInput(
-                        session_id=state.session_id or "",
-                        prompt=state.task_prompt if send_prompt else None,
-                        tools=[t.spec() for t in self._tools.values()],
-                        system_prompt=self._system_prompt,
-                        model=self._model,
-                        max_turns=self._max_turns,
-                        builtin_tools=self._builtin_tools,
-                        tool_activities=self._tool_activities,
-                        checkpoint=state.checkpoint,
-                        injected=dict(state.pending),
-                        segment_index=index,
-                        live_output=self._stream is not None,
-                        fork=state.fork_next,
-                        conversation=ConversationRef(
-                            query=QUERY,
-                            agent=self._key or "",
-                            entries=len(state.transcript),
-                        ),
-                    ),
+                    seg_input,
                     result_type=SegmentOutput,
                     start_to_close_timeout=self._segment_timeout,
                     heartbeat_timeout=self._segment_heartbeat_timeout,
@@ -781,10 +823,11 @@ class DurableClaudeAgent:
             state.external_storage = seg.external_storage
             if seg.transcript_keep is not None:
                 keep = seg.transcript_keep
-                state.transcript = state.transcript[:keep] + list(seg.transcript_add)
-                self._sizes = self._sizes[:keep] + [
-                    entry_bytes(e) for e in seg.transcript_add
-                ]
+                added = [entry_text(e) for e in seg.transcript_add]
+                del state.conversation[keep:]
+                del self._sizes[keep:]
+                state.conversation.extend(added)
+                self._sizes.extend(len(t) for t in added)
             if seg.deferred is None:
                 state.task_prompt = None
                 state.task_segments = 0
@@ -828,21 +871,88 @@ class DurableClaudeAgent:
                 *(c.id for c in calls),
             ][-_RECENT_CALLS:]
             state.tool_calls += len(calls)
-            if self._auto_continue:
-                await self._continue_as_new_or_stop()
 
-    async def _continue_as_new_or_stop(self) -> None:
-        """Between two steps: continue as new when it is time, or stop in good order.
+    async def _fit_results(self, make: Callable[[], SegmentInput]) -> SegmentInput:
+        """The next segment's input, with tool results it can carry.
+
+        Without External Storage, the results go to the segment in its input, which
+        is one payload (Temporal refuses one over 2 MB by default, and a Workflow task
+        that schedules it fails again and again). When the results of one message do
+        not fit together, the largest are replaced, one by one, by a note for Claude:
+        the call ran, and its result is in the Workflow's history. If the input still
+        does not fit, the task fails.
+
+        Args:
+            make: Builds the input from the agent's state.
+
+        Returns:
+            The input to schedule.
+        """
+        state = self._state
+        inp = make()
+        if state.external_storage or not state.pending:
+            return inp
+        converter = workflow.payload_converter()
+
+        def size(value: Any) -> int:
+            return sum(p.ByteSize() for p in converter.to_payloads([value]))
+
+        total = size(inp)
+        if total <= PAYLOAD_LIMIT_BYTES:
+            return inp
+        sizes = {call_id: size(o) for call_id, o in state.pending.items()}
+        for call_id in sorted(sizes, key=lambda c: (-sizes[c], c)):
+            if total <= PAYLOAD_LIMIT_BYTES:
+                break
+            state.pending[call_id] = ToolOutcome(
+                content=(
+                    f"This tool call ran, but its result ({sizes[call_id] / 1024 / 1024:.1f}"
+                    " MB) was too large to deliver to Claude together with the other "
+                    "results of the same message without External Storage. It is kept "
+                    "in the Workflow's history. Do not call the tool again only to see "
+                    "the result; ask for less data next time."
+                ),
+                is_error=True,
+            )
+            workflow.logger.warning(
+                "The result of tool call %s (%d bytes) was too large to deliver with "
+                "the others of its message without External Storage; Claude gets a "
+                "note instead.",
+                call_id,
+                sizes[call_id],
+            )
+            inp = make()
+            total = size(inp)
+        if total > PAYLOAD_LIMIT_BYTES and self._new_checks():
+            await self._fail(
+                f"The next step's input is {total / 1024 / 1024:.2f} MB, more than one "
+                "payload carries without External Storage (Temporal refuses payloads "
+                "over 2 MB by default). Configure External Storage on the Client (see "
+                "the README)."
+            )
+        return inp
+
+    async def _continue_as_new_or_stop(self, first_of_task: bool) -> None:
+        """Before a segment: continue as new when it is time, or stop in good order.
 
         When the state cannot move to a new run (see :meth:`should_continue_as_new`),
         the agent keeps going in this run until the next step could take the history
         past Temporal's limits; then the task fails with an error that says what to
         change, before the server ends the Workflow.
+
+        Args:
+            first_of_task: This is the task's first segment, where the first
+                published version did not check (only after tool calls).
         """
-        if self.should_continue_as_new():
-            await self._hand_over()
         full = self._history_nearly_full()
-        if full is None:
+        due = self.should_continue_as_new()
+        if not due and full is None:
+            return
+        if first_of_task and not self._new_checks():
+            return
+        if due:
+            await self._hand_over()
+        if full is None or not self._new_checks():
             return
         problem = self._handover_problem()
         if problem is None:
@@ -924,24 +1034,24 @@ class DurableClaudeAgent:
             "without a session store)."
         )
         if seg.transcript_keep is None:
-            if state.transcript:
+            if state.conversation:
                 return (
                     "The segment runner keeps conversations in a session store, but "
                     f"this Workflow holds this one. {same_choice}"
                 )
             return None
-        if state.checkpoint is not None and not state.transcript:
+        if state.checkpoint is not None and not state.conversation:
             return (
                 "The segment runner returned a conversation for the Workflow to hold, "
                 f"but this one is kept in a session store. {same_choice}"
             )
         keep = seg.transcript_keep
         if (
-            not 0 <= keep <= len(state.transcript)
+            not 0 <= keep <= len(state.conversation)
             or keep + len(seg.transcript_add) == 0
         ):
             return (
-                f"The segment runner kept {keep} of {len(state.transcript)} "
+                f"The segment runner kept {keep} of {len(state.conversation)} "
                 f"conversation entries and added {len(seg.transcript_add)}."
             )
         return None
@@ -970,7 +1080,7 @@ class DurableClaudeAgent:
             tools=[t.spec() for t in self._tools.values()],
             builtin_tools=self._builtin_tools,
             conversation=ConversationRef(
-                query=QUERY, agent=self._key or "", entries=len(state.transcript)
+                query=QUERY, agent=self._key or "", entries=len(state.conversation)
             ),
         )
 

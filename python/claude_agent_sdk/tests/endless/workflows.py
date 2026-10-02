@@ -165,3 +165,44 @@ class ChatWorkflow:
     def progress(self) -> dict[str, int]:
         """Totals across runs."""
         return {"runs": self.agent.runs, "tool_calls": self.agent.total_tool_calls}
+
+
+@workflow.defn
+class AutoChatWorkflow:
+    """A chat that leaves Continue-As-New to the agent, which checks before every step,
+    so it can hand over at the start of a message, before Claude sees it."""
+
+    @workflow.init
+    def __init__(self, stop_after: int, state: ChatState | None = None) -> None:
+        self.inbox: list[str] = list(state.inbox) if state else []
+        self.replies: list[str] = list(state.replies) if state else []
+        self.agent = _agent(
+            state.agent if state else None,
+            auto_continue_as_new=True,
+            continue_as_new_after_events=30,
+            continue_as_new_args=lambda s: [
+                stop_after,
+                ChatState(inbox=list(self.inbox), replies=list(self.replies), agent=s),
+            ],
+        )
+
+    @workflow.run
+    async def run(self, stop_after: int, state: ChatState | None = None) -> list[str]:
+        """Answer messages until ``stop_after`` replies were given."""
+        del state
+        if self.agent.busy:  # a message handed over by Continue-As-New
+            self.replies.append(await self.agent.run())
+        while len(self.replies) < stop_after:
+            await workflow.wait_condition(lambda: bool(self.inbox))
+            self.replies.append(await self.agent.run(self.inbox.pop(0)))
+        return self.replies
+
+    @workflow.signal
+    def send(self, text: str) -> None:
+        """A new message from the user."""
+        self.inbox.append(text)
+
+    @workflow.query
+    def progress(self) -> dict[str, int]:
+        """Totals across runs."""
+        return {"runs": self.agent.runs, "tool_calls": self.agent.total_tool_calls}

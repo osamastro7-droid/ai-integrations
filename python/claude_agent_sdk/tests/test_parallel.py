@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from temporalio import activity
 from temporalio.claude_agent_sdk import (
     ClaudeAgentPlugin,
     ClaudeAgentSdkRunner,
@@ -26,25 +27,46 @@ from temporalio.claude_agent_sdk.testing import ScriptedClaude
 from temporalio.client import Client, WorkflowHandle
 from temporalio.worker import Worker
 from tests.endless.activities import ALL as COUNTING
+from tests.endless.activities import publish
 from tests.endless.workflows import LongTaskWorkflow, TaskOptions
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
 from tests.parallel.policy import parallel_policy
-from tests.parallel.workflows import ParallelWorkflow
+from tests.parallel.workflows import ParallelWorkflow, SurviveCancelWorkflow
 from tests.refund import shop
 from tests.test_crash import wait_until
 
 pytestmark = pytest.mark.timeout(240)
 
 
-def worker(client: Client, queue: str, runner: Any) -> Worker:
+def worker(
+    client: Client, queue: str, runner: Any, activities: list[Any] = COUNTING
+) -> Worker:
     """A Worker for the agents these tests use."""
     return Worker(
         client,
         task_queue=queue,
-        workflows=[ParallelWorkflow, LongTaskWorkflow],
-        activities=COUNTING,
+        workflows=[ParallelWorkflow, LongTaskWorkflow, SurviveCancelWorkflow],
+        activities=activities,
         plugins=[ClaudeAgentPlugin(runner, heartbeat_every=1.0)],
     )
+
+
+def count_together(calls: int) -> Any:
+    """A ``count`` tool that returns only once ``calls`` different calls are running at
+    the same time: calls run one after another would wait for each other and fail."""
+    running: set[str] = set()
+    everyone = asyncio.Event()
+
+    @activity.defn(name="count")
+    async def count(args: dict[str, Any]) -> dict[str, Any]:
+        running.add(activity.info().activity_id)  # a retry is the same call
+        if len(running) == calls:
+            everyone.set()
+        await asyncio.wait_for(everyone.wait(), 15)
+        shop.log_execution("count", activity.info().activity_id, str(args.get("n")))
+        return {"n": args.get("n")}
+
+    return count
 
 
 def counted() -> list[str]:
@@ -82,7 +104,8 @@ async def test_calls_in_one_message_run_at_once(
 ) -> None:
     queue = f"par-{uuid.uuid4().hex[:8]}"
     folder = tmp_path / "fake" if mode == "store" else None
-    async with worker(client, queue, ScriptedClaude(parallel_policy, folder)):
+    tools = [count_together(3), publish]
+    async with worker(client, queue, ScriptedClaude(parallel_policy, folder), tools):
         handle = await client.start_workflow(
             ParallelWorkflow.run,
             args=[["parallel 3"], None],
@@ -98,11 +121,46 @@ async def test_calls_in_one_message_run_at_once(
         inputs, order = await history_of_steps(handle)
     assert answers == ["counted 3 at once"]
     assert sorted(counted()) == ["1", "2", "3"]  # each call ran once
-    assert order[:3] == ["start count"] * 3  # all three started before any ended
+    assert order[:3] == ["start count"] * 3  # all three scheduled before any ended
+    # and they ran at the same time: count_together returns only then
     assert len(inputs) == 2  # the calls, then the answer
     assert len(inputs[1]["injected"]) == 3  # every result went back at once
     kinds = [e["type"] for e in events if e["type"] in ("tool_call", "tool_result")]
     assert kinds == ["tool_call"] * 3 + ["tool_result"] * 3
+
+
+@pytest.mark.usefixtures("shop_dir")
+@pytest.mark.parametrize("mode", ["held", "store"])
+async def test_a_stopped_task_delivers_the_results_of_calls_that_finished(
+    client: Client, tmp_path: Path, mode: str
+) -> None:
+    """Cancelled while two counts finished and a publish waits for approval: the
+    next task gives Claude the two real results and "did not run" for the publish."""
+    queue = f"parstop-{uuid.uuid4().hex[:8]}"
+    folder = tmp_path / "fake" if mode == "store" else None
+    async with worker(client, queue, ScriptedClaude(parallel_policy, folder)):
+        handle = await client.start_workflow(
+            SurviveCancelWorkflow.run,
+            args=["parallel 2 and publish", "parallel 2"],
+            id=queue,
+            task_queue=queue,
+        )
+        for _ in range(300):
+            if await handle.query(SurviveCancelWorkflow.pending_approvals):
+                break
+            await asyncio.sleep(0.1)
+        await wait_until(lambda: len(shop.executions("count")) == 2)
+        await asyncio.sleep(0.5)  # their results reach the Workflow
+        await handle.cancel()
+        answers = await asyncio.wait_for(handle.result(), 60)
+        inputs, _ = await history_of_steps(handle)
+    assert answers == ["first task cancelled", "counted 2 at once"]
+    delivered = list(inputs[1]["injected"].values())
+    assert len(delivered) == 3
+    assert sum(1 for v in delivered if not v["is_error"]) == 2  # the counts
+    assert any("did not run" in str(v["content"]) for v in delivered)
+    assert shop.executions("publish") == []
+    assert sorted(counted()) == ["1", "2"]
 
 
 @pytest.mark.usefixtures("shop_dir")
