@@ -57,6 +57,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -692,21 +693,37 @@ def _as_outcome(value: Any) -> ToolOutcome:
     )
 
 
-_SAVED_OUTPUT = re.compile(r"Full output saved to: (.+?)\r?\n")
-"""Where Claude Code names the file it saved a large output to, in its preview."""
+_SAVED_OUTPUT = re.compile(
+    r"<persisted-output>\r?\nOutput too large \([^)\r\n]*\)\. "
+    r"Full output saved to: ([^\r\n]+)\r?\n"
+)
+"""How Claude Code's preview of a large output starts, naming the file with the rest."""
 
 
-def _saved_output_tail(content: Any) -> str | None:
-    """The end of an output Claude Code saved to a file, if it did.
+def _saved_output_tail(content: Any, project_key: str, session_id: str) -> str | None:
+    """The end of an output Claude Code saved to a file in this step, if it did.
 
-    Read it while the engine runs: the file is in the engine's temporary folder.
+    Read it while the engine runs: the file is in the folder of the resumed session,
+    ``<temp>/claude-resume-*/projects/<project_key>/<session_id>/tool-results``, which
+    the SDK removes. Any other path is ignored: the text names it, and a tool's output
+    (a command's, or an MCP tool's from an issue body) can contain such text, so a
+    file anywhere else is never read into the conversation.
     """
-    found = _SAVED_OUTPUT.search(content) if isinstance(content, str) else None
-    path = found.group(1).strip() if found else None
-    if not path:
+    found = _SAVED_OUTPUT.match(content) if isinstance(content, str) else None
+    if found is None:
+        return None
+    path = Path(found.group(1).strip())
+    layout = path.parts[-6:-1]
+    expected = ("projects", project_key, session_id, "tool-results")
+    if len(layout) != 5 or not layout[0].startswith("claude-resume-"):
+        return None
+    if layout[1:] != expected or path.suffix != ".txt":
         return None
     try:
-        with open(path, "rb") as handle:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None  # not a link to a file elsewhere
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as handle:
             handle.seek(0, os.SEEK_END)
             handle.seek(max(0, handle.tell() - SAVED_OUTPUT_TAIL))
             return handle.read().decode("utf-8", errors="replace")
@@ -1164,7 +1181,9 @@ class ClaudeAgentSdkRunner:
                         result = block
                         # The engine's temporary folder still exists: read the end
                         # of an output it saved to a file before the folder goes.
-                        saved = _saved_output_tail(block.content)
+                        saved = _saved_output_tail(
+                            block.content, key["project_key"], step.session_id
+                        )
         finally:
             if stopper is not None:
                 stopper.cancel()
