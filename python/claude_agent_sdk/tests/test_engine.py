@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from claude_agent_sdk import DeferredToolUse, ResultMessage, SystemMessage
+from claude_agent_sdk import (
+    DeferredToolUse,
+    InMemorySessionStore,
+    ResultMessage,
+    SystemMessage,
+)
 
 from temporalio.claude_agent_sdk import (
     ClaudeAgentSdkRunner,
@@ -70,17 +75,21 @@ async def _drive(
     limit: int = 8,
     added: list[int] | None = None,
     builtin: list[str] | None = None,
+    outputs: list[SegmentOutput] | None = None,
 ) -> tuple[list[tuple[str, dict[str, Any]]], SegmentOutput]:
     """Run segments like the Workflow does: pause, run the tool, resume with its result.
 
     Without a session store, it holds the conversation like the Workflow, and records
-    how many entries each segment added in ``added``.
+    how many entries each segment added in ``added``. Every segment's output goes in
+    ``outputs``.
     """
     held = runner._store is None  # type: ignore[reportPrivateUsage]
     transcript: list[dict[str, Any]] = []
 
     def hold(out: SegmentOutput) -> SegmentOutput:
         nonlocal transcript
+        if outputs is not None:
+            outputs.append(out)
         if held and not out.is_error:
             assert out.transcript_keep is not None
             transcript = transcript[: out.transcript_keep] + out.transcript_add
@@ -147,6 +156,117 @@ async def test_engine_pauses_at_every_durable_call_and_resumes(
     )
     assert api.errors == []  # every request followed the real API's tool rules
     assert runner.stub_calls == 0  # the engine never ran a durable tool itself
+
+
+@pytest.mark.parametrize("mode", ["held", "store"])
+async def test_engine_reports_each_steps_own_cost(tmp_path: Path, mode: str) -> None:
+    """Each step reports what it spent, so the Workflow's sum is the task's cost.
+
+    Claude Code 2.1.277 and newer save the session's running total in the transcript
+    (a ``cost-state`` entry) and start a resumed run from it, so a resumed run would
+    report everything spent so far. Here every step makes one model call with the
+    same usage: every step costs the same.
+    """
+    api = start_with_policy(refund_policy)
+    outputs: list[SegmentOutput] = []
+    try:
+        runner = _make_runner(api, tmp_path, mode)
+        await _drive(runner, "Order A-1001 arrived broken.", TOOLS, outputs=outputs)
+    finally:
+        api.stop()
+    costs = [out.cost_usd for out in outputs]
+    assert len(costs) == 4 and costs[0] > 0, costs
+    assert costs == [pytest.approx(costs[0])] * 4, costs
+    for out in outputs:  # the Workflow never holds a saved total
+        assert all(e.get("type") != "cost-state" for e in out.transcript_add)
+    assert api.errors == []
+
+
+async def test_saved_cost_totals_never_reach_the_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A conversation that holds saved totals (as an older version left them, one after
+    each step, from Claude Code 2.1.277 and newer) resumes without them, on any
+    engine version: the seed leaves them out, the step costs what it spent, not 5
+    dollars more, and sends nothing of the conversation again."""
+    firsts: list[list[Any]] = []  # each run's first append (a resumed run: its seed)
+
+    class Recording(InMemorySessionStore):
+        appended = False
+
+        async def append(self, key: Any, entries: Any) -> None:
+            if not self.appended:
+                self.appended = True
+                firsts.append(list(entries))
+            await super().append(key, entries)
+
+    monkeypatch.setattr(_runner, "InMemorySessionStore", Recording)
+    api = start_with_policy(refund_policy)
+    try:
+        runner = _make_runner(api, tmp_path)
+        first = await runner.run(
+            SegmentInput(
+                session_id=str(uuid.uuid4()),
+                prompt="Order A-1001 arrived broken.",
+                tools=TOOLS,
+                transcript=[],
+            ),
+            1,
+        )
+        assert first.deferred is not None and first.transcript_keep == 0
+        saved = {
+            "type": "cost-state",
+            "sessionId": first.session_id,
+            "totalCostUSD": 5.0,
+            "modelUsage": {},
+        }
+        middle = len(first.transcript_add) // 2
+        before = first.transcript_add
+        transcript = [*before[:middle], saved, *before[middle:], saved]
+        second = await runner.run(
+            SegmentInput(
+                session_id=first.session_id,
+                prompt=None,
+                tools=TOOLS,
+                checkpoint=first.checkpoint,
+                injected={
+                    first.deferred.id: _fake_tool(
+                        first.deferred.name, first.deferred.input
+                    )
+                },
+                transcript=transcript,
+            ),
+            1,
+        )
+    finally:
+        api.stop()
+    assert not second.is_error, second.error
+    seed = firsts[1]
+    assert [e.get("uuid") for e in seed] == [
+        e.get("uuid") for e in first.transcript_add
+    ]  # the whole conversation, without the saved total
+    assert second.cost_usd == pytest.approx(first.cost_usd)
+    assert second.transcript_keep == len(transcript)  # the old totals stay, harmless
+    old = {e["uuid"] for e in first.transcript_add if "uuid" in e}
+    new = [e["uuid"] for e in second.transcript_add if "uuid" in e]
+    assert new and not old.intersection(new)  # nothing of the conversation again
+    assert all(e.get("type") != "cost-state" for e in second.transcript_add)
+
+
+async def test_the_store_loads_sessions_without_saved_cost_totals() -> None:
+    """With a session store the engine loads through the plugin's view of it, which
+    drops saved totals; the store itself keeps what the engine wrote."""
+    store = InMemorySessionStore()
+    key = {"project_key": "-work", "session_id": "s1"}
+    entries = [
+        {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "hi"}},
+        {"type": "cost-state", "sessionId": "s1", "totalCostUSD": 1.5},
+    ]
+    await store.append(key, entries)  # type: ignore[arg-type]
+    view = _runner._guarded(store, "s1", None)  # type: ignore[reportPrivateUsage]
+    assert await view.load(key) == entries[:1]
+    assert await store.load(key) == entries  # type: ignore[arg-type]
+    assert _runner._without_cost_state([]) == []  # type: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize("mode", ["held", "store"])

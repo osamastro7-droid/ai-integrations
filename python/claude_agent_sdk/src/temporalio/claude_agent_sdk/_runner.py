@@ -403,6 +403,26 @@ def _is_transcript(entry: Any) -> bool:
     )
 
 
+_COST_STATE = "cost-state"
+
+
+def _is_cost_state(entry: Any) -> bool:
+    """Whether ``entry`` is a saved cost total (see ``_without_cost_state``)."""
+    return isinstance(entry, dict) and entry.get("type") == _COST_STATE
+
+
+def _without_cost_state(entries: list[Any]) -> list[Any]:
+    """The entries without the session's saved cost totals.
+
+    Claude Code 2.1.277 and newer write the session's running cost at the end of a run
+    (a ``cost-state`` entry) and start a resumed run from it, so the run's result
+    reports the session's total instead of what the run spent, and the Workflow would
+    count earlier steps again. Without the entry every engine reports each run's own
+    cost (``max_budget_usd`` stays per run either way, tested on 2.1.287).
+    """
+    return [e for e in entries if not _is_cost_state(e)]
+
+
 def _last_entry(entries: list[Any]) -> str | None:
     """The uuid of the session's last transcript entry: where the engine resumes."""
     for entry in reversed(entries):
@@ -589,14 +609,29 @@ def _seed(committed: list[Any], checkpoint: str) -> list[Any] | None:
     return None
 
 
-def _common_prefix(old: list[Any], new: list[Any]) -> int:
-    """How many entries at the start of ``old`` are unchanged in ``new``."""
-    count = 0
-    for before, after in zip(old, new):
-        if before is not after and before != after:
-            break
-        count += 1
-    return count
+def _kept(committed: list[Any], entries: list[Any]) -> tuple[int, int]:
+    """How much of the committed conversation the session still starts with.
+
+    Saved cost totals do not count: the engine never resumes from one, and those an
+    older version left in the conversation stay where they are (every seed and every
+    store load leaves them out), so the step sends nothing again because of them.
+
+    Returns:
+        The number of committed entries to keep, and the number of the session's
+        entries they cover.
+    """
+    i = j = 0
+    while True:
+        while i < len(committed) and _is_cost_state(committed[i]):
+            i += 1
+        while j < len(entries) and _is_cost_state(entries[j]):
+            j += 1
+        if i == len(committed) or j == len(entries):
+            return i, j
+        if committed[i] is not entries[j] and committed[i] != entries[j]:
+            return i, j
+        i += 1
+        j += 1
 
 
 def _attempt_session_id(session_id: str, attempt: int) -> str:
@@ -624,13 +659,17 @@ def _moved(err: BaseException) -> bool:
 
 
 class _GuardedStore:
-    """Passes the session store to the SDK, and checks the session when it is resumed.
+    """Passes the session store to the SDK, without the saved cost totals.
 
-    Resuming in place is right only while the session still ends at the checkpoint.
-    The check rides on the load the SDK does anyway, so it costs nothing extra.
+    The engine loads every session it resumes through it, so it never starts from the
+    session's running cost (see ``_without_cost_state``); the store itself keeps what
+    the engine wrote. With a checkpoint, it also checks the session when it is
+    resumed in place: that is right only while the session still ends at the
+    checkpoint. The check rides on the load the SDK does anyway, so it costs nothing
+    extra.
     """
 
-    def __init__(self, inner: Any, session_id: str, checkpoint: str) -> None:
+    def __init__(self, inner: Any, session_id: str, checkpoint: str | None) -> None:
         self._inner = inner
         self._session_id = session_id
         self._checkpoint = checkpoint
@@ -642,6 +681,7 @@ class _GuardedStore:
         entries = await self._inner.load(key)
         if (
             entries
+            and self._checkpoint is not None
             and key.get("session_id") == self._session_id
             and not key.get("subpath")
             and _last_entry(entries) != self._checkpoint
@@ -650,11 +690,11 @@ class _GuardedStore:
                 f"Session {self._session_id} continued after checkpoint "
                 f"{self._checkpoint}"
             )
-        return entries
+        return _without_cost_state(entries) if entries else entries
 
 
-def _guarded(inner: Any, session_id: str, checkpoint: str) -> Any:
-    """``inner`` with the resume check, keeping only the optional methods it has."""
+def _guarded(inner: Any, session_id: str, checkpoint: str | None) -> Any:
+    """``inner`` for the SDK, keeping only the optional methods it has."""
     namespace: dict[str, Any] = {}
     for name in _OPTIONAL_STORE_METHODS:
         # The rule the SDK applies: present, and not the protocol's default.
@@ -1197,7 +1237,7 @@ class ClaudeAgentSdkRunner:
                 )
             if moved is not None:
                 delivered = moved[1]
-            session_id, seed, resume = inp.session_id, found, True
+            session_id, seed, resume = inp.session_id, _without_cost_state(found), True
         if resume and len(injected) == len(delivered) and inp.prompt is None:
             return SegmentOutput(
                 session_id=session_id,
@@ -1695,8 +1735,10 @@ class ClaudeAgentSdkRunner:
         if committed is not None:
             # The engine only appends to what it resumed from, which is the committed
             # conversation, cut after the checkpoint when that is the deferral marker.
-            keep = _common_prefix(committed, entries)
-            out.transcript_keep, out.transcript_add = keep, entries[keep:]
+            # Saved cost totals never join the conversation (``_kept``).
+            keep, covered = _kept(committed, entries)
+            out.transcript_keep = keep
+            out.transcript_add = _without_cost_state(entries[covered:])
             problem = too_large(out)
             if problem is not None:
                 return SegmentOutput(
@@ -1775,9 +1817,7 @@ class ClaudeAgentSdkRunner:
                 )
             ),
             "settings": str(Path(hook_dir) / "settings.json"),
-            "session_store": (
-                _guarded(store, session_id, guard) if guard is not None else store
-            ),
+            "session_store": _guarded(store, session_id, guard),
             "cwd": self._cwd,
             "env": {
                 **self._env,
