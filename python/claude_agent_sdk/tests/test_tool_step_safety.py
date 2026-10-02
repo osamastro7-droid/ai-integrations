@@ -453,6 +453,24 @@ async def test_a_session_already_on_disk_is_left_alone(tmp_path: Path) -> None:
     assert transcript.exists() and (folder / "kept.txt").exists()
 
 
+def test_the_command_env_file_is_a_posix_shell_script(tmp_path: Path) -> None:
+    """Claude Code runs it in Git Bash on Windows too, so it has LF line endings
+    there as well, and it holds names only: the values travel in the environment."""
+    (tmp_path / "work").mkdir()
+    runner = ClaudeAgentSdkRunner(
+        cwd=str(tmp_path / "work"), env={"ANTHROPIC_API_KEY": "x"}
+    )
+    env = runner._step_env(  # type: ignore[reportPrivateUsage]
+        {"ANTHROPIC_BASE_URL": "https://example.invalid"}, str(tmp_path), "toolu_1"
+    )
+    script = (tmp_path / "command_env.sh").read_bytes()
+    assert env["CLAUDE_ENV_FILE"] == str(tmp_path / "command_env.sh")
+    assert b"\r" not in script
+    assert b'export ANTHROPIC_BASE_URL="$TCA_KEEP_ANTHROPIC_BASE_URL"' in script
+    assert b"example.invalid" not in script
+    assert env["TCA_KEEP_ANTHROPIC_BASE_URL"] == "https://example.invalid"
+
+
 def test_file_checkpointing_is_refused(tmp_path: Path) -> None:
     (tmp_path / "work").mkdir()
     with pytest.raises(ValueError, match="enable_file_checkpointing"):

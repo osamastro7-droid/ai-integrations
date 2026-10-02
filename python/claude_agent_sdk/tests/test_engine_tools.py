@@ -81,7 +81,7 @@ async def test_real_engine_bash_runs_as_its_own_activity(
             result = await client.execute_workflow(
                 ShellWorkflow.run,
                 args=[
-                    f"run: echo ran >> {effects} && echo hello from bash",
+                    f"run: echo ran >> {posix(effects)} && echo hello from bash",
                     ShellOptions(),
                 ],
                 id=queue,
@@ -238,7 +238,7 @@ def test_the_saved_output_is_read_only_from_claude_codes_own_folder(
     key, sid = "-srv-agent", "4d1c3f0e-0000-4000-8000-000000000001"
     folder = tmp_path / "claude-resume-x1" / "projects" / key / sid / "tool-results"
     folder.mkdir(parents=True)
-    (folder / "out.txt").write_text("x" * 5000 + "THE-END\n")
+    (folder / "out.txt").write_bytes(b"x" * 5000 + b"THE-END\n")  # no \r on Windows
     secret = tmp_path / "secret.txt"
     secret.write_text("TOP-SECRET\n")
     links = []

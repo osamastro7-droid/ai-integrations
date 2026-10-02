@@ -1423,8 +1423,9 @@ class ClaudeAgentSdkRunner:
                 keep[f"TCA_KEEP_{name}"] = before[name]
                 lines.append(f'export {name}="$TCA_KEEP_{name}"')
         lines.append(f"unset TCA_ALLOW_ID TCA_USER_ENV_FILE {' '.join(keep)}")
+        # Git Bash runs it on Windows too: LF line endings on every platform.
         Path(hook_dir, "command_env.sh").write_text(
-            "\n".join(lines) + "\n", encoding="utf-8"
+            "\n".join(lines) + "\n", encoding="utf-8", newline="\n"
         )
         user_file = before.get("CLAUDE_ENV_FILE")
         return {
