@@ -2,13 +2,14 @@
 
 A command or MCP tool that runs as its own Activity must run once, with its approval,
 in the Worker's environment, and talk to no model; nothing a tool prints, a hook in
-``extra_options`` answers, or a settings file sets may change that. Each test here
-failed before the change it guards.
+``extra_options`` answers, or a settings file sets may change that. The tests that
+came with a fix failed before it; the fault tests check paths that already held.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import claude_agent_sdk
 import pytest
 from claude_agent_sdk import HookMatcher
 
@@ -34,6 +36,7 @@ from temporalio.claude_agent_sdk import (
     _stand_in,
 )
 from temporalio.exceptions import ApplicationError
+from temporalio.testing import ActivityEnvironment
 from tests.engine_tools.policy import shell_policy
 from tests.helpers.fake_messages_api import (
     FakeMessagesAPI,
@@ -111,6 +114,102 @@ async def test_a_tool_step_keeps_its_result_when_the_engine_fails_afterwards(
         api.stop()
     assert outcome.content == "local" and not outcome.is_error
     assert lines(effects) == ["ran"]
+
+
+async def test_in_an_activity_a_kept_result_is_logged_with_the_engines_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same, as the tool step Activity: the Worker's log says what happened."""
+    api = start_with_policy(shell_policy)
+    runner = make_runner(tmp_path, api)
+
+    def refuse(handler: Any) -> None:
+        handler.rfile.read(int(handler.headers.get("content-length", 0)))
+        error = {"type": "invalid_request_error", "message": "stand-in refuses"}
+        handler._send({"type": "error", "error": error}, status=400)
+
+    try:
+        out = await pause_at_bash(runner, "echo local")
+        monkeypatch.setattr(_stand_in._Handler, "do_POST", refuse)
+        with caplog.at_level(logging.WARNING):
+            outcome = await ActivityEnvironment().run(
+                runner.run_tool_step, step_for(out), 1
+            )
+    finally:
+        api.stop()
+    assert outcome.content == "local" and not outcome.is_error
+    kept = [
+        r.getMessage() for r in caplog.records if "Its result is kept" in r.getMessage()
+    ]
+    assert len(kept) == 1 and kept[0].startswith(
+        f"Tool call {out.deferred.id} (Bash) ran;"
+    )
+
+
+async def test_a_tool_step_whose_engine_breaks_before_the_result_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Here the command ran, but the engine broke just before the step got its result.
+    The step cannot tell this from a command that never ran, so it fails with the
+    engine's error and Temporal retries it, which runs the command again: the
+    documented at-least-once of this path (``maximum_attempts=1`` runs it at most
+    once). It never makes up a result."""
+    effects = tmp_path / "work" / "effects.log"
+    api = start_with_policy(shell_policy)
+    runner = make_runner(tmp_path, api)
+    real = claude_agent_sdk.query  # the function the runner calls
+
+    async def breaks_before_the_result(*args: Any, **kwargs: Any) -> Any:
+        async for message in real(*args, **kwargs):
+            if isinstance(message, claude_agent_sdk.UserMessage) and any(
+                isinstance(block, claude_agent_sdk.ToolResultBlock)
+                for block in message.content
+            ):
+                raise ConnectionResetError("the engine went away")
+            yield message
+
+    try:
+        out = await pause_at_bash(runner, "echo ran >> effects.log && echo local")
+        monkeypatch.setattr(_runner, "query", breaks_before_the_result)
+        with pytest.raises(ConnectionResetError, match="the engine went away"):
+            await runner.run_tool_step(step_for(out), 1)
+        assert lines(effects) == ["ran"]
+        monkeypatch.setattr(_runner, "query", real)
+        outcome = await runner.run_tool_step(step_for(out), 2)  # Temporal's retry
+    finally:
+        api.stop()
+    assert outcome.content == "local" and not outcome.is_error
+    assert lines(effects) == ["ran", "ran"]
+
+
+async def test_a_tool_step_that_stopped_says_its_call_did_not_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelled or timed out before the call ran: the hook denies it, and the step
+    fails for good (Claude learns the call did not run; it is not run again)."""
+    effects = tmp_path / "work" / "effects.log"
+    api = start_with_policy(shell_policy)
+    runner = make_runner(tmp_path, api)
+    real = _runner._hook_folder
+
+    def stopped() -> str:
+        folder = real()
+        Path(folder, "stop").touch()  # what the runner writes on a cancel or timeout
+        return folder
+
+    try:
+        out = await pause_at_bash(runner, "echo ran >> effects.log")
+        monkeypatch.setattr(_runner, "_hook_folder", stopped)
+        with pytest.raises(ApplicationError) as failed:
+            await runner.run_tool_step(step_for(out), 1)
+    finally:
+        api.stop()
+    assert failed.value.non_retryable
+    assert failed.value.message.startswith(
+        f"Claude Code did not run tool call {out.deferred.id} (Bash) in its step: "
+    )
+    assert _defer_hook.STOPPED in failed.value.message
+    assert lines(effects) == []
 
 
 @pytest.mark.parametrize("where", ["user settings", "global config"])
