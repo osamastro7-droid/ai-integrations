@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import errno
 import gc
 import itertools
@@ -33,10 +34,12 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import unicodedata
 import uuid
 import warnings
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -46,20 +49,25 @@ from claude_agent_sdk import SessionKey
 from temporalio.claude_agent_sdk import (
     ClaudeAgentPlugin,
     ClaudeAgentSdkRunner,
+    DeferredCall,
     DurableClaudeAgent,
     DurableTool,
     FileSessionStore,
     SegmentInput,
     ToolOutcome,
     ToolSpec,
+    ToolStepInput,
     _defer_hook,
     _runner,
     _session_store,
     activity_as_tool,
+    make_segment_activity,
+    make_tool_step_activity,
 )
 from temporalio.claude_agent_sdk.testing import ScriptedClaude
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import CancelledError
+from temporalio.testing import ActivityEnvironment
 from temporalio.worker import Worker
 from tests.endless.activities import count
 from tests.endless.policy import count_policy
@@ -456,6 +464,58 @@ async def test_the_file_store_appends_after_a_half_written_line(
     assert path.read_text(encoding="utf-8").endswith("}\n")  # the half line is gone
 
 
+@pytest.mark.parametrize("before", [[], ["1"], ["1", "2"]])
+async def test_the_file_store_cuts_a_half_line_longer_than_one_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, before: list[str]
+) -> None:
+    """It looks back for the last newline a block at a time (small blocks here),
+    and an empty file or a file that is all one half line are fine too."""
+    monkeypatch.setattr(_session_store, "_BLOCK", 7)
+    store = FileSessionStore(tmp_path)
+    key = _key("project", "session")
+    path = store._path(key)
+    whole = "".join(json.dumps(_entry(uid)) + "\n" for uid in before)
+    path.write_text(whole + '{"type": "user", "uuid": "9", "text": "' + "x" * 50)
+    await store.append(key, [_entry("3")])
+    assert [e.get("uuid") for e in await store.load(key) or []] == [*before, "3"]
+    path.write_text("")
+    await store.append(key, [_entry("4")])
+    assert [e.get("uuid") for e in await store.load(key) or []] == ["4"]
+
+
+async def test_the_file_store_writes_nothing_for_a_batch_it_has(
+    tmp_path: Path,
+) -> None:
+    """Entries are told apart by their uuid; one without a uuid is always new."""
+    store = FileSessionStore(tmp_path)
+    key = _key("project", "session")
+    summary: Any = {"type": "summary"}
+    await store.append(key, [_entry("1"), summary])
+    path = store._path(key)
+    size = path.stat().st_size
+    await store.append(key, [_entry("1")])
+    assert path.stat().st_size == size  # nothing new, nothing written
+    await store.append(key, [summary])
+    loaded = await store.load(key) or []
+    assert [e.get("uuid", e.get("type")) for e in loaded] == ["1", "summary", "summary"]
+    assert await store.load(_key("project", "nobody")) is None
+
+
+async def test_the_file_store_remembers_only_its_newest_transcripts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transcript it forgot is read again from its file: nothing is stored twice."""
+    monkeypatch.setattr(_session_store, "_CACHED_FILES", 2)
+    store = FileSessionStore(tmp_path)
+    for session in ("a", "b", "c"):
+        await store.append(_key("project", session), [_entry(session)])
+    assert [path.name[0] for path in store._seen] == ["b", "c"]
+    await store.append(_key("project", "a"), [_entry("a"), _entry("a2")])
+    loaded = await store.load(_key("project", "a")) or []
+    assert [e.get("uuid") for e in loaded] == ["a", "a2"]
+    assert [path.name[0] for path in store._seen] == ["c", "a"]
+
+
 class _DiskFillsUp:
     """``os`` for the store module, except that a write stops after 10 bytes."""
 
@@ -817,6 +877,57 @@ async def test_heartbeats_follow_the_segments_timeout(
             WriterWorkflow.run, "count to 1", id=queue, task_queue=queue
         )
     assert answer == "counted to 1"
+
+
+@pytest.mark.parametrize(
+    ("timeout", "every", "gap"),
+    [(None, 0.1, 0.1), (0.3, 30.0, 0.1)],
+    ids=["no-heartbeat-timeout", "three-per-timeout"],
+)
+async def test_steps_heartbeat_while_they_run(
+    timeout: float | None, every: float, gap: float
+) -> None:
+    """Every ``heartbeat_every`` seconds, or three times per heartbeat timeout when
+    that is shorter: a segment with its index, a tool step with its call's id. The
+    typical gap is checked (the median), so a slow machine cannot fail it, but twice
+    the gap would."""
+    beats: list[tuple[float, Any]] = []
+    env = ActivityEnvironment()
+    env.on_heartbeat = lambda *details: beats.append((time.monotonic(), details[0]))
+    if timeout is not None:
+        env.info = dataclasses.replace(
+            env.info, heartbeat_timeout=timedelta(seconds=timeout)
+        )
+
+    async def slow(_: dict[str, Any]) -> str:
+        await asyncio.sleep(1.0)
+        return "done"
+
+    def median_gap() -> float:
+        times = [t for t, _ in beats]
+        gaps = sorted(b - a for a, b in itertools.pairwise(times))
+        return gaps[len(gaps) // 2]
+
+    runner = ScriptedClaude(
+        count_policy, think_seconds=1.0, engine_tools={"Bash": slow}
+    )
+    segment = make_segment_activity(runner, heartbeat_every=every)
+    inp = SegmentInput(
+        session_id="s", prompt="count to 1", tools=[], transcript=[], segment_index=4
+    )
+    out = await env.run(segment, inp)
+    assert out.deferred is not None and len(beats) >= 5
+    assert {d for _, d in beats} == {4}
+    assert median_gap() < gap * 1.5
+    beats.clear()
+    step = make_tool_step_activity(runner, heartbeat_every=every)
+    call = DeferredCall(id="toolu_7", name="Bash", input={}, kind="engine")
+    outcome = await env.run(
+        step, ToolStepInput(session_id="s", checkpoint="c", call=call)
+    )
+    assert outcome.content == "done" and len(beats) >= 5
+    assert {d for _, d in beats} == {"toolu_7"}
+    assert median_gap() < gap * 1.5
 
 
 # ---- live output ----

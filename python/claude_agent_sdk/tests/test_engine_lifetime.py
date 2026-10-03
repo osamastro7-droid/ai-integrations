@@ -344,6 +344,47 @@ async def test_supervising_launcher_passes_signals_on(tmp_path: Path) -> None:
             kill(supervisor)
 
 
+EARLY_SIGNAL = """\
+import os, runpy, signal, subprocess, sys
+launcher = runpy.run_path(sys.argv[1])
+start = subprocess.Popen
+def popen(argv):
+    os.kill(os.getpid(), signal.SIGHUP)  # the SDK stops it while it starts
+    return start(argv)
+subprocess.Popen = popen
+sys.exit(launcher["supervise"](sys.argv[2:], None))
+"""
+
+
+@posix_only
+def test_a_signal_before_the_engine_started_reaches_the_engine(
+    tmp_path: Path,
+) -> None:
+    engine, pid_file = fake_engine(tmp_path), tmp_path / "engine.pid"
+    launcher = str(Path(_runner.__file__).with_name("_launcher.py"))
+    ran = subprocess.run(
+        [sys.executable, "-c", EARLY_SIGNAL, launcher, str(engine), str(pid_file)],
+        capture_output=True,
+        timeout=60,
+    )
+    if sys.platform != "win32":
+        assert ran.returncode == 128 + int(signal.SIGHUP), ran.stderr
+
+
+@posix_only
+def test_an_engine_that_cannot_start_is_reported(tmp_path: Path) -> None:
+    launcher = str(Path(_runner.__file__).with_name("_launcher.py"))
+    missing = str(tmp_path / "no-claude-here")
+    ran = subprocess.run(
+        [sys.executable, "-c", SUPERVISE, launcher, missing],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert ran.returncode == 127
+    assert ran.stderr.startswith(f"Claude Code cannot start ({missing}): ")
+
+
 # ---- Windows ----
 
 

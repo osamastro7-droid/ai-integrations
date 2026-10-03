@@ -695,6 +695,45 @@ def test_the_stand_in_reads_no_body_over_its_limit_or_of_a_negative_length() -> 
     assert post_to(stand_in, b"{}", stand_in.key, "two") == 400
 
 
+def ask(
+    stand_in: _stand_in.StandInModel,
+    path: str,
+    body: bytes | None,
+    method: str = "POST",
+) -> tuple[int, Any]:
+    """Send a request with the stand-in's key; its status and JSON answer."""
+    request = urllib.request.Request(
+        f"{stand_in.base_url}{path}",
+        data=body,
+        method=method,
+        headers={"x-api-key": stand_in.key},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+            return int(response.status), json.loads(response.read())
+    except urllib.error.HTTPError as err:
+        return err.code, json.loads(err.read())
+
+
+def test_the_stand_in_answers_each_kind_of_request_shortly() -> None:
+    """A model call gets "ok"; token counting, other paths and GET get small answers;
+    a JSON body that is not an object is refused."""
+    stand_in = _stand_in.StandInModel()
+    status, answer = ask(stand_in, "/v1/messages", b'{"model": "m"}')
+    assert status == 200 and answer["model"] == "m"
+    assert answer["content"] == [{"type": "text", "text": _stand_in.ANSWER}]
+    assert answer["stop_reason"] == "end_turn"
+    assert ask(stand_in, "/v1/messages/count_tokens", b"{}") == (
+        200,
+        {"input_tokens": 1},
+    )
+    assert ask(stand_in, "/v1/other", b"{}") == (200, {})
+    assert ask(stand_in, "/", None, method="GET") == (200, {})
+    status, refused = ask(stand_in, "/v1/messages", b"[1, 2]")
+    assert status == 400 and refused["error"]["message"] == "not a JSON object"
+    assert stand_in.requests == 4  # the POSTs with its key
+
+
 @pytest.mark.parametrize("credential", ["key helper", "login", "token variables"])
 async def test_a_tool_steps_engine_sends_the_stand_ins_key_whatever_the_worker_has(
     tmp_path: Path, credential: str
