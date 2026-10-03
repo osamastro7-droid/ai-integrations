@@ -33,6 +33,7 @@ from tests.endless.activities import ALL
 from tests.endless.policy import count_policy
 from tests.endless.workflows import LongTaskWorkflow, TaskOptions
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
+from tests.helpers.workers import FAIL_FAST
 
 pytestmark = pytest.mark.timeout(180)
 
@@ -57,6 +58,7 @@ def worker(client: Client, queue: str, runner: SegmentRunner) -> Worker:
         workflows=[LongTaskWorkflow],
         activities=ALL,
         plugins=[ClaudeAgentPlugin(runner, heartbeat_every=1.0)],
+        **FAIL_FAST,
     )
 
 

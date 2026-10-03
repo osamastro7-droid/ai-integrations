@@ -19,6 +19,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 from temporalio.worker import Replayer, Worker
 from tests.conftest import wait_for_approval
+from tests.helpers.workers import FAIL_FAST
 from tests.refund import shop
 from tests.refund.activities import ALL, issue_refund
 from tests.refund.policy import refund_policy
@@ -47,6 +48,7 @@ async def run_case(
         workflows=[RefundAgentWorkflow],
         activities=ALL,
         plugins=[plugin],
+        **FAIL_FAST,
     ):
         handle = await client.start_workflow(
             RefundAgentWorkflow.run,
@@ -137,6 +139,7 @@ async def test_only_an_allowed_approver_can_approve(
         workflows=[RefundAgentWorkflow],
         activities=ALL,
         plugins=[plugin],
+        **FAIL_FAST,
     ):
         handle = await client.start_workflow(
             RefundAgentWorkflow.run,

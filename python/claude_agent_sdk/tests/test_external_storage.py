@@ -26,6 +26,7 @@ from temporalio.converter import DataConverter, ExternalStorage
 from temporalio.worker import Worker
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
 from tests.helpers.storage import FolderStorageDriver
+from tests.helpers.workers import FAIL_FAST
 from tests.refund import shop
 from tests.storage.workflows import FetchWorkflow, fetch_document, fetch_policy
 
@@ -49,6 +50,7 @@ async def fetch(
         workflows=[FetchWorkflow],
         activities=[fetch_document],
         plugins=[plugin],
+        **FAIL_FAST,
     ):
         handle = await client.start_workflow(
             FetchWorkflow.run, f"fetch {kb} KB", id=queue, task_queue=queue

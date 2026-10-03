@@ -29,6 +29,7 @@ from tests.endless.activities import ALL as COUNTING
 from tests.engine_tools.policy import shell_policy
 from tests.engine_tools.workflows import ShellOptions, ShellWorkflow
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
+from tests.helpers.workers import FAIL_FAST
 from tests.test_workflow_engine import hang_on_request
 
 # Every test gets its own shop ledger, where the durable ``count`` tool records runs.
@@ -56,6 +57,7 @@ def worker(client: Client, queue: str, runner: Any) -> Worker:
         workflows=[ShellWorkflow],
         activities=COUNTING,
         plugins=[ClaudeAgentPlugin(runner, heartbeat_every=1.0)],
+        **FAIL_FAST,
     )
 
 

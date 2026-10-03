@@ -30,6 +30,7 @@ from tests.endless.activities import ALL as COUNTING
 from tests.endless.activities import publish
 from tests.endless.workflows import LongTaskWorkflow, TaskOptions
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
+from tests.helpers.workers import FAIL_FAST
 from tests.parallel.policy import parallel_policy
 from tests.parallel.workflows import ParallelWorkflow, SurviveCancelWorkflow
 from tests.refund import shop
@@ -48,6 +49,7 @@ def worker(
         workflows=[ParallelWorkflow, LongTaskWorkflow, SurviveCancelWorkflow],
         activities=activities,
         plugins=[ClaudeAgentPlugin(runner, heartbeat_every=1.0)],
+        **FAIL_FAST,
     )
 
 

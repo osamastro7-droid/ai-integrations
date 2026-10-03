@@ -41,6 +41,7 @@ from tests.endless.workflows import (
     TaskOptions,
 )
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
+from tests.helpers.workers import FAIL_FAST
 from tests.refund import shop
 
 pytestmark = pytest.mark.timeout(240)
@@ -90,6 +91,7 @@ def scripted_worker(
         workflows=[LongTaskWorkflow, ChatWorkflow, AutoChatWorkflow],
         activities=ALL,
         plugins=[plugin],
+        **FAIL_FAST,
     )
 
 

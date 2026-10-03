@@ -15,6 +15,7 @@ from temporalio.claude_agent_sdk import (
 from temporalio.claude_agent_sdk.testing import ScriptedClaude
 from temporalio.client import Client
 from temporalio.worker import Worker
+from tests.helpers.workers import FAIL_FAST
 from tests.refund.activities import ALL
 from tests.refund.policy import refund_policy
 from tests.refund.workflows import RefundAgentWorkflow
@@ -55,6 +56,7 @@ async def main() -> None:
         workflows=[RefundAgentWorkflow],
         activities=ALL,
         plugins=[ClaudeAgentPlugin(build_runner(args.real), heartbeat_every=1.0)],
+        **FAIL_FAST,
     )
     print("worker ready", flush=True)
     await worker.run()

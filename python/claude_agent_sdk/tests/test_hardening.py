@@ -70,6 +70,7 @@ from tests.helpers.fake_messages_api import (
     engine_env,
     start_with_policy,
 )
+from tests.helpers.workers import FAIL_FAST
 
 pytestmark = pytest.mark.timeout(120)
 AUTH = {"ANTHROPIC_API_KEY": "sk-ant-fake-not-real"}
@@ -772,6 +773,7 @@ async def test_a_cancelled_step_runs_no_more_builtin_tools(
             workflows=[WriterWorkflow],
             activities=[count],
             plugins=[ClaudeAgentPlugin(runner, heartbeat_every=0.5)],
+            **FAIL_FAST,
         ):
             handle = await client.start_workflow(
                 WriterWorkflow.run, "count to 1", id=queue, task_queue=queue
@@ -809,6 +811,7 @@ async def test_heartbeats_follow_the_segments_timeout(
         workflows=[WriterWorkflow],
         activities=[count],
         plugins=[ClaudeAgentPlugin(runner, heartbeat_every=30)],
+        **FAIL_FAST,
     ):
         answer = await client.execute_workflow(
             WriterWorkflow.run, "count to 1", id=queue, task_queue=queue

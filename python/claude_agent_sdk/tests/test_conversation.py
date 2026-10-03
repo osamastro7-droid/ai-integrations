@@ -43,6 +43,7 @@ from tests.endless.policy import count_policy
 from tests.endless.workflows import LongTaskWorkflow, TaskOptions
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
 from tests.helpers.storage import FolderStorageDriver
+from tests.helpers.workers import FAIL_FAST
 from tests.lifecycle.policy import big_result_policy
 from tests.lifecycle.workflows import BigResultWorkflow
 from tests.refund import shop
@@ -76,6 +77,7 @@ def worker(client: Client, queue: str, runner: Any) -> Worker:
         ],
         activities=[*COUNTING, fetch_document],
         plugins=[ClaudeAgentPlugin(runner, heartbeat_every=1.0)],
+        **FAIL_FAST,
     )
 
 

@@ -37,6 +37,7 @@ from tests.conftest import LIMIT, SUGGEST_AT, wait_for_approval
 from tests.endless.activities import ALL as COUNTING
 from tests.endless.policy import count_policy
 from tests.endless.workflows import ChatWorkflow, LongTaskWorkflow, TaskOptions
+from tests.helpers.workers import FAIL_FAST
 from tests.lifecycle.policy import big_input_policy, big_result_policy
 from tests.lifecycle.workflows import (
     COUNT,
@@ -77,7 +78,9 @@ def scripted(
     return lambda policy: ScriptedClaude(policy, folder)
 
 
-def scripted_worker(client: Client, queue: str, runner: Any) -> Worker:
+def scripted_worker(
+    client: Client, queue: str, runner: Any, *, fail_fast: bool = True
+) -> Worker:
     """A Worker for every Workflow in this file."""
     return Worker(
         client,
@@ -85,6 +88,7 @@ def scripted_worker(client: Client, queue: str, runner: Any) -> Worker:
         workflows=WORKFLOWS,
         activities=[*COUNTING, *SHOP, fetch_document],
         plugins=[ClaudeAgentPlugin(runner, heartbeat_every=1.0)],
+        **(FAIL_FAST if fail_fast else {}),
     )
 
 
@@ -165,6 +169,7 @@ async def test_checking_continue_as_new_in_a_wait_condition_is_safe(
         workflows=[UpdateChatWorkflow],
         activities=COUNTING,
         plugins=[ClaudeAgentPlugin(scripted(count_policy))],
+        **FAIL_FAST,
     ):
         handle = await client.start_workflow(
             UpdateChatWorkflow.run, args=[None, False], id=queue, task_queue=queue
@@ -412,7 +417,8 @@ async def test_live_output_agent_must_be_created_during_init(
     scripted: Callable[[Policy], ScriptedClaude],
 ) -> None:
     queue = f"late-{uuid.uuid4().hex[:8]}"
-    async with scripted_worker(client, queue, scripted(count_policy)):
+    # The default Worker options: this checks the failed Workflow task itself.
+    async with scripted_worker(client, queue, scripted(count_policy), fail_fast=False):
         handle = await client.start_workflow(
             LateLiveOutputWorkflow.run, "count to 1", id=queue, task_queue=queue
         )

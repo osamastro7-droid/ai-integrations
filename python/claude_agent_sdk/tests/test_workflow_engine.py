@@ -36,6 +36,7 @@ from tests.helpers.fake_messages_api import (
     engine_env,
     start_with_policy,
 )
+from tests.helpers.workers import FAIL_FAST
 from tests.refund import shop
 from tests.refund.policy import refund_policy
 from tests.refund.workflows import MANAGER, RefundAgentWorkflow
@@ -226,6 +227,7 @@ async def test_real_engine_segment_that_times_out_is_retried_cleanly(
             workflows=[LongTaskWorkflow],
             activities=COUNTING,
             plugins=[ClaudeAgentPlugin(runner, heartbeat_every=1.0)],
+            **FAIL_FAST,
         ):
             handle = await client.start_workflow(
                 LongTaskWorkflow.run,

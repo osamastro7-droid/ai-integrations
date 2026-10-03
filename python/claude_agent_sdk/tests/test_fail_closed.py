@@ -35,6 +35,7 @@ from tests.helpers.fake_messages_api import (
     engine_env,
     start_with_policy,
 )
+from tests.helpers.workers import FAIL_FAST
 from tests.refund import shop
 from tests.refund.activities import ALL
 from tests.refund.policy import refund_policy
@@ -130,6 +131,7 @@ async def test_workflow_stops_loudly_and_no_tool_activity_runs(
         workflows=[RefundAgentWorkflow],
         activities=ALL,
         plugins=[plugin],
+        **FAIL_FAST,
     ):
         handle = await client.start_workflow(
             RefundAgentWorkflow.run, BROKEN_TEAPOT, id=queue, task_queue=queue
@@ -167,6 +169,7 @@ async def test_a_tool_call_never_runs_twice(client: Client) -> None:
         workflows=[RefundAgentWorkflow],
         activities=ALL,
         plugins=[plugin],
+        **FAIL_FAST,
     ):
         handle = await client.start_workflow(
             RefundAgentWorkflow.run, BROKEN_TEAPOT, id=queue, task_queue=queue
