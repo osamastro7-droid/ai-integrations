@@ -49,6 +49,9 @@ posix_only = pytest.mark.skipif(
 
 FAKE_ENGINE = """\
 import json, os, signal, sys, time
+if sys.argv[1:] == ["-v"]:
+    print(json.dumps(["version", os.environ.get("TCA_WORKER_PID")]))
+    sys.exit(0)
 if sys.argv[1:2] == ["exit"]:
     print(json.dumps([sys.argv[2:], os.environ.get("TCA_WORKER_PID")]))
     sys.exit(7)
@@ -179,13 +182,20 @@ def test_hooks_that_test_the_lock_together_both_see_the_worker_gone(
 def test_launcher_script_checks_itself_and_starts_the_engine_unchanged(
     tmp_path: Path,
 ) -> None:
-    """The runner's check starts nothing; otherwise the engine gets every argument
-    as it was, not the launcher's variable, and its exit code comes back."""
+    """The runner's check starts nothing; the SDK's version probe goes straight to the
+    engine; otherwise the engine gets every argument as it was, not the launcher's
+    variable, and its exit code comes back."""
     script = _runner._write_launch_script(str(fake_engine(tmp_path)))
     check = subprocess.run(
         [script, _launcher.CHECK], capture_output=True, text=True, timeout=60
     )
     assert check.returncode == 0 and check.stdout.strip() == "ok", check.stderr
+    worker = {**os.environ, _launcher.WORKER_PID: str(os.getpid())}
+    probe = subprocess.run(
+        [script, "-v"], capture_output=True, text=True, timeout=60, env=worker
+    )
+    # The variable is still there: the launcher (which removes it) did not run.
+    assert json.loads(probe.stdout) == ["version", str(os.getpid())], probe.stderr
     ran = subprocess.run(
         [script, "exit", "a b", "it's", "--resume"],
         capture_output=True,

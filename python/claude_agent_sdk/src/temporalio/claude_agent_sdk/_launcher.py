@@ -1,6 +1,6 @@
 """Starts Claude Code so that it ends when the Worker process that started it ends.
 
-On Linux and macOS the runner gives the SDK a two-line shell script as ``cli_path``,
+On Linux and macOS the runner gives the SDK a short shell script as ``cli_path``,
 and the script runs this file (standard library only, so it starts in tens of
 milliseconds) with the real engine and the SDK's arguments.
 

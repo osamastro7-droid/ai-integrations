@@ -1191,7 +1191,10 @@ def _write_launch_script(engine: str) -> str:
     """A ``/bin/sh`` script that starts ``engine`` through the launcher (``_launcher``).
 
     Isolated mode and no ``site``: the launcher needs only the standard library.
-    Written to a new name and moved in place, so a run never sees half a script.
+    The SDK's version probe before every start (``-v`` alone) goes straight to the
+    engine, which prints its version and exits: no Python in between, about 20 ms
+    of every step. Written to a new name and moved in place, so a run never sees
+    half a script.
     """
     if not _launch_dir or not _private_folder(_launch_dir[0]):
         # A cleaner of temporary files may remove an old one: never write into a
@@ -1203,8 +1206,9 @@ def _write_launch_script(engine: str) -> str:
     command = " ".join(
         _sh_quote(part) for part in (sys.executable, "-I", "-S", str(_LAUNCHER), engine)
     )
+    probe = f'if [ "$#" -eq 1 ] && [ "$1" = -v ]; then exec {_sh_quote(engine)} -v; fi'
     temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}")
-    temporary.write_text(f'#!/bin/sh\nexec {command} "$@"\n', encoding="utf-8")
+    temporary.write_text(f'#!/bin/sh\n{probe}\nexec {command} "$@"\n', encoding="utf-8")
     temporary.chmod(0o700)
     os.replace(temporary, path)
     return str(path)
