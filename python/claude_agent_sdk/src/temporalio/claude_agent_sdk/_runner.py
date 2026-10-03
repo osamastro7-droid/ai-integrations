@@ -730,10 +730,16 @@ def _hook_entry() -> dict[str, Any]:
     needs quoting. (Through a shell, Git Bash on Windows drops the backslashes of a
     Windows path, and PowerShell, its fallback, needs other quoting.) The hook file
     is run as a plain script: it only needs the standard library, and importing
-    this package would add about a second to every durable tool call.
+    this package would add about a second to every durable tool call. Isolated mode
+    and no ``site``, like the launcher: nothing from the Worker's environment or its
+    ``.pth`` files runs before each decision.
     """
     hook = Path(__file__).with_name("_defer_hook.py")
-    return {"type": "command", "command": sys.executable, "args": [str(hook)]}
+    return {
+        "type": "command",
+        "command": sys.executable,
+        "args": ["-I", "-S", str(hook)],
+    }
 
 
 def _hook_folder() -> str:

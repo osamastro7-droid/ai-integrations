@@ -310,7 +310,8 @@ def test_the_hook_stops_builtin_tools_once_the_step_stopped(
 def test_the_hook_starts_without_a_shell() -> None:
     entry = _runner._hook_entry()  # type: ignore[reportPrivateUsage]
     assert entry["command"] == sys.executable  # exec form: nothing to quote
-    assert entry["args"] == [str(Path(_runner.__file__).with_name("_defer_hook.py"))]
+    hook = str(Path(_runner.__file__).with_name("_defer_hook.py"))
+    assert entry["args"] == ["-I", "-S", hook]  # standard library only
 
 
 async def _pause_once(runner: ClaudeAgentSdkRunner) -> Any:
