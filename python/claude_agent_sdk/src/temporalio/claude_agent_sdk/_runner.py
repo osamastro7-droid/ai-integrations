@@ -77,13 +77,14 @@ import tempfile
 import unicodedata
 import uuid
 import warnings
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
 from typing import Any, cast
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     HookMatcher,
     InMemorySessionStore,
     MirrorErrorMessage,
@@ -773,6 +774,146 @@ def _hook_denials(hook_dir: str) -> dict[str, str]:
         }
     except OSError:
         return {}
+
+
+class _Feed:
+    """An engine's input: the messages for its turn, then, once ``close`` is called,
+    its end.
+
+    The SDK writes each message to the engine as it comes, and closes the engine's
+    input when the stream ends; the engine then exits after its turn.
+    """
+
+    def __init__(self, messages: list[dict[str, Any]]) -> None:
+        self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        for message in messages:
+            self._queue.put_nowait(message)
+
+    def close(self) -> None:
+        self._queue.put_nowait(None)
+
+    async def stream(self) -> AsyncIterator[dict[str, Any]]:
+        while (message := await self._queue.get()) is not None:
+            yield message
+
+
+async def _as_messages(prompt: Any) -> list[dict[str, Any]]:
+    """An engine run's input as user messages.
+
+    A text prompt becomes the message the one-shot query writes for it; the runner's
+    own message stream is read as it is.
+    """
+    if isinstance(prompt, str):
+        return [
+            {
+                "type": "user",
+                "session_id": "",
+                "message": {"role": "user", "content": prompt},
+                "parent_tool_use_id": None,
+            }
+        ]
+    return [message async for message in prompt]
+
+
+def _agents_running(client: Any) -> bool:
+    """Whether delegated agents the engine started still run (the SDK tracks them)."""
+    return bool(getattr(getattr(client, "_query", None), "_inflight_tasks", None))
+
+
+async def _turn_messages(client: Any, feed: _Feed, resumed: bool) -> AsyncIterator[Any]:
+    """An engine's messages until it exits. Its input ends once its own turn is over.
+
+    The one-shot query ends the input at the first result that comes while no
+    delegated agent runs. A resumed engine first repeats the result its session
+    paused with, before its ``init`` message (tested on Claude Code 2.1.273 and
+    2.1.288), so the input ended before the resumed turn even started: hooks and
+    permission callbacks from ``extra_options``, which the engine asks over its
+    input, were never asked, and Claude Code refused their calls. This ends the
+    input at the turn's own result instead, once no agent runs: any result but
+    one such repeat (a pause, before ``init``). Like the one-shot query, it reads
+    on until the engine exits: the last result counts, and an engine that exits
+    after an error result raises ``ResultError``.
+    """
+    started = not resumed
+    repeated = False
+    ending = False
+    async for message in client.receive_messages():
+        yield message
+        if ending:
+            continue
+        if isinstance(message, SystemMessage) and message.subtype == "init":
+            started = True
+        elif isinstance(message, ResultMessage):
+            if (
+                not started
+                and not repeated
+                and message.deferred_tool_use is not None
+                and not message.is_error
+            ):
+                repeated = True  # the pause the session ended with, repeated
+            elif not _agents_running(client):  # each one wakes the engine again
+                feed.close()
+                ending = True
+
+
+async def _disconnect(client: Any) -> None:
+    """Stop an engine started through the streaming client, and clean up after it.
+
+    The SDK closes the engine's input, waits for it to exit (and ends it if it does
+    not), and removes its resume folder. If that wait is cut short (a second cancel,
+    an event loop that closes), the engine still gets SIGTERM and the folder goes.
+    """
+    process = getattr(getattr(client, "_transport", None), "_process", None)
+    resumed = getattr(client, "_materialized", None)
+    try:
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+    finally:
+        _stop_now(process, resumed)
+
+
+EXIT_GRACE_SECONDS = 10.0
+"""How long an engine that got SIGTERM may still write to its resume folder."""
+
+
+def _stop_now(process: Any, resumed: Any) -> None:
+    """End an engine without waiting: SIGTERM if it still runs; its resume folder goes.
+
+    An engine that is still exiting can write a few lines to the folder after it is
+    removed (session metadata, no conversation): it is removed again after
+    ``EXIT_GRACE_SECONDS`` while the event loop runs, and when the Worker exits.
+    """
+    running = process is not None and process.returncode is None
+    if running:
+        with contextlib.suppress(OSError):
+            process.terminate()
+    if resumed is None:
+        return
+    folder = str(resumed.config_dir)
+    shutil.rmtree(folder, ignore_errors=True)
+    if running:
+        with contextlib.suppress(RuntimeError):  # no event loop runs
+            asyncio.get_running_loop().call_later(
+                EXIT_GRACE_SECONDS, shutil.rmtree, folder, True
+            )
+        atexit.register(shutil.rmtree, folder, True)
+
+
+async def _engine_messages(
+    options: dict[str, Any], messages: list[dict[str, Any]], resumed: bool
+) -> AsyncGenerator[Any, None]:
+    """Start an engine, send it ``messages``, and yield what it says until it exits.
+
+    See ``_turn_messages`` for when its input ends.
+    """
+    feed = _Feed(messages)
+    client = ClaudeSDKClient(ClaudeAgentOptions(**options))
+    try:
+        await client.connect(feed.stream())
+        async for message in _turn_messages(client, feed, resumed):
+            yield message
+    finally:
+        await _disconnect(client)
 
 
 # ---- the engine ends with its Worker ----
@@ -2018,29 +2159,31 @@ class ClaudeAgentSdkRunner:
         joining = _join_job_while_starting()
         try:
             lock = _hold_worker_lock(hook_dir)
-            async for message in query(
-                prompt=prompt, options=ClaudeAgentOptions(**options)
-            ):
-                if joining is not None and not joining.done():
-                    joining.cancel()
-                    _engines_end_with_worker()
-                if isinstance(message, MirrorErrorMessage):
-                    store_error = message.error or "unknown error"
-                elif isinstance(message, SystemMessage) and message.subtype == "init":
-                    version = message.data.get("claude_code_version")
-                    engine_version = str(version or engine_version)
-                elif (
-                    isinstance(message, AssistantMessage)
-                    and message.parent_tool_use_id is None  # not a subagent's
-                ):
-                    last_assistant = message.uuid or last_assistant
-                    for block in message.content:
-                        if isinstance(block, TextBlock) and block.text.strip():
-                            emit({"type": "text", "text": block.text})
-                elif isinstance(message, UserMessage):
-                    stopped_by_hook = stopped_by_hook or _hook_said_stopped(message)
-                elif isinstance(message, ResultMessage):
-                    result = message
+            engine = _engine_messages(options, await _as_messages(prompt), resume)
+            async with contextlib.aclosing(engine) as messages:
+                async for message in messages:
+                    if joining is not None and not joining.done():
+                        joining.cancel()
+                        _engines_end_with_worker()
+                    if isinstance(message, MirrorErrorMessage):
+                        store_error = message.error or "unknown error"
+                    elif (
+                        isinstance(message, SystemMessage) and message.subtype == "init"
+                    ):
+                        version = message.data.get("claude_code_version")
+                        engine_version = str(version or engine_version)
+                    elif (
+                        isinstance(message, AssistantMessage)
+                        and message.parent_tool_use_id is None  # not a subagent's
+                    ):
+                        last_assistant = message.uuid or last_assistant
+                        for block in message.content:
+                            if isinstance(block, TextBlock) and block.text.strip():
+                                emit({"type": "text", "text": block.text})
+                    elif isinstance(message, UserMessage):
+                        stopped_by_hook = stopped_by_hook or _hook_said_stopped(message)
+                    elif isinstance(message, ResultMessage):
+                        result = message
             marker = Path(hook_dir) / "paused_call"  # written when the hook defers
             if marker.exists():
                 paused_by_hook = marker.read_text(encoding="utf-8").strip() or None

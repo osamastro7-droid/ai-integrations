@@ -7,14 +7,17 @@ pin down the engine behavior the plugin relies on.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from claude_agent_sdk import (
     DeferredToolUse,
+    HookMatcher,
     InMemorySessionStore,
     ResultMessage,
     SystemMessage,
@@ -391,12 +394,12 @@ async def test_engine_older_than_the_minimum_is_refused_before_it_starts(
         del self
         return "2.1.259 (Claude Code)"
 
-    def must_not_start(**kwargs: Any) -> Any:
-        del kwargs
+    def must_not_start(*args: Any) -> Any:
+        del args
         raise AssertionError("the engine must not start")
 
     monkeypatch.setattr(ClaudeAgentSdkRunner, "_engine_version", old_version)
-    monkeypatch.setattr(_runner, "query", must_not_start)
+    monkeypatch.setattr(_runner, "_engine_messages", must_not_start)
     runner = ClaudeAgentSdkRunner(
         session_store=FileSessionStore(tmp_path),
         env={"ANTHROPIC_API_KEY": "sk-ant-fake-not-real"},
@@ -419,8 +422,8 @@ async def test_old_engine_found_at_start_never_hands_back_a_tool_call(
     async def unknown_version(self: ClaudeAgentSdkRunner) -> None:
         del self
 
-    async def old_engine(**kwargs: Any) -> AsyncIterator[Any]:
-        del kwargs
+    async def old_engine(*args: Any) -> AsyncIterator[Any]:
+        del args
         yield SystemMessage(subtype="init", data={"claude_code_version": "2.1.259"})
         yield ResultMessage(
             subtype="success",
@@ -436,7 +439,7 @@ async def test_old_engine_found_at_start_never_hands_back_a_tool_call(
         )
 
     monkeypatch.setattr(ClaudeAgentSdkRunner, "_engine_version", unknown_version)
-    monkeypatch.setattr(_runner, "query", old_engine)
+    monkeypatch.setattr(_runner, "_engine_messages", old_engine)
     runner = ClaudeAgentSdkRunner(
         session_store=FileSessionStore(tmp_path),
         env={"ANTHROPIC_API_KEY": "sk-ant-fake-not-real"},
@@ -504,3 +507,160 @@ async def test_builtin_tools_run_inside_the_segment(
     else:
         assert out.is_error and out.error is not None and stop in out.error
     assert api.errors == [] and runner.stub_calls == 0
+
+
+@pytest.mark.parametrize("mode", ["held", "store"])
+async def test_your_hooks_are_asked_in_every_segment(tmp_path: Path, mode: str) -> None:
+    """A resumed engine first repeats the result its session paused with. The engine's
+    input used to end there, before the resumed turn: a hook from ``extra_options``
+    was never asked, and Claude Code refused the call it was asked about."""
+    asked: list[str] = []
+
+    async def record(event: Any, tool_use_id: Any, context: Any) -> Any:
+        del tool_use_id, context
+        asked.append(event.get("tool_name", "?"))
+        return {}
+
+    ref: list[FakeMessagesAPI] = []
+
+    def decide(body: dict[str, Any]) -> list[dict[str, Any]]:
+        _, _, history = history_of(body)
+        if not history:
+            return [ref[0].tool_use("look_up_order", {"order_id": "A-1001"})]
+        if len(history) == 1:
+            return [ref[0].call("Glob", {"pattern": "*.nothing"})]
+        glob = history[-1]
+        return [{"type": "text", "text": f"FINAL {glob.is_error} {glob.content}"}]
+
+    api = FakeMessagesAPI(decide).start()
+    ref.append(api)
+    held = mode == "held"
+    runner = ClaudeAgentSdkRunner(
+        session_store=None if held else FileSessionStore(tmp_path / "store"),
+        cwd=str(tmp_path),
+        env=engine_env(api, str(tmp_path / "cfg")),
+        extra_options={
+            "hooks": {"PreToolUse": [HookMatcher(matcher=None, hooks=[record])]}
+        },
+    )
+    try:
+        first = await runner.run(
+            SegmentInput(
+                session_id=str(uuid.uuid4()),
+                prompt="Look up A-1001.",
+                tools=TOOLS,
+                builtin_tools=["Glob"],
+                transcript=[] if held else None,
+            ),
+            1,
+        )
+        assert first.deferred is not None
+        second = await runner.run(
+            SegmentInput(
+                session_id=first.session_id,
+                prompt=None,
+                tools=TOOLS,
+                builtin_tools=["Glob"],
+                checkpoint=first.checkpoint,
+                injected={first.deferred.id: ToolOutcome({"found": True})},
+                transcript=first.transcript_add if held else None,
+                segment_index=1,
+            ),
+            1,
+        )
+    finally:
+        api.stop()
+    assert "Glob" in asked, asked
+    assert second.result == "FINAL False No files found", second.result
+    assert api.errors == []
+
+
+class _Scripted:
+    """A streaming client that replays an engine's messages, with the delegated agents
+    running after each one, and notes when the runner ended the engine's input."""
+
+    def __init__(self, script: list[tuple[Any, set[str]]], feed: Any) -> None:
+        self.script = script
+        self.feed = feed
+        self.ended_after: int | None = None
+        self._query = SimpleNamespace(_inflight_tasks=set[str]())
+
+    async def receive_messages(self) -> AsyncIterator[Any]:
+        for i, (message, running) in enumerate(self.script):
+            self._query._inflight_tasks = running
+            yield message
+            if self.ended_after is None and not self.feed._queue.empty():
+                self.ended_after = i
+
+
+def _result(call: str | None = None, *, error: bool = False) -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=error,
+        num_turns=1,
+        session_id="s",
+        deferred_tool_use=(
+            DeferredToolUse(id=call, name="mcp__durable__x", input={}) if call else None
+        ),
+    )
+
+
+_INIT = SystemMessage(subtype="init", data={})
+_PAUSE = _result("toolu_1")  # the result a resumed engine repeats before init
+
+
+@pytest.mark.parametrize(
+    ("resumed", "script", "ended_after"),
+    [
+        (False, [(_INIT, set()), (_result(), set())], 1),
+        (True, [(_PAUSE, set()), (_INIT, set()), (_result(), set())], 2),
+        (True, [(_PAUSE, set()), (_PAUSE, set())], 1),
+        (True, [(_result(error=True), set())], 0),
+        (
+            False,
+            [(_INIT, set()), (_result(), {"a1"}), (_result(), set())],
+            2,
+        ),
+        (False, [(_INIT, set()), (_result(error=True), set())], 1),
+    ],
+    ids=[
+        "new",
+        "resumed",
+        "two-before-init",
+        "error-before-init",
+        "agent-running",
+        "error",
+    ],
+)
+async def test_the_input_ends_after_the_turns_own_result(
+    resumed: bool, script: list[tuple[Any, set[str]]], ended_after: int
+) -> None:
+    """Only a pause a resumed engine repeats before ``init`` is skipped: an engine
+    that fails before it starts its turn must not wait for input forever."""
+    feed = _runner._Feed([])  # type: ignore[reportPrivateUsage]
+    client = _Scripted(script, feed)
+    seen = [
+        m
+        async for m in _runner._turn_messages(client, feed, resumed)  # type: ignore[reportPrivateUsage]
+    ]
+    assert len(seen) == len(script)  # it reads until the engine is done
+    assert client.ended_after == ended_after
+
+
+async def test_an_engine_stopped_while_it_exits_leaves_no_resume_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An engine whose ending was cut short gets SIGTERM, and its resume folder goes,
+    also the lines it writes while it exits."""
+    monkeypatch.setattr(_runner, "EXIT_GRACE_SECONDS", 0.05)
+    folder = tmp_path / "claude-resume-x"
+    (folder / "projects").mkdir(parents=True)
+    signals: list[str] = []
+    process = SimpleNamespace(returncode=None, terminate=lambda: signals.append("TERM"))
+    _runner._stop_now(process, SimpleNamespace(config_dir=folder))  # type: ignore[reportPrivateUsage]
+    assert signals == ["TERM"] and not folder.exists()
+    (folder / "projects").mkdir(parents=True)  # written while it exits
+    await asyncio.sleep(0.2)
+    assert not folder.exists()
