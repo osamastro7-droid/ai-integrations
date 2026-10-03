@@ -33,6 +33,7 @@ from tests.endless.activities import ALL
 from tests.endless.policy import count_policy
 from tests.endless.workflows import LongTaskWorkflow, TaskOptions
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
+from tests.helpers.outside_workflow import CarriedStream
 from tests.helpers.workers import FAIL_FAST
 
 pytestmark = pytest.mark.timeout(180)
@@ -178,22 +179,6 @@ def test_an_input_that_is_text_and_fits_stays_as_it_is() -> None:
     """Its JSON is two quotes longer: before, that cut it, with a quote in front."""
     event = {"type": "tool_call", "input": "z" * FIELD_LIMIT}
     assert cap_event(event) == event
-
-
-class CarriedStream:
-    """What ``_carry_stream`` uses of a Workflow's stream, outside a Workflow."""
-
-    def __init__(self, state: WorkflowStreamState) -> None:
-        self.state = state
-
-    def get_state(self) -> WorkflowStreamState:
-        return dataclasses.replace(self.state, log=list(self.state.log))
-
-    def truncate(self, up_to_offset: int) -> None:
-        dropped = up_to_offset - self.state.base_offset
-        self.state = dataclasses.replace(
-            self.state, log=self.state.log[dropped:], base_offset=up_to_offset
-        )
 
 
 def input_bytes(args: list[Any]) -> int:
