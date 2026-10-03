@@ -10,6 +10,7 @@ limits, Continue-As-New, Workers configured differently, and nothing left on dis
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import uuid
 from pathlib import Path
@@ -25,6 +26,7 @@ from temporalio.claude_agent_sdk import (
     ClaudeAgentPlugin,
     ClaudeAgentSdkRunner,
     ConversationRef,
+    DurableClaudeAgent,
     FileSessionStore,
     SegmentInput,
     ToolOutcome,
@@ -32,6 +34,7 @@ from temporalio.claude_agent_sdk import (
     _conversation,
     _runner,
 )
+from temporalio.claude_agent_sdk._workflow import _Conversations
 from temporalio.claude_agent_sdk.testing import ScriptedClaude
 from temporalio.client import Client, WorkflowQueryFailedError
 from temporalio.converter import DataConverter, ExternalStorage
@@ -204,6 +207,133 @@ async def test_a_step_reads_the_conversation_a_page_at_a_time() -> None:
     inp.conversation = ConversationRef(query=QUERY, agent="0", entries=4)
     with pytest.raises(RuntimeError, match="scheduled with 4. Retrying"):  # changed
         await env.run(_conversation.read_conversation, inp)
+
+
+def _held(entries: int) -> SegmentInput:
+    """A segment of a conversation of ``entries`` entries that the Workflow holds."""
+    return SegmentInput(
+        session_id="s",
+        prompt=None,
+        tools=[],
+        checkpoint=str(entries - 1) if entries else None,
+        conversation=ConversationRef(query=QUERY, agent="0", entries=entries),
+    )
+
+
+async def test_a_conversation_of_one_entry_is_read() -> None:
+    entries = [{"uuid": "0", "text": "the only entry"}]
+    asked: list[int] = []
+    env = ActivityEnvironment(client=_FakeClient(_FakeHandle(entries, asked)))  # type: ignore[arg-type]
+    assert await env.run(_conversation.read_conversation, _held(1)) == entries
+    assert asked == [0]
+
+
+async def test_a_step_with_no_conversation_to_read_asks_nothing() -> None:
+    """No Query for a new conversation; a transcript passed inline wins."""
+    asked: list[int] = []
+    env = ActivityEnvironment(client=_FakeClient(_FakeHandle([], asked)))  # type: ignore[arg-type]
+    for inp in (_held(0), SegmentInput(session_id="s", prompt="hi", tools=[])):
+        assert await env.run(_conversation.read_conversation, inp) == []
+        assert await _conversation.read_conversation(inp) == []  # even outside one
+    inline = _held(3)
+    inline.transcript = [{"uuid": "t"}]
+    got = await env.run(_conversation.read_conversation, inline)
+    assert got == [{"uuid": "t"}] and got is not inline.transcript
+    assert asked == []
+
+
+class _EmptyHandle(_FakeHandle):
+    async def query(self, name: str, args: list[Any], result_type: Any) -> Any:
+        self.asked.append(args[1])
+        return []
+
+
+async def test_an_empty_page_fails_the_step_so_temporal_retries_it() -> None:
+    asked: list[int] = []
+    env = ActivityEnvironment(client=_FakeClient(_EmptyHandle([], asked)))  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError) as raised:
+        await env.run(_conversation.read_conversation, _held(2))
+    assert str(raised.value) == "The Workflow served no entries at 0 of 2. Retrying."
+    assert asked == [0]  # asked once: an empty page never loops
+
+
+async def test_a_held_conversation_is_read_only_in_a_segment_activity() -> None:
+    with pytest.raises(RuntimeError) as outside:
+        await _conversation.read_conversation(_held(2))
+    assert str(outside.value) == (
+        "A conversation the Workflow holds can only be read inside the segment "
+        "Activity; pass SegmentInput.transcript to run a segment directly."
+    )
+    asked: list[int] = []
+    env = ActivityEnvironment(client=_FakeClient(_FakeHandle([], asked)))  # type: ignore[arg-type]
+    env.info = dataclasses.replace(env.info, workflow_id=None)  # a standalone Activity
+    with pytest.raises(RuntimeError) as standalone:
+        await env.run(_conversation.read_conversation, _held(2))
+    assert str(standalone.value) == (
+        "This segment Activity was not started by a Workflow, so no Workflow holds "
+        "its conversation; pass SegmentInput.transcript instead."
+    )
+    assert asked == []
+
+
+async def test_a_query_that_fails_fails_the_step_so_temporal_retries_it() -> None:
+    env = ActivityEnvironment(client=_FakeClient(_FakeHandle([{"uuid": "0"}], [])))  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError) as raised:
+        await env.run(_conversation.read_conversation, _held(2))  # it holds 1
+    assert str(raised.value) == (
+        "The Workflow did not serve the conversation: scheduled with 2. Retrying."
+    )
+    assert isinstance(raised.value.__cause__, WorkflowQueryFailedError)
+
+
+async def test_without_a_client_a_step_asks_for_whole_pages() -> None:
+    """For example in an ActivityEnvironment: no client, so no External Storage."""
+
+    async def in_a_segment() -> tuple[int, bool]:
+        return _conversation.page_limit(), _conversation.external_storage_on()
+
+    assert await ActivityEnvironment().run(in_a_segment) == (
+        _conversation.PAGE_BYTES,
+        False,
+    )
+    assert _conversation.page_limit() == _conversation.PAGE_BYTES  # outside one
+
+
+async def test_a_step_knows_when_its_worker_has_external_storage(
+    tmp_path: Path,
+) -> None:
+    storage = DataConverter(
+        external_storage=ExternalStorage(drivers=[FolderStorageDriver(tmp_path)])
+    )
+    for converter, on in ((DataConverter.default, False), (storage, True)):
+        client = _FakeClient(_FakeHandle([], []), converter)
+        env = ActivityEnvironment(client=client)  # type: ignore[arg-type]
+
+        async def in_a_segment() -> bool:
+            return _conversation.external_storage_on()
+
+        assert await env.run(in_a_segment) is on
+
+
+def test_the_query_serves_each_agent_a_page_of_its_own_conversation() -> None:
+    """The handler a segment's Query reaches (read-only; refuses out-of-date steps)."""
+    big = [{"uuid": str(i), "text": "x" * (200 * 1024)} for i in range(3)]
+    small = [{"uuid": "a"}, {"uuid": "b"}]
+    registry = _Conversations()
+    for key, entries in (("0", big), ("1", small)):
+        state = AgentState(conversation=[_conversation.entry_text(e) for e in entries])
+        registry.agents[key] = DurableClaudeAgent(state=state)
+    assert registry.serve("1", 0, 2, 10**9) == small
+    assert registry.serve("1", 1, 2, 10**9) == small[1:]
+    assert registry.serve("1", 0, 2, 0) == small[:1]  # a limit below 1 counts as 1
+    assert registry.serve("0", 0, 3, 10**9) == big[:2]  # never more than a full page
+    with pytest.raises(ValueError) as stale:
+        registry.serve("1", 0, 3, 10**9)
+    assert str(stale.value) == (
+        "The conversation has 2 entries, but the step that asks was scheduled with 3."
+    )
+    with pytest.raises(ValueError, match="This Workflow has no agent '2'"):
+        registry.serve("2", 0, 2, 10**9)
 
 
 # ---- the scripted runner holds its conversation too ----
