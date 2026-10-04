@@ -26,6 +26,7 @@ def build_runner(real: bool) -> SegmentRunner:
 
     ``RUNNER_MODE=store`` keeps conversations in a store every Worker shares;
     otherwise (the default) each Workflow holds its own, and no storage is shared.
+    ``WARM_ENGINES`` is the real runner's ``warm_engines`` (0 by default).
     """
     shared = os.environ.get("RUNNER_MODE", "held") == "store"
     if real:
@@ -34,6 +35,7 @@ def build_runner(real: bool) -> SegmentRunner:
             if shared
             else None,
             cwd=os.environ.get("ENGINE_CWD"),
+            warm_engines=int(os.environ.get("WARM_ENGINES", "0")),
         )
     return ScriptedClaude(
         refund_policy,

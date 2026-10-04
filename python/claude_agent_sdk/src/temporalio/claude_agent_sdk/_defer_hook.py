@@ -38,6 +38,12 @@ holds a lock on ``$TCA_HOOK_DIR/worker.lock``, and a hook that can take it knows
 Worker died. If the folder is missing (the run ended, or the engine cannot see the
 Worker's temporary folder), every call is denied, and the runner fails a step that
 finished that way.
+
+Warm engines: an engine that paused can stay running and get the next segment's
+results as its next message (the runner's ``warm_engines``). Its environment is fixed
+when it starts, so the calls answered since then are in ``$TCA_HOOK_DIR/answered``
+(one id per line), and the runner clears ``paused_call`` and ``denied`` before each
+of its turns.
 """
 
 from __future__ import annotations
@@ -81,6 +87,9 @@ DURABLE_PREFIX = "mcp__durable__"
 
 WORKER_LOCK = "worker.lock"
 """The file in ``$TCA_HOOK_DIR`` that the Worker locks while its engine runs."""
+
+ANSWERED = "answered"
+"""The file in ``$TCA_HOOK_DIR`` with calls answered after a warm engine started."""
 
 REASON_KEYS = {
     NOT_RUN: "not_run",
@@ -187,6 +196,12 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
     name = str(event.get("tool_name") or "")
     answered = set(os.environ.get("TCA_ANSWERED_IDS", "").split())
     run_dir = os.environ.get("TCA_HOOK_DIR")
+    if run_dir is not None:
+        try:
+            with open(os.path.join(run_dir, ANSWERED), encoding="utf-8") as handle:
+                answered.update(handle.read().split())
+        except OSError:
+            pass  # no warm engine: the environment has them all
     marker = os.path.join(run_dir, "paused_call") if run_dir else None
     allow_id = os.environ.get("TCA_ALLOW_ID")
     stopped = run_dir is not None and (

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import contextlib
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from temporalio.plugin import SimplePlugin
@@ -47,4 +48,17 @@ class ClaudeAgentPlugin(SimplePlugin):
         def activities(existing: Sequence[Any] | None) -> list[Any]:
             return [*(existing or []), *added]
 
-        super().__init__("ClaudeAgentPlugin", activities=activities)
+        @contextlib.asynccontextmanager
+        async def warm_engines_end_with_worker() -> AsyncIterator[None]:
+            try:
+                yield
+            finally:
+                end = getattr(runner, "_end_all_warm", None)
+                if callable(end):
+                    end()  # engines kept for the next segment (warm_engines)
+
+        super().__init__(
+            "ClaudeAgentPlugin",
+            activities=activities,
+            run_context=warm_engines_end_with_worker,
+        )

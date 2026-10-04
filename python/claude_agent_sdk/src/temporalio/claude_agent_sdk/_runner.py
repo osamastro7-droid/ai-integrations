@@ -77,7 +77,7 @@ import tempfile
 import unicodedata
 import uuid
 import warnings
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Collection
 from pathlib import Path
 from typing import Any, cast
 
@@ -105,8 +105,8 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from ._conversation import external_storage_on, read_conversation, too_large
+from ._defer_hook import ANSWERED, REASON_KEYS, STOPPED, WORKER_LOCK, denial_name
 from ._defer_hook import NOT_RUN as NOT_RUN_REASON
-from ._defer_hook import REASON_KEYS, STOPPED, WORKER_LOCK, denial_name
 from ._events import emit
 from ._launcher import CHECK as LAUNCHER_CHECK
 from ._launcher import WORKER_PID
@@ -783,15 +783,20 @@ def _hook_denials(hook_dir: str) -> dict[str, str]:
 
 
 class _Feed:
-    """An engine's input: the messages for its turn, then, once ``close`` is called,
+    """An engine's input: the messages for its turns, then, once ``close`` is called,
     its end.
 
     The SDK writes each message to the engine as it comes, and closes the engine's
-    input when the stream ends; the engine then exits after its turn.
+    input when the stream ends; the engine then exits after its turn. A warm engine's
+    input stays open between segments: the next segment's message goes in with
+    ``put``.
     """
 
     def __init__(self, messages: list[dict[str, Any]]) -> None:
         self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self.put(messages)
+
+    def put(self, messages: list[dict[str, Any]]) -> None:
         for message in messages:
             self._queue.put_nowait(message)
 
@@ -826,7 +831,14 @@ def _agents_running(client: Any) -> bool:
     return bool(getattr(getattr(client, "_query", None), "_inflight_tasks", None))
 
 
-async def _turn_messages(client: Any, feed: _Feed, resumed: bool) -> AsyncIterator[Any]:
+async def _turn_messages(
+    client: Any,
+    feed: _Feed,
+    resumed: bool,
+    *,
+    stay: bool = False,
+    answered: Collection[str] = (),
+) -> AsyncGenerator[Any, None]:
     """An engine's messages until it exits. Its input ends once its own turn is over.
 
     The one-shot query ends the input at the first result that comes while no
@@ -839,25 +851,43 @@ async def _turn_messages(client: Any, feed: _Feed, resumed: bool) -> AsyncIterat
     one such repeat (a pause, before ``init``). Like the one-shot query, it reads
     on until the engine exits: the last result counts, and an engine that exits
     after an error result raises ``ResultError``.
+
+    With ``stay``, an engine that paused cleanly stays running instead (it can stay
+    warm, see ``warm_engines``): when its turn's result came with no error and no
+    task started, at a call other than one of ``answered`` (whose results this run
+    brings: a resumed engine repeats such a pause), this returns at that result, and
+    the input stays open.
     """
     started = not resumed
     repeated = False
+    tasks = False
     ending = False
     async for message in client.receive_messages():
         yield message
         if ending:
             continue
-        if isinstance(message, SystemMessage) and message.subtype == "init":
-            started = True
+        if isinstance(message, SystemMessage):
+            started = started or message.subtype == "init"
+            tasks = tasks or message.subtype == "task_started"
         elif isinstance(message, ResultMessage):
+            paused = message.deferred_tool_use
             if (
                 not started
                 and not repeated
-                and message.deferred_tool_use is not None
+                and paused is not None
                 and not message.is_error
             ):
                 repeated = True  # the pause the session ended with, repeated
-            elif not _agents_running(client):  # each one wakes the engine again
+                continue
+            if (
+                stay
+                and not tasks
+                and not message.is_error
+                and paused is not None
+                and paused.id not in answered
+            ):
+                return  # the engine waits, its input open, for the next segment
+            if not _agents_running(client):  # each one wakes the engine again
                 feed.close()
                 ending = True
 
@@ -920,6 +950,99 @@ async def _engine_messages(
             yield message
     finally:
         await _disconnect(client)
+
+
+async def _connected(
+    client: Any, feed: _Feed, resumed: bool, answered: Collection[str]
+) -> AsyncGenerator[Any, None]:
+    """A new engine's messages, for an engine that may stay warm (``stay``).
+
+    The runner, not this, ends the engine: it may keep it for the next segment.
+    """
+    await client.connect(feed.stream())
+    async for message in _turn_messages(
+        client, feed, resumed, stay=True, answered=answered
+    ):
+        yield message
+
+
+@dataclasses.dataclass
+class _WarmEngine:
+    """An engine that paused and stays running for the session's next segment.
+
+    The durable boundary is still the pause: the Workflow committed the checkpoint
+    before the engine waits here, so a lost warm engine only means a cold start that
+    resumes from the checkpoint.
+    """
+
+    client: Any
+    """The SDK's streaming client, connected to the engine."""
+    feed: _Feed
+    """The engine's input: the next segment's message goes here."""
+    session_id: str
+    checkpoint: str
+    """Where the engine paused: the next segment must continue exactly there."""
+    paused: str
+    """The call it paused at: the next segment must bring exactly its result."""
+    shape: str
+    """The agent's tools and settings: the next segment must have the same."""
+    hook_dir: str
+    lock: int | None
+    store: Any
+    """The session store the engine mirrors into."""
+    cost: float
+    """The engine's running cost total, to report each segment's own cost."""
+    version: str
+    ran_inside: list[str]
+    violations: list[str]
+    buffer: int
+    """The engine's ``max_buffer_size``: a bigger result needs a new engine."""
+    timer: asyncio.TimerHandle | None = None
+
+
+def _forget_local_copy(paths: tuple[Path, ...]) -> None:
+    """Remove the engine's own copy of a new session from its config folder.
+
+    Claude Code writes a new session's transcript (and tool outputs too large to show
+    Claude in full) under ``<config folder>/projects``; resumed sessions run in a
+    temporary folder the SDK removes. With the conversation in the Workflow, that
+    copy is never read again, so it does not stay on the Worker's disk. Only a copy
+    the engine created is removed (see ``_run_held``), once the engine ended (such an
+    engine never stays warm: see ``_parks``).
+    """
+    if not paths:
+        return
+    transcript, folder = paths
+    try:
+        transcript.unlink(missing_ok=True)
+    except OSError:
+        pass  # best effort, for example a file still open on Windows
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+def _next_hook_turn(hook_dir: str, injected: dict[str, Any]) -> None:
+    """Prepare a warm engine's hook folder for its next turn (a new segment).
+
+    The hook allows one paused call per segment and records its denials per segment;
+    the calls answered since the engine started are in ``answered`` (its environment
+    is fixed when it starts).
+    """
+    with contextlib.suppress(OSError):
+        os.remove(os.path.join(hook_dir, "paused_call"))
+    shutil.rmtree(os.path.join(hook_dir, "denied"), ignore_errors=True)
+    path = os.path.join(hook_dir, ANSWERED)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("".join(f"{call}\n" for call in injected))
+
+
+_ending: set[asyncio.Task[None]] = set()
+"""Warm engines being ended in the background (kept until done)."""
+
+
+def _engine_alive(client: Any) -> bool:
+    """Whether the engine behind a streaming client still runs."""
+    process = getattr(getattr(client, "_transport", None), "_process", None)
+    return process is not None and process.returncode is None
 
 
 # ---- the engine ends with its Worker ----
@@ -1455,6 +1578,8 @@ class ClaudeAgentSdkRunner:
         one_tool_at_a_time: bool = False,
         model: str | None = None,
         max_budget_usd: float | None = None,
+        warm_engines: int = 0,
+        warm_seconds: float = 30.0,
     ) -> None:
         """Create the runner.
 
@@ -1480,14 +1605,36 @@ class ClaudeAgentSdkRunner:
                 for durable tools: when Claude calls several at once, they all run.
             model: Default model when the agent does not set one.
             max_budget_usd: Cost cap per segment.
+            warm_engines: Experimental. How many paused engines this Worker keeps
+                running (0, the default: none). When the session's next segment
+                runs on this Worker within ``warm_seconds``, at the same checkpoint
+                and with only the result of the paused call, the result goes to the
+                running engine as its next message: no new engine starts and
+                resumes the session (with a local fake model, a tool round was
+                about 7 times faster: 100 ms instead of 740 ms). In any other case
+                (another Worker, a retry, a reset, a longer wait) the warm engine
+                ends and the segment resumes from the checkpoint as usual. Each
+                warm engine keeps its process and memory (a few hundred MB);
+                ``ClaudeAgentPlugin`` ends them when its Worker stops. No engine
+                stays warm for segments with ``max_turns`` or ``max_budget_usd``,
+                calls answered in one message, Claude Code tools run as their own
+                Activities, or a runner whose ``extra_options`` has hooks, a
+                permission or ``stderr`` callback, or in-process MCP servers; with
+                the conversation in the Workflow, neither does the engine that
+                starts it. A resumed engine runs ``PreToolUse`` hooks again for the
+                call whose result it gets; a warm one does not.
+            warm_seconds: How long a paused engine stays warm.
 
         Raises:
             ValueError: If ``extra_options`` sets an option the plugin manages, or
                 Claude Code and the SDK would derive different session keys for the
                 working directory (for example decomposed Unicode or emoji in its
-                path, or a path given in another form than its real one).
+                path, or a path given in another form than its real one), or
+                ``warm_engines`` is negative, or ``warm_seconds`` not positive.
         """
         _check_extra_options(extra_options or {})
+        if warm_engines < 0 or warm_seconds <= 0:
+            raise ValueError("warm_engines must be 0 or more, warm_seconds above 0")
         directory = cwd or os.getcwd()
         mismatch = _key_mismatch(directory)
         if mismatch is not None:
@@ -1505,6 +1652,10 @@ class ClaudeAgentSdkRunner:
         self._one_tool = one_tool_at_a_time
         self._model = model
         self._max_budget = max_budget_usd
+        self._warm_cap = warm_engines
+        self._warm_seconds = warm_seconds
+        self._warm: dict[tuple[str, str], _WarmEngine] = {}
+        """Paused engines by session and checkpoint (see ``warm_engines``)."""
         self.stub_calls = 0
         """Durable tools the engine ran itself. Stays 0 while the engine honors defer."""
         self._stand_in = StandInModel()
@@ -1702,6 +1853,142 @@ class ClaudeAgentSdkRunner:
             )
         return leaf, entries
 
+    def _may_park(self, inp: SegmentInput) -> bool:
+        """Whether this segment's engine may stay warm when it pauses.
+
+        Not with a limit on turns or cost: the engine counts them per run. Not with
+        hooks, a permission callback, a ``stderr`` callback or in-process MCP servers
+        in ``extra_options``: the SDK runs them in tasks of the segment that started
+        the engine, so in a later segment they would see that segment's Activity
+        (its info, heartbeats and cancellation).
+        """
+        servers = self._extra.get("mcp_servers")
+        return (
+            self._warm_cap > 0
+            and inp.max_turns is None
+            and self._max_budget is None
+            and not self._extra.get("hooks")
+            and self._extra.get("can_use_tool") is None
+            and self._extra.get("stderr") is None
+            and not (
+                isinstance(servers, dict)
+                and any(
+                    isinstance(c, dict) and c.get("type") == "sdk"
+                    for c in servers.values()
+                )
+            )
+        )
+
+    @staticmethod
+    def _shape(inp: SegmentInput) -> str:
+        """What an engine is started with that the next segment must share."""
+        return json.dumps(
+            [
+                inp.system_prompt,
+                inp.model,
+                [[t.name, t.description, t.input_schema] for t in inp.tools],
+                inp.builtin_tools,
+                inp.tool_activities,
+            ],
+            sort_keys=True,
+            default=str,
+        )
+
+    def _take_warm(
+        self, inp: SegmentInput, injected: dict[str, ToolOutcome], attempt: int
+    ) -> _WarmEngine | None:
+        """The warm engine this segment continues, taken from the pool, or None.
+
+        Never for a retry: an earlier attempt may still run somewhere and go on from
+        the same checkpoint; a retry starts a new engine, as without warm engines.
+        """
+        if inp.checkpoint is None:
+            return None
+        warm = self._warm.pop((inp.session_id, inp.checkpoint), None)
+        if warm is None:
+            return None
+        if warm.timer is not None:
+            warm.timer.cancel()
+        payload = sum(len(_text(_result_content(o))) for o in injected.values())
+        if (
+            attempt == 1
+            and inp.prompt is None
+            and not inp.fork
+            and self._may_park(inp)
+            and set(injected) == {warm.paused}
+            and warm.shape == self._shape(inp)
+            and 8 * payload <= warm.buffer
+            and _engine_alive(warm.client)
+        ):
+            return warm
+        self._end_warm(warm)
+        return None
+
+    def _park(self, warm: _WarmEngine) -> None:
+        """Keep a paused engine for ``warm_seconds``, ending the oldest beyond the cap."""
+        key = (warm.session_id, warm.checkpoint)
+        old = self._warm.pop(key, None)
+        if old is not None:
+            self._end_warm(old)
+        while self._warm and len(self._warm) >= self._warm_cap:
+            self._end_warm(self._warm.pop(next(iter(self._warm))))
+        self._warm[key] = warm
+        warm.timer = asyncio.get_running_loop().call_later(
+            self._warm_seconds, self._expire, key, warm
+        )
+
+    def _expire(self, key: tuple[str, str], warm: _WarmEngine) -> None:
+        if self._warm.get(key) is warm:
+            del self._warm[key]
+            self._end_warm(warm)
+
+    @staticmethod
+    def _end_warm(warm: _WarmEngine) -> None:
+        """End a warm engine in the background; its hook folder and lock go too.
+
+        The folder and the lock go once the ending task is done, also if it was
+        cancelled before it ran (an event loop that closes): the engine then gets
+        SIGTERM at once.
+        """
+        if warm.timer is not None:
+            warm.timer.cancel()
+        process = getattr(getattr(warm.client, "_transport", None), "_process", None)
+        resumed = getattr(warm.client, "_materialized", None)
+        task = asyncio.ensure_future(_disconnect(warm.client))
+        _ending.add(task)
+
+        def ended(task: asyncio.Task[None]) -> None:
+            _ending.discard(task)
+            _stop_now(process, resumed)
+            _release_worker_lock(warm.lock)
+            shutil.rmtree(warm.hook_dir, ignore_errors=True)
+
+        task.add_done_callback(ended)
+
+    async def _ends_at_checkpoint(self, inp: SegmentInput) -> bool:
+        """Whether the shared session still ends at the segment's checkpoint.
+
+        A warm engine knows the session as it left it. When a segment from the same
+        checkpoint ran on another Worker (a retry, or a reset), the session went on
+        there, and only a new engine continues it right (in a copy, ``_SessionMoved``).
+        """
+        key = {
+            "project_key": project_key_for_directory(self._cwd),
+            "session_id": inp.session_id,
+        }
+        entries = cast("list[Any]", await self._store.load(key) or [])
+        return _last_entry(entries) == inp.checkpoint
+
+    def _end_all_warm(self) -> None:
+        """End every warm engine, each in a task of its own (the Worker stopped).
+
+        Nothing waits for them here: ``async with Worker`` cancels the Worker's run
+        once it shut down, and a run that still waited would then cancel the code
+        that comes after the ``async with`` block.
+        """
+        while self._warm:
+            self._end_warm(self._warm.pop(next(iter(self._warm))))
+
     async def run(self, inp: SegmentInput, attempt: int) -> SegmentOutput:
         """Run one segment until Claude pauses at a durable tool call or finishes.
 
@@ -1735,6 +2022,27 @@ class ClaudeAgentSdkRunner:
                 f"Session {inp.session_id} is kept in its Workflow, but this Worker's "
                 "runner has a session store. Every Worker of a task queue needs the "
                 "same choice: create this runner without session_store. Retrying."
+            )
+        warm = self._take_warm(inp, injected, attempt)
+        if warm is not None:
+            try:
+                fresh = await self._ends_at_checkpoint(inp)
+            except BaseException:
+                self._end_warm(warm)
+                raise
+            if not fresh:
+                self._end_warm(warm)
+                warm = None
+        if warm is not None:
+            return await self._run_engine(
+                inp,
+                injected,
+                warm.session_id,
+                True,
+                warm.store,
+                guard=inp.checkpoint,
+                delivered=set(),
+                warm=warm,
             )
         session_id, resume, delivered = await self._start(inp, attempt, injected)
         if resume and len(injected) == len(delivered) and inp.prompt is None:
@@ -1773,6 +2081,32 @@ class ClaudeAgentSdkRunner:
         what the Workflow committed.
         """
         committed = await read_conversation(inp)
+        warm = self._take_warm(inp, injected, attempt)
+        if warm is not None:
+            try:
+                # The conversation must hold the checkpoint, and no calls answered in
+                # the same message (their results go into the conversation, which
+                # only a new engine reads).
+                clean = (
+                    bool(committed)
+                    and _seed(committed, warm.checkpoint) is not None
+                    and _deliver(committed, warm.checkpoint, injected) is None
+                )
+            except BaseException:
+                self._end_warm(warm)
+                raise
+            if clean:
+                return await self._run_engine(
+                    inp,
+                    injected,
+                    warm.session_id,
+                    True,
+                    warm.store,
+                    committed=committed,
+                    delivered=set(),
+                    warm=warm,
+                )
+            self._end_warm(warm)
         delivered: set[str] = set()  # results the seed already holds
         if inp.checkpoint is None:
             if committed:
@@ -1827,20 +2161,18 @@ class ClaudeAgentSdkRunner:
             await store.append(key, seed)  # type: ignore[arg-type]
         # A copy that is already there is not this run's (Claude Code then refuses the
         # session id), so it stays.
-        ours = not resume and not any(p.exists() for p in self._local_copy(session_id))
-        try:
-            return await self._run_engine(
-                inp,
-                injected,
-                session_id,
-                resume,
-                store,
-                committed=committed,
-                delivered=delivered,
-            )
-        finally:
-            if ours:
-                self._forget_local_copy(session_id)
+        local = self._local_copy(session_id)
+        ours = not resume and not any(p.exists() for p in local)
+        return await self._run_engine(
+            inp,
+            injected,
+            session_id,
+            resume,
+            store,
+            committed=committed,
+            delivered=delivered,
+            local_copy=local if ours else (),
+        )
 
     async def run_tool_step(self, step: ToolStepInput, attempt: int) -> ToolOutcome:
         """Run one Claude Code tool call that paused a segment, as its own Activity.
@@ -2077,25 +2409,6 @@ class ClaudeAgentSdkRunner:
         )
         return folder / f"{session_id}.jsonl", folder / session_id
 
-    def _forget_local_copy(self, session_id: str) -> None:
-        """Remove the engine's own copy of a new session from its config folder.
-
-        Claude Code writes a new session's transcript (and tool outputs too large to
-        show Claude in full) under ``<config folder>/projects``; resumed sessions run
-        in a temporary folder the SDK removes. With the conversation in the Workflow,
-        that copy is never read again, so it does not stay on the Worker's disk. Only
-        a copy this run created is removed (see ``_run_held``).
-        """
-        paths = self._local_copy(session_id)
-        if not paths:
-            return
-        transcript, folder = paths
-        try:
-            transcript.unlink(missing_ok=True)
-        except OSError:
-            pass  # best effort, for example a file still open on Windows
-        shutil.rmtree(folder, ignore_errors=True)
-
     async def _run_engine(
         self,
         inp: SegmentInput,
@@ -2107,6 +2420,8 @@ class ClaudeAgentSdkRunner:
         guard: str | None = None,
         committed: list[dict[str, Any]] | None = None,
         delivered: set[str] | None = None,
+        warm: _WarmEngine | None = None,
+        local_copy: tuple[Path, ...] = (),
     ) -> SegmentOutput:
         """Run the engine once, on the session in ``store``.
 
@@ -2121,101 +2436,265 @@ class ClaudeAgentSdkRunner:
                 output then says what changed in it.
             delivered: Calls whose results the session already holds (see
                 ``_deliver``); the others go in the message that resumes it.
+            warm: An engine still running since it paused at the call whose result
+                is in ``injected`` (see ``warm_engines``): the results go to it as
+                its next message, instead of a new engine resuming the session.
+            local_copy: The engine's own copy of the new session it starts, to
+                remove once the engine ended (see ``_forget_local_copy``).
 
         Raises:
             _SessionMoved: If the session does not end at ``guard``.
         """
-        # Durable tools the engine ran itself (must stay empty).
-        ran_inside: list[str] = []
-        violations: list[str] = []  # decisions hooks in extra_options tried to make
-        hook_dir = _hook_folder()
-        options = self._engine_options(
-            inp,
-            injected,
-            session_id,
-            resume,
-            store,
-            guard,
-            hook_dir,
-            self._durable_server(inp.tools, ran_inside),
-            violations,
-        )
-        # A command that runs inside the segment sees none of the plugin's variables.
-        options["env"] = _command_env(options["env"], hook_dir, self._cwd, {}, {})
-        prompt: Any
-        in_message = {k: v for k, v in injected.items() if k not in (delivered or ())}
-        if not resume:
-            prompt = inp.prompt or ""
-        elif in_message:
-            prompt = self._user_message(session_id, in_message, inp.prompt)
-        else:
-            prompt = inp.prompt  # a new task on the session
-
+        options: dict[str, Any] = {}
+        hook_dir = warm.hook_dir if warm is not None else _hook_folder()
+        # Durable tools the engine ran itself (must stay empty), and decisions hooks
+        # in extra_options tried to make.
+        ran_inside: list[str] = warm.ran_inside if warm is not None else []
+        violations: list[str] = warm.violations if warm is not None else []
         result: ResultMessage | None = None
-        engine_version = "(unknown version)"
+        # A warm engine reported its version when it started.
+        engine_version = warm.version if warm is not None else "(unknown version)"
         paused_by_hook: str | None = None
         last_assistant: str | None = None
         store_error: str | None = None
         stopped_by_hook = False
         denials: dict[str, str] = {}
-        lock: int | None = None
-        # When the Activity is cancelled or times out, deny every later tool call
-        # while the SDK shuts the engine down.
-        stopper = (
-            asyncio.ensure_future(_stop_hooks_when_cancelled(hook_dir))
-            if activity.in_activity()
-            else None
-        )
-        joining = _join_job_while_starting()
+        lock: int | None = warm.lock if warm is not None else None
+        # The engine's client and input when it may stay warm (see warm_engines).
+        client: Any = warm.client if warm is not None else None
+        feed: _Feed | None = warm.feed if warm is not None else None
+        parked = False
+        stopper: asyncio.Future[None] | None = None
+        joining: Any = None
         try:
-            lock = _hold_worker_lock(hook_dir)
-            engine = _engine_messages(options, await _as_messages(prompt), resume)
-            async with contextlib.aclosing(engine) as messages:
-                async for message in messages:
-                    if joining is not None and not joining.done():
-                        joining.cancel()
-                        _engines_end_with_worker()
-                    if isinstance(message, MirrorErrorMessage):
-                        store_error = message.error or "unknown error"
-                    elif (
-                        isinstance(message, SystemMessage) and message.subtype == "init"
-                    ):
-                        version = message.data.get("claude_code_version")
-                        engine_version = str(version or engine_version)
-                    elif (
-                        isinstance(message, AssistantMessage)
-                        and message.parent_tool_use_id is None  # not a subagent's
-                    ):
-                        last_assistant = message.uuid or last_assistant
-                        for block in message.content:
-                            if isinstance(block, TextBlock) and block.text.strip():
-                                emit({"type": "text", "text": block.text})
-                    elif isinstance(message, UserMessage):
-                        stopped_by_hook = stopped_by_hook or _hook_said_stopped(message)
-                    elif isinstance(message, ResultMessage):
-                        result = message
-            marker = Path(hook_dir) / "paused_call"  # written when the hook defers
-            if marker.exists():
-                paused_by_hook = marker.read_text(encoding="utf-8").strip() or None
-            denials = _hook_denials(hook_dir)
-        except ResultError as err:
-            final = err.subtype in FINAL_RESULT_ERRORS or _final_api_error(err)
-            if not final:
-                raise  # other engine errors: let Temporal retry the segment
-            # Retrying will not help.
-            return SegmentOutput(session_id=session_id, is_error=True, error=str(err))
-        except RuntimeError as err:
-            if _moved(err):
-                raise _SessionMoved(str(err)) from err
-            raise
+            if warm is None:
+                options = self._engine_options(
+                    inp,
+                    injected,
+                    session_id,
+                    resume,
+                    store,
+                    guard,
+                    hook_dir,
+                    self._durable_server(inp.tools, ran_inside),
+                    violations,
+                )
+                # A command run inside the segment sees none of the plugin's variables.
+                options["env"] = _command_env(
+                    options["env"], hook_dir, self._cwd, {}, {}
+                )
+            else:
+                ran_inside.clear()
+                violations.clear()
+                _next_hook_turn(hook_dir, injected)
+            prompt: Any
+            in_message = {
+                k: v for k, v in injected.items() if k not in (delivered or ())
+            }
+            if not resume:
+                prompt = inp.prompt or ""
+            elif in_message:
+                prompt = self._user_message(session_id, in_message, inp.prompt)
+            else:
+                prompt = inp.prompt  # a new task on the session
+            # When the Activity is cancelled or times out, deny every later tool call
+            # while the SDK shuts the engine down.
+            if activity.in_activity():
+                stopper = asyncio.ensure_future(_stop_hooks_when_cancelled(hook_dir))
+            try:
+                messages: AsyncGenerator[Any, None]
+                if warm is not None:  # a warm engine: its next message
+                    assert feed is not None
+                    feed.put(await _as_messages(prompt))
+                    messages = _turn_messages(
+                        client, feed, False, stay=True, answered=set(injected)
+                    )
+                else:
+                    joining = _join_job_while_starting()
+                    lock = _hold_worker_lock(hook_dir)
+                    first = await _as_messages(prompt)
+                    if self._may_park(inp) and not local_copy:
+                        feed = _Feed(first)
+                        client = ClaudeSDKClient(ClaudeAgentOptions(**options))
+                        messages = _connected(client, feed, resume, set(injected))
+                    else:
+                        messages = _engine_messages(options, first, resume)
+                async with contextlib.aclosing(messages):
+                    async for message in messages:
+                        if joining is not None and not joining.done():
+                            joining.cancel()
+                            _engines_end_with_worker()
+                        if isinstance(message, MirrorErrorMessage):
+                            store_error = message.error or "unknown error"
+                        elif (
+                            isinstance(message, SystemMessage)
+                            and message.subtype == "init"
+                        ):
+                            version = message.data.get("claude_code_version")
+                            engine_version = str(version or engine_version)
+                        elif (
+                            isinstance(message, AssistantMessage)
+                            and message.parent_tool_use_id is None  # not a subagent's
+                        ):
+                            last_assistant = message.uuid or last_assistant
+                            for block in message.content:
+                                if isinstance(block, TextBlock) and block.text.strip():
+                                    emit({"type": "text", "text": block.text})
+                        elif isinstance(message, UserMessage):
+                            stopped_by_hook = stopped_by_hook or _hook_said_stopped(
+                                message
+                            )
+                        elif isinstance(message, ResultMessage):
+                            result = message
+                marker = Path(hook_dir) / "paused_call"  # written when the hook defers
+                if marker.exists():
+                    paused_by_hook = marker.read_text(encoding="utf-8").strip() or None
+                denials = _hook_denials(hook_dir)
+            except ResultError as err:
+                final = err.subtype in FINAL_RESULT_ERRORS or _final_api_error(err)
+                if not final:
+                    raise  # other engine errors: let Temporal retry the segment
+                # Retrying will not help.
+                return SegmentOutput(
+                    session_id=session_id, is_error=True, error=str(err)
+                )
+            except RuntimeError as err:
+                if _moved(err):
+                    raise _SessionMoved(str(err)) from err
+                raise
+            finally:
+                if stopper is not None:
+                    stopper.cancel()
+                if joining is not None:
+                    joining.cancel()
+            if warm is not None and result is None:
+                # The engine ended after it was taken (it was alive then): a new
+                # engine can do the step.
+                raise RuntimeError(
+                    "The warm engine ended before its turn's result. Retrying."
+                )
+            out = await self._segment_output(
+                inp,
+                injected,
+                session_id,
+                resume,
+                store,
+                guard,
+                committed,
+                warm,
+                ran_inside,
+                violations,
+                hook_dir,
+                result,
+                engine_version,
+                paused_by_hook,
+                last_assistant,
+                store_error,
+                stopped_by_hook,
+                denials,
+            )
+            if feed is not None and self._parks(
+                out, hook_dir, client, local_copy, denials
+            ):
+                assert out.deferred is not None and out.checkpoint is not None
+                assert result is not None
+                self._park(
+                    _WarmEngine(
+                        client=client,
+                        feed=feed,
+                        session_id=out.session_id,
+                        checkpoint=out.checkpoint,
+                        paused=out.deferred.id,
+                        shape=self._shape(inp),
+                        hook_dir=hook_dir,
+                        lock=lock,
+                        store=store,
+                        cost=float(result.total_cost_usd or 0.0),
+                        version=engine_version,
+                        ran_inside=ran_inside,
+                        violations=violations,
+                        buffer=(
+                            warm.buffer
+                            if warm is not None
+                            else int(options["max_buffer_size"])
+                        ),
+                    )
+                )
+                parked = True
+            return out
         finally:
-            if stopper is not None:
-                stopper.cancel()
-            if joining is not None:
-                joining.cancel()
-            _release_worker_lock(lock)
-            shutil.rmtree(hook_dir, ignore_errors=True)  # the hook denies from now on
+            if not parked:
+                try:
+                    if client is not None:
+                        await _disconnect(client)
+                finally:
+                    _release_worker_lock(lock)
+                    # The hook denies from now on.
+                    shutil.rmtree(hook_dir, ignore_errors=True)
+                    _forget_local_copy(local_copy)
 
+    def _parks(
+        self,
+        out: SegmentOutput,
+        hook_dir: str,
+        client: Any,
+        local_copy: tuple[Path, ...],
+        denials: dict[str, str],
+    ) -> bool:
+        """Whether an engine that just ran stays warm: it paused at one durable call,
+        cleanly.
+
+        Not at a Claude Code tool that runs as its own Activity (a tool step): a new
+        engine checks such a call again when its result arrives, and a running one
+        does not (tested: an Edit run apart is refused on resume, and taken by a
+        running engine). So that result always goes to a new engine.
+
+        Not an engine that started a conversation the Workflow holds: it writes the
+        conversation to its own config folder (``_forget_local_copy``), and a Worker
+        that dies while it waits would leave it there. A resumed engine runs in a
+        temporary folder, as each segment's engine does today.
+
+        Not after the hook denied a call in the same turn: the denial comes after the
+        pause in the session, so the next segment needs a new engine anyway.
+        """
+        return (
+            not local_copy
+            and not denials
+            and out.deferred is not None
+            and out.deferred.kind == "durable"
+            and not out.is_error
+            and not out.siblings
+            and out.checkpoint is not None
+            and not os.path.exists(os.path.join(hook_dir, "stop"))
+            and _engine_alive(client)
+        )
+
+    async def _segment_output(
+        self,
+        inp: SegmentInput,
+        injected: dict[str, ToolOutcome],
+        session_id: str,
+        resume: bool,
+        store: Any,
+        guard: str | None,
+        committed: list[dict[str, Any]] | None,
+        warm: _WarmEngine | None,
+        ran_inside: list[str],
+        violations: list[str],
+        hook_dir: str,
+        result: ResultMessage | None,
+        engine_version: str,
+        paused_by_hook: str | None,
+        last_assistant: str | None,
+        store_error: str | None,
+        stopped_by_hook: bool,
+        denials: dict[str, str],
+    ) -> SegmentOutput:
+        """What one engine run committed: the pause or the answer, or why it failed.
+
+        Raises:
+            RuntimeError: If the turn did not reach the session store (retried).
+        """
         violation = _hook_violation(violations)
         if violation is not None:
             return SegmentOutput(session_id=session_id, is_error=True, error=violation)
@@ -2250,6 +2729,8 @@ class ClaudeAgentSdkRunner:
             )
         sid = result.session_id or session_id
         cost = float(result.total_cost_usd or 0.0)
+        if warm is not None and cost >= warm.cost:
+            cost -= warm.cost  # a warm engine reports its running total
         deferred = result.deferred_tool_use
         broken = self._pause_contract_problem(
             ran_inside,
