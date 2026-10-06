@@ -309,6 +309,114 @@ async def test_real_engine_an_mcp_tool_runs_as_its_own_activity(
     assert api.errors == []
 
 
+def notes_server(calls: list[str], hold_first: float) -> Any:
+    """An in-process MCP server whose ``add_note`` records the ``tool_use_id`` that
+    Claude Code sends with each call, and holds the first call ``hold_first`` seconds."""
+    import mcp.types
+    from claude_agent_sdk._internal._mcp_compat import MCP_MAJOR
+    from mcp.server import Server
+
+    tool = mcp.types.Tool.model_validate(  # the wire names: the same in mcp 1 and 2
+        {
+            "name": "add_note",
+            "description": "Add a note.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+            },
+        }
+    )
+
+    def call_id(meta: Any) -> str:
+        if hasattr(meta, "model_dump"):
+            meta = meta.model_dump(by_alias=True)
+        return str((meta or {}).get("claudecode/toolUseId"))
+
+    async def add(meta: Any, arguments: dict[str, Any]) -> mcp.types.CallToolResult:
+        calls.append(call_id(meta))
+        if len(calls) == 1:
+            await asyncio.sleep(hold_first)
+        return mcp.types.CallToolResult(
+            content=[
+                mcp.types.TextContent(type="text", text=f"noted {arguments['text']}")
+            ]
+        )
+
+    if MCP_MAJOR >= 2:
+
+        async def on_list_tools(ctx: Any, params: Any) -> mcp.types.ListToolsResult:
+            del ctx, params
+            return mcp.types.ListToolsResult(tools=[tool])
+
+        async def on_call_tool(ctx: Any, params: Any) -> mcp.types.CallToolResult:
+            return await add(ctx.meta, dict(params.arguments or {}))
+
+        server: Any = Server(  # type: ignore[call-arg]
+            "notes", on_list_tools=on_list_tools, on_call_tool=on_call_tool
+        )
+    else:
+        server = Server("notes")
+
+        async def list_tools() -> list[mcp.types.Tool]:
+            return [tool]
+
+        async def call_tool(name: str, arguments: dict[str, Any]) -> Any:
+            del name
+            return await add(server.request_context.meta, arguments)
+
+        server.list_tools()(list_tools)  # mcp 1 registers with decorators
+        server.call_tool(validate_input=False)(call_tool)
+
+    return {"type": "sdk", "name": "notes", "instance": server}
+
+
+@pytest.mark.parametrize("repeatable", [False, True], ids=["once", "repeatable"])
+async def test_real_engine_an_mcp_server_gets_the_calls_own_id_in_every_attempt(
+    client: Client, tmp_path: Path, repeatable: bool
+) -> None:
+    """Claude Code sends each MCP call its ``tool_use_id``
+    (``_meta["claudecode/toolUseId"]``); a tool step runs the original call, so the
+    server sees the same id in every attempt and can recognize a repeated call.
+    The first call outlives its step: a repeatable tool's step is retried, with the
+    same id; otherwise the call is not run again."""
+    calls: list[str] = []
+    api = start_with_policy(shell_policy)
+    runner = make_runner(
+        tmp_path,
+        api,
+        extra_options={"mcp_servers": {"notes": notes_server(calls, hold_first=90)}},
+    )
+    queue = f"meta-{uuid.uuid4().hex[:8]}"
+    options = ShellOptions(
+        tool_timeout=30, repeatable_tools=["mcp__notes__*"] if repeatable else []
+    )
+    try:
+        async with worker(client, queue, runner):
+            result = await client.execute_workflow(
+                ShellWorkflow.run,
+                args=["note: buy milk", options],
+                id=queue,
+                task_queue=queue,
+            )
+            steps = [
+                i
+                for n, i in await activity_types(client.get_workflow_handle(queue))
+                if n.endswith("tool_step")
+            ]
+    finally:
+        api.stop()
+    assert len(steps) == 1 and steps[0].startswith("tool-toolu_")
+    tool_use_id = steps[0].removeprefix("tool-")
+    if repeatable:
+        assert result == "noted buy milk" and calls == [tool_use_id, tool_use_id]
+    else:
+        assert result.startswith(
+            "error: This call was interrupted (its step timed out), so it may have run"
+        )
+        assert calls == [tool_use_id]
+    assert api.errors == []
+
+
 @pytest.mark.parametrize("order", ["bash first", "count first"])
 async def test_real_engine_bash_and_a_durable_tool_in_one_message(
     client: Client, tmp_path: Path, order: str
