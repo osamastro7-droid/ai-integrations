@@ -18,7 +18,9 @@ from claude_agent_sdk import HookMatcher, ToolResultBlock, UserMessage
 
 from temporalio.claude_agent_sdk import ClaudeAgentSdkRunner, ToolOutcome
 from temporalio.claude_agent_sdk import _defer_hook as hook
+from temporalio.claude_agent_sdk import _launcher as launcher
 from temporalio.claude_agent_sdk import _runner as runner
+from temporalio.exceptions import ApplicationError
 
 PREFIX = runner.PREFIX
 
@@ -257,10 +259,12 @@ async def test_an_engine_that_cannot_run_reports_no_version(tmp_path: Path) -> N
 @pytest.mark.skipif(
     sys.platform == "win32", reason="Windows starts the engine directly"
 )
-async def test_a_launcher_that_cannot_run_falls_back_with_a_warning(
+async def test_a_launcher_that_cannot_run_stops_the_step_and_is_checked_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """For example a temporary folder mounted noexec: the engine starts directly."""
+    """For example a temporary folder mounted noexec. By default the engine must end
+    with its Worker, so the step stops (retryable), and the next step checks again:
+    once the folder is fixed, the launcher is used."""
     script = tmp_path / "launch"
     script.write_text("#!/bin/sh\nexit 0\n")  # not executable
     written: list[str] = []
@@ -274,12 +278,82 @@ async def test_a_launcher_that_cannot_run_falls_back_with_a_warning(
     configured = ClaudeAgentSdkRunner(
         cwd=str(tmp_path), cli_path="/bin/true", env={"ANTHROPIC_API_KEY": "x"}
     )
-    with pytest.warns(UserWarning, match=f"cannot run {script}, so Claude Code"):
+    for _ in range(2):
+        with pytest.raises(ApplicationError) as raised:
+            await configured._launch_path()
+        assert raised.value.type == runner.CLEANUP_UNAVAILABLE
+        assert not raised.value.non_retryable
+        assert f"cannot run {script} (" in str(raised.value)
+    assert written == ["/bin/true", "/bin/true"] and runner._launch_scripts == {}
+    script.write_text(  # the folder allows running programs again
+        f'#!/bin/sh\n[ "$1" = {launcher.CHECK} ] && echo ok\n'
+    )
+    script.chmod(0o700)
+    assert await configured._launch_path() == str(script)
+    assert runner._launch_scripts == {"/bin/true": str(script)}
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows starts the engine directly"
+)
+async def test_a_launcher_that_cannot_run_falls_back_with_a_warning_in_best_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``engine_cleanup="best_effort"``: the engine starts directly, with a warning
+    that says so, and the script is checked once."""
+    script = tmp_path / "launch"
+    script.write_text("#!/bin/sh\nexit 0\n")  # not executable
+    written: list[str] = []
+
+    def write(engine: str) -> str:
+        written.append(engine)
+        return str(script)
+
+    monkeypatch.setattr(runner, "_launch_scripts", {})
+    monkeypatch.setattr(runner, "_write_launch_script", write)
+    monkeypatch.setattr(runner, "_warned", set())
+    configured = ClaudeAgentSdkRunner(
+        cwd=str(tmp_path),
+        cli_path="/bin/true",
+        env={"ANTHROPIC_API_KEY": "x"},
+        engine_cleanup="best_effort",
+    )
+    with pytest.warns(
+        UserWarning, match=f"cannot run {script} .*Going on anyway, because engine"
+    ):
         assert await configured._launch_path() is None
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # checked once: no second warning
         assert await configured._launch_path() is None
     assert written == ["/bin/true"] and runner._launch_scripts == {"/bin/true": None}
+
+
+async def test_a_required_runner_checks_a_launcher_a_best_effort_one_gave_up_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runners in one Worker process share the checked scripts: a failure that a
+    best-effort runner accepted never lets a required one start without the check."""
+    monkeypatch.setattr(runner, "_launch_scripts", {"/bin/true": None})
+    monkeypatch.setattr(
+        runner, "_write_launch_script", lambda engine: str(tmp_path / "missing")
+    )
+    configured = ClaudeAgentSdkRunner(
+        cwd=str(tmp_path), cli_path="/bin/true", env={"ANTHROPIC_API_KEY": "x"}
+    )
+    if sys.platform == "win32":
+        assert await configured._launch_path() is None
+        return
+    with pytest.raises(ApplicationError):
+        await configured._launch_path()
+
+
+def test_engine_cleanup_must_be_required_or_best_effort(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="engine_cleanup"):
+        ClaudeAgentSdkRunner(
+            cwd=str(tmp_path),
+            env={"ANTHROPIC_API_KEY": "x"},
+            engine_cleanup="off",  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.skipif(

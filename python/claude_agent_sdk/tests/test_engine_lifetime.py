@@ -34,6 +34,7 @@ from temporalio.claude_agent_sdk import (
     _runner,
 )
 from temporalio.client import Client
+from temporalio.exceptions import ApplicationError
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
 from tests.helpers.processes import alive, descendants
 from tests.refund.policy import refund_policy
@@ -110,7 +111,7 @@ def test_hook_decides_as_usual_while_the_worker_holds_its_lock(
     run_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("TCA_TOOL_ACTIVITIES", "Bash")
-    lock = _runner._hold_worker_lock(str(run_dir))
+    lock = _runner._hold_worker_lock(str(run_dir), required=True)
     try:
         assert decision("Glob", "t1") == "run"
         assert decision("Bash", "t2") == "defer"
@@ -124,7 +125,7 @@ def test_hook_stops_once_the_worker_is_gone(
     """Nothing holds the lock: the Worker died. Built-in tools are denied; a durable
     call still defers, which ends the run (no one runs it); a tool step runs nothing."""
     monkeypatch.setenv("TCA_TOOL_ACTIVITIES", "Bash")
-    _runner._release_worker_lock(_runner._hold_worker_lock(str(run_dir)))
+    _runner._release_worker_lock(_runner._hold_worker_lock(str(run_dir), required=True))
     assert decision("Glob", "t1") == "deny"
     assert decision("mcp__durable__count", "t2") == "defer"
     monkeypatch.setenv("TCA_ALLOW_ID", "t3")
@@ -138,20 +139,37 @@ def test_hook_without_a_lock_file_decides_as_before(run_dir: Path) -> None:
     assert decision("Glob") == "run"
 
 
-def test_where_files_cannot_be_locked_steps_still_run(
+def refuse_locks(fd: int) -> None:
+    """Like some network and FUSE file systems."""
+    del fd
+    raise OSError(errno.ENOLCK, "No locks available")
+
+
+def test_where_files_cannot_be_locked_the_step_stops(
     run_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Some network and FUSE file systems refuse locks: the step runs, without the
-    lock file (so the hook takes the Worker to be there), and a warning says so."""
+    """Without the lock the hook could not tell that a dead Worker's engine should
+    stop, so by default (``engine_cleanup="required"``) the step stops, before the
+    engine starts, with an error that says what to fix."""
+    monkeypatch.setattr(_runner, "_lock_file", refuse_locks)
+    with pytest.raises(ApplicationError) as raised:
+        _runner._hold_worker_lock(str(run_dir), required=True)
+    assert raised.value.type == _runner.CLEANUP_UNAVAILABLE
+    assert not raised.value.non_retryable  # another Worker can run the step
+    assert "cannot lock files" in str(raised.value) and "TMPDIR" in str(raised.value)
+    assert 'engine_cleanup="best_effort"' in str(raised.value)
+    assert not (run_dir / _defer_hook.WORKER_LOCK).exists()
 
-    def refuse(fd: int) -> None:
-        del fd
-        raise OSError(errno.ENOLCK, "No locks available")
 
-    monkeypatch.setattr(_runner, "_lock_file", refuse)
+def test_where_files_cannot_be_locked_a_best_effort_step_still_runs(
+    run_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``engine_cleanup="best_effort"``: the step runs, without the lock file (so the
+    hook takes the Worker to be there), and a warning says so."""
+    monkeypatch.setattr(_runner, "_lock_file", refuse_locks)
     monkeypatch.setattr(_runner, "_warned", set())
     with pytest.warns(UserWarning, match="cannot lock files"):
-        lock = _runner._hold_worker_lock(str(run_dir))
+        lock = _runner._hold_worker_lock(str(run_dir), required=False)
     assert lock is None and not (run_dir / _defer_hook.WORKER_LOCK).exists()
     _runner._release_worker_lock(lock)
     assert decision("Glob") == "run"
@@ -163,7 +181,7 @@ def test_hooks_that_test_the_lock_together_both_see_the_worker_gone(
 ) -> None:
     """Hooks of calls Claude Code runs together test the lock at the same time: one
     hook's test must not look like the Worker to another."""
-    _runner._release_worker_lock(_runner._hold_worker_lock(str(run_dir)))
+    _runner._release_worker_lock(_runner._hold_worker_lock(str(run_dir), required=True))
     other = os.open(run_dir / _defer_hook.WORKER_LOCK, os.O_RDWR)
     try:
         if sys.platform != "win32":
@@ -509,3 +527,145 @@ async def test_real_engine_ends_with_its_worker(
         with contextlib.suppress(Exception):
             await handle.terminate()
         api.stop()
+
+
+def refund_step() -> SegmentInput:
+    return SegmentInput(
+        session_id=str(uuid.uuid4()),
+        prompt="Order A-1001 arrived broken, I want my money back.",
+        tools=REFUND_TOOLS,
+        transcript=[],
+    )
+
+
+def noexec_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Launcher scripts that cannot run, like those in a folder mounted noexec."""
+    written: list[str] = []
+
+    def write(engine: str) -> str:
+        script = tmp_path / f"launch-{len(written)}"
+        script.write_text("#!/bin/sh\nexit 0\n")  # not executable
+        written.append(engine)
+        return str(script)
+
+    monkeypatch.setattr(_runner, "_launch_scripts", {})
+    monkeypatch.setattr(_runner, "_write_launch_script", write)
+    return written
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [
+        pytest.param("launcher", marks=posix_only),
+        "lock",
+    ],
+)
+async def test_real_engine_a_step_without_its_cleanup_stops_before_claude_code_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str
+) -> None:
+    """The default ``engine_cleanup="required"``: a step whose engine could not end
+    with its Worker process stops before Claude Code starts (no model request), and
+    the error says what to fix. A launcher check that failed is made again by the
+    next step, so a fixed Worker goes on."""
+    written = noexec_launcher(tmp_path, monkeypatch) if cause == "launcher" else []
+    if cause == "lock":
+        monkeypatch.setattr(_runner, "_lock_file", refuse_locks)
+    api = start_with_policy(refund_policy)
+    (tmp_path / "work").mkdir()
+    runner = ClaudeAgentSdkRunner(
+        cwd=str(tmp_path / "work"), env=engine_env(api, str(tmp_path / "cfg"))
+    )
+    try:
+        for _ in range(2):
+            with pytest.raises(ApplicationError) as raised:
+                await runner.run(refund_step(), 1)
+            assert raised.value.type == _runner.CLEANUP_UNAVAILABLE
+            assert not raised.value.non_retryable
+            assert (
+                "cannot run" if cause == "launcher" else "cannot lock files"
+            ) in str(raised.value)
+    finally:
+        api.stop()
+    assert api.requests == []  # Claude Code never ran
+    assert len(written) == (2 if cause == "launcher" else 0)  # checked again
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [
+        pytest.param("launcher", marks=posix_only),
+        "lock",
+        "job",
+    ],
+)
+async def test_real_engine_best_effort_cleanup_runs_the_step_with_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str
+) -> None:
+    """``engine_cleanup="best_effort"`` keeps the old behavior: the step runs, and a
+    warning says that a dead Worker's engine would finish its turn."""
+    if cause == "launcher":
+        noexec_launcher(tmp_path, monkeypatch)
+    elif cause == "lock":
+        monkeypatch.setattr(_runner, "_lock_file", refuse_locks)
+    else:
+        monkeypatch.setattr(
+            _runner,
+            "_engines_end_with_worker",
+            lambda: {0: _runner._job_problem("cannot put Claude Code in the job")},
+        )
+    monkeypatch.setattr(_runner, "_warned", set())
+    api = start_with_policy(refund_policy)
+    (tmp_path / "work").mkdir()
+    runner = ClaudeAgentSdkRunner(
+        cwd=str(tmp_path / "work"),
+        env=engine_env(api, str(tmp_path / "cfg")),
+        engine_cleanup="best_effort",
+    )
+    try:
+        with pytest.warns(UserWarning, match="Going on anyway, because engine_cleanup"):
+            out = await runner.run(refund_step(), 1)
+    finally:
+        api.stop()
+    assert out.deferred is not None and out.deferred.name == "look_up_order"
+    assert api.errors == []
+
+
+async def test_real_engine_an_engine_outside_the_workers_job_is_ended(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows can fail to put an engine in the Worker's job object only after the
+    engine started. By default the step then ends the engine and stops, so no engine
+    runs that would outlive its Worker. (The failure is simulated here, on every
+    system.)"""
+    from claude_agent_sdk._internal.transport import subprocess_cli
+
+    started: list[int] = []
+
+    def outside_the_job() -> dict[int, str]:
+        failed: dict[int, str] = {}
+        for child in subprocess_cli._ACTIVE_CHILDREN:
+            pid = getattr(child, "pid", None)
+            if isinstance(pid, int) and alive(pid):
+                started.append(pid)
+                failed[pid] = _runner._job_problem(
+                    "cannot put Claude Code in the job object (Windows error 5)"
+                )
+        return failed
+
+    monkeypatch.setattr(_runner, "_engines_end_with_worker", outside_the_job)
+    monkeypatch.setattr(_runner, "_JOB_POLL", True)  # as on Windows
+    api = start_with_policy(refund_policy)
+    (tmp_path / "work").mkdir()
+    runner = ClaudeAgentSdkRunner(
+        cwd=str(tmp_path / "work"), env=engine_env(api, str(tmp_path / "cfg"))
+    )
+    try:
+        with pytest.raises(ApplicationError) as raised:
+            await runner.run(refund_step(), 1)
+    finally:
+        api.stop()
+    assert raised.value.type == _runner.CLEANUP_UNAVAILABLE
+    assert "Windows error 5" in str(raised.value)
+    assert started, "the engine had started"
+    assert api.requests == []  # ended within milliseconds: it asked Claude nothing
+    await wait_until(lambda: not [pid for pid in started if alive(pid)], timeout=15)

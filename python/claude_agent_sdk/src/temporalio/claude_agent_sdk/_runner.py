@@ -70,6 +70,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -79,7 +80,7 @@ import uuid
 import warnings
 from collections.abc import AsyncGenerator, AsyncIterator, Collection
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -1121,6 +1122,11 @@ if sys.platform == "win32":
         ]
         kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
         kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         _KERNEL32.append(kernel32)
         return kernel32
@@ -1142,45 +1148,61 @@ if sys.platform == "win32":
         finally:
             kernel32.CloseHandle(process)
 
-    def _end_with_worker(pid: int) -> None:
-        """Put process ``pid`` in a job that ends it when this Worker process ends.
+    def _worker_job() -> str | None:
+        """Create this Worker process's job object, once.
 
-        The job's handle stays open for the life of this process: when the process
-        ends, however it ends, Windows closes it and ends every process in the job
+        Its handle stays open for the life of this process: when the process ends,
+        however it ends, Windows closes it and ends every process in the job
         (``KILL_ON_JOB_CLOSE``), with the processes they started (those start in the
-        job). The Worker process and its other child processes are not in it. Best
-        effort: a warning if it fails.
+        job).
+
+        Returns:
+            What went wrong, or None.
         """
+        if _JOB:
+            return None
         kernel32 = _kernel32()
-        if not _JOB:
-            job = kernel32.CreateJobObjectW(None, None)
-            info = _ExtendedLimits()
-            # Kill on close; breakaway allowed, for programs that ask for it.
-            info.BasicLimitInformation.LimitFlags = 0x2000 | 0x800
-            if not job or not kernel32.SetInformationJobObject(
-                job, 9, ctypes.byref(info), ctypes.sizeof(info)
-            ):
-                _warn_once(
-                    "temporalio.claude_agent_sdk: could not create a job object "
-                    f"(Windows error {ctypes.get_last_error()}), so if this Worker "
-                    "process dies, Claude Code finishes its current turn.",
-                    key="job",
-                )
-                return
-            _JOB.append(job)
+        job = kernel32.CreateJobObjectW(None, None)
+        info = _ExtendedLimits()
+        # Kill on close; breakaway allowed, for programs that ask for it.
+        info.BasicLimitInformation.LimitFlags = 0x2000 | 0x800
+        if not job or not kernel32.SetInformationJobObject(
+            job, 9, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            return (
+                f"cannot create a job object (Windows error {ctypes.get_last_error()})"
+            )
+        _JOB.append(job)
+        return None
+
+    def _end_with_worker(pid: int) -> str | None:
+        """Put process ``pid`` in the job that ends it when this Worker process ends.
+
+        The Worker process and its other child processes are not in it.
+
+        Returns:
+            What went wrong, or None (the runner decides, see ``engine_cleanup``).
+        """
+        problem = _worker_job()
+        if problem is not None:
+            return problem
+        kernel32 = _kernel32()
         if _in_worker_job(pid):
-            return
-        process = kernel32.OpenProcess(0x0100 | 0x0001, False, pid)  # quota, terminate
+            return None
+        # Query, quota, terminate.
+        process = kernel32.OpenProcess(0x1000 | 0x0100 | 0x0001, False, pid)
         if not process:
-            return  # it has ended
+            return None  # it has ended
         try:
-            if not kernel32.AssignProcessToJobObject(_JOB[0], process):
-                _warn_once(
-                    "temporalio.claude_agent_sdk: could not put Claude Code in a job "
-                    f"object (Windows error {ctypes.get_last_error()}), so if this "
-                    "Worker process dies, Claude Code finishes its current turn.",
-                    key="job",
-                )
+            if kernel32.AssignProcessToJobObject(_JOB[0], process):
+                return None
+            error = ctypes.get_last_error()
+            code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(process, ctypes.byref(code)) and (
+                code.value != 259  # STILL_ACTIVE
+            ):
+                return None  # it ended (an engine that failed at its start)
+            return f"cannot put Claude Code in the job object (Windows error {error})"
         finally:
             kernel32.CloseHandle(process)
 
@@ -1193,9 +1215,14 @@ else:
     def _unlock_file(fd: int) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
-    def _end_with_worker(pid: int) -> None:
+    def _worker_job() -> str | None:
+        """Nothing to do here: on Linux and macOS the launcher does it (``_launcher``)."""
+        return None
+
+    def _end_with_worker(pid: int) -> str | None:
         """Nothing to do here: on Linux and macOS the launcher does it (``_launcher``)."""
         del pid
+        return None
 
 
 _warned: set[str] = set()
@@ -1208,60 +1235,166 @@ def _warn_once(message: str, key: str) -> None:
         warnings.warn(message, stacklevel=3)
 
 
-def _engines_end_with_worker() -> None:
-    """Windows: put the Claude Code processes the SDK has started in the Worker's job.
+CLEANUP_UNAVAILABLE = "EngineCleanupUnavailable"
+"""Type of the ``ApplicationError`` of a step stopped because its engine could not be
+made to end with the Worker process (``engine_cleanup="required"``)."""
 
-    The SDK keeps the processes it started (in this Worker process, the plugin's
-    engines and any other) in ``_ACTIVE_CHILDREN``; a test checks that it still does.
-    Best effort: it never fails a step.
+
+def _cleanup_problem(problem: str, *, required: bool, key: str) -> None:
+    """Stop the step (``engine_cleanup="required"``), or warn once (``"best_effort"``).
+
+    Args:
+        problem: What went wrong, and what it means for a Worker process that dies.
+        required: Whether the runner requires the engine to end with its Worker.
+        key: One warning per key and Worker process.
+
+    Raises:
+        ApplicationError: If ``required`` (type ``CLEANUP_UNAVAILABLE``). Retryable:
+            another Worker, or this one once fixed, can run the step.
     """
-    if sys.platform != "win32":
-        return
+    message = f"temporalio.claude_agent_sdk: {problem}"
+    if required:
+        raise ApplicationError(
+            f'{message} The step stopped, because engine_cleanup is "required" '
+            '(engine_cleanup="best_effort" goes on anyway, with a warning).',
+            type=CLEANUP_UNAVAILABLE,
+        )
+    _warn_once(
+        f'{message} Going on anyway, because engine_cleanup is "best_effort".',
+        key=key,
+    )
+
+
+def _job_problem(problem: str) -> str:
+    """``problem`` with what it means: the engine would outlive a dead Worker."""
+    return (
+        f"{problem}: Claude Code would not end with this Worker process, and would "
+        "finish its current turn if the process died."
+    )
+
+
+def _child_pids() -> set[int]:
+    """The processes the SDK has started in this Worker process.
+
+    It reads the SDK's own list (``_ACTIVE_CHILDREN``); a test checks that the SDK
+    still keeps it.
+    """
     try:
         from claude_agent_sdk._internal.transport import subprocess_cli
 
-        for child in list(subprocess_cli._ACTIVE_CHILDREN):
-            pid = getattr(child, "pid", None)
-            if isinstance(pid, int):
-                _end_with_worker(pid)
-    except Exception as err:
-        _warn_once(
-            "temporalio.claude_agent_sdk: cannot put Claude Code in a job object "
-            f"({err!r}), so if this Worker process dies, Claude Code finishes its "
-            "current turn.",
-            key="job",
-        )
+        children = list(subprocess_cli._ACTIVE_CHILDREN)
+    except Exception:
+        return set()
+    return {
+        pid
+        for pid in (getattr(c, "pid", None) for c in children)
+        if isinstance(pid, int)
+    }
 
 
-def _join_job_while_starting() -> asyncio.Future[None] | None:
-    """Windows: put new engines in the Worker's job every 5 ms, until cancelled.
+def _engines_end_with_worker() -> dict[int, str]:
+    """Windows: put the Claude Code processes the SDK has started in the Worker's job.
 
-    The runner starts it before the engine and cancels it at the engine's first
-    message, so an engine is in the job within milliseconds of its start, long before
-    Claude Code starts a process of its own (an MCP server, a command).
+    Every one is tried (``_child_pids``).
+
+    Returns:
+        The processes that could not join it, with what went wrong (as
+        ``_job_problem`` words it); 0 stands for all of them. Empty elsewhere.
     """
     if sys.platform != "win32":
-        return None
+        return {}
+    failed: dict[int, str] = {}
+    try:
+        for pid in _child_pids():
+            problem = _end_with_worker(pid)
+            if problem is not None:
+                failed[pid] = _job_problem(problem)
+    except Exception as err:
+        failed[0] = _job_problem(f"cannot put Claude Code in a job object ({err!r})")
+    return failed
 
-    async def poll() -> None:
+
+_JOB_POLL = sys.platform == "win32"
+"""Whether ``_JobWatch`` looks while the engine starts (tests set it elsewhere too)."""
+
+
+class _JobWatch:
+    """Windows: a step's engine joins the Worker's job object, or ``engine_cleanup``
+    decides. Elsewhere the launcher did it before the engine started.
+
+    It looks every 5 ms while the engine starts, on the Worker's event loop, so the
+    engine is in the job within milliseconds, normally long before it starts a
+    process of its own (an MCP server, a command); a process it starts before it
+    joins (on a loop blocked for longer) stays outside the job. If this step's
+    engine cannot join it and cleanup is required, the engine ends at once: the hook
+    denies every call from then on, and the engine is terminated, not asked to
+    finish its turn. (It cannot tell its engine from one that another step starts at
+    the same moment, so such an engine's failure stops this step too; a job that
+    fails, fails for every engine of the Worker.)
+    """
+
+    def __init__(self, hook_dir: str, *, required: bool) -> None:
+        self._hook_dir = hook_dir
+        self._required = required
+        self._before = _child_pids()  # other steps' engines: not this step's
+        self.problems: list[str] = []
+        self._poll: asyncio.Future[None] | None = None
+        if _JOB_POLL:
+            self._poll = asyncio.ensure_future(self._polling())
+
+    async def _polling(self) -> None:
         while True:
-            _engines_end_with_worker()
+            self._check()
             await asyncio.sleep(0.005)
 
-    return asyncio.ensure_future(poll())
+    def _check(self) -> None:
+        failed = {
+            pid: problem
+            for pid, problem in _engines_end_with_worker().items()
+            if pid not in self._before
+        }
+        for problem in failed.values():
+            if problem not in self.problems:
+                self.problems.append(problem)
+        if failed and self._required:
+            with contextlib.suppress(OSError):
+                Path(self._hook_dir, "stop").touch()
+            for pid in failed:
+                if pid > 0:
+                    with contextlib.suppress(OSError):
+                        os.kill(pid, signal.SIGTERM)  # TerminateProcess on Windows
+
+    def stop(self) -> None:
+        if self._poll is not None:
+            self._poll.cancel()
+
+    def joined(self) -> None:
+        """At the engine's first message, or when it ended without one.
+
+        Raises:
+            ApplicationError: If this step's engine could not join the job and
+                cleanup is required.
+        """
+        self.stop()
+        self._check()
+        if self.problems:
+            _cleanup_problem(self.problems[0], required=self._required, key="job")
 
 
-def _hold_worker_lock(hook_dir: str) -> int | None:
+def _hold_worker_lock(hook_dir: str, *, required: bool) -> int | None:
     """Lock ``<hook folder>/worker.lock`` for this run: the hook's sign that the Worker lives.
 
     The hook can take the lock only once this process is gone (the operating system
     releases it), and then denies every call. Python opens files non-inheritable, so
     the engine never holds the lock. Where locks do not work (some network or FUSE
-    file systems), the file goes, the hook takes the Worker to be there, and a
-    warning says so.
+    file systems), ``engine_cleanup`` decides: the step stops (``required``), or the
+    file goes, the hook takes the Worker to be there, and a warning says so.
 
     Returns:
         The file descriptor to pass to ``_release_worker_lock``, or None.
+
+    Raises:
+        ApplicationError: If locks do not work and ``required``.
     """
     path = os.path.join(hook_dir, WORKER_LOCK)
     fd: int | None = None
@@ -1274,10 +1407,12 @@ def _hold_worker_lock(hook_dir: str) -> int | None:
             os.close(fd)
         with contextlib.suppress(OSError):
             os.remove(path)
-        _warn_once(
-            "temporalio.claude_agent_sdk: cannot lock files in "
-            f"{tempfile.gettempdir()} ({err.strerror or err}), so the hook cannot "
-            "tell that a dead Worker's engine should stop.",
+        _cleanup_problem(
+            f"cannot lock files in {tempfile.gettempdir()} ({err.strerror or err}): "
+            "without the lock, the hook cannot tell that a dead Worker's engine "
+            "should stop. Use a temporary folder where file locks work (for example, "
+            "set TMPDIR to a folder on a local disk).",
+            required=required,
             key="lock",
         )
         return None
@@ -1341,6 +1476,28 @@ def _write_launch_script(engine: str) -> str:
     temporary.chmod(0o700)
     os.replace(temporary, path)
     return str(path)
+
+
+async def _launch_problem(script: str) -> str | None:
+    """Why ``script`` cannot start the launcher here, or None if it can."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            script,
+            LAUNCHER_CHECK,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as err:
+        return err.strerror or str(err)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), 30)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return "no answer in 30 seconds"
+    if proc.returncode == 0 and out.strip() == b"ok":
+        return None
+    return f"exit status {proc.returncode}"
 
 
 def _command_env(
@@ -1580,6 +1737,7 @@ class ClaudeAgentSdkRunner:
         max_budget_usd: float | None = None,
         warm_engines: int = 0,
         warm_seconds: float = 30.0,
+        engine_cleanup: Literal["required", "best_effort"] = "required",
     ) -> None:
         """Create the runner.
 
@@ -1624,17 +1782,33 @@ class ClaudeAgentSdkRunner:
                 starts it. A resumed engine runs ``PreToolUse`` hooks again for the
                 call whose result it gets; a warm one does not.
             warm_seconds: How long a paused engine stays warm.
+            engine_cleanup: Whether each engine must end with this Worker process.
+                ``"required"`` (the default): if the engine cannot start through its
+                launcher (Linux, macOS), cannot join the Worker's job object
+                (Windows), or the Worker cannot hold its lock file, the step stops
+                with a retryable ``ApplicationError`` of type
+                ``EngineCleanupUnavailable`` that says what to fix, before Claude
+                Code runs anything (an engine can fail to join the job only after it
+                started: the step then ends it at once). ``"best_effort"``: the step
+                goes on with a warning, and if the Worker process dies, its engine
+                finishes its current turn, built-in tools included.
 
         Raises:
             ValueError: If ``extra_options`` sets an option the plugin manages, or
                 Claude Code and the SDK would derive different session keys for the
                 working directory (for example decomposed Unicode or emoji in its
                 path, or a path given in another form than its real one), or
-                ``warm_engines`` is negative, or ``warm_seconds`` not positive.
+                ``warm_engines`` is negative, or ``warm_seconds`` not positive, or
+                ``engine_cleanup`` is not ``"required"`` or ``"best_effort"``.
         """
         _check_extra_options(extra_options or {})
         if warm_engines < 0 or warm_seconds <= 0:
             raise ValueError("warm_engines must be 0 or more, warm_seconds above 0")
+        cleanup = cast("str", engine_cleanup)  # a caller may pass anything
+        if cleanup not in ("required", "best_effort"):
+            raise ValueError(
+                f'engine_cleanup must be "required" or "best_effort", not {cleanup!r}'
+            )
         directory = cwd or os.getcwd()
         mismatch = _key_mismatch(directory)
         if mismatch is not None:
@@ -1654,6 +1828,7 @@ class ClaudeAgentSdkRunner:
         self._max_budget = max_budget_usd
         self._warm_cap = warm_engines
         self._warm_seconds = warm_seconds
+        self._cleanup_required = cleanup == "required"
         self._warm: dict[tuple[str, str], _WarmEngine] = {}
         """Paused engines by session and checkpoint (see ``warm_engines``)."""
         self.stub_calls = 0
@@ -1691,55 +1866,65 @@ class ClaudeAgentSdkRunner:
         return str(bundled) if bundled.is_file() else shutil.which("claude")
 
     async def _launch_path(self) -> str | None:
-        """The launcher script for this runner's engine, checked once (Linux, macOS).
+        """The launcher script for this runner's engine, checked (Linux, macOS).
 
         The SDK starts the engine through it, so the engine ends with this Worker
         process (see ``_launcher``). When the script cannot run (for example a
-        temporary folder mounted noexec), the engine starts directly, with a warning.
+        temporary folder mounted noexec), ``engine_cleanup`` decides: the step stops,
+        and the next one checks again (``"required"``), or the engine starts
+        directly, with a warning once (``"best_effort"``).
+
+        Raises:
+            ApplicationError: If the script cannot run and cleanup is required.
         """
         if sys.platform == "win32":
             return None
         engine = self._engine_path()
         if engine is None:
             return None  # the SDK reports the missing engine
-        cached = _launch_scripts.get(engine)
-        if cached is not None and not (
-            os.path.isfile(cached) and _private_folder(os.path.dirname(cached))
+        known = engine in _launch_scripts
+        script = _launch_scripts.get(engine)
+        if script is not None and not (
+            os.path.isfile(script) and _private_folder(os.path.dirname(script))
         ):
             # A cleaner of temporary files removed it (a Worker idle for days).
-            _launch_scripts[engine] = _write_launch_script(engine)
-        if engine not in _launch_scripts:
+            script = _launch_scripts[engine] = _write_launch_script(engine)
+        if script is None and (not known or self._cleanup_required):
+            # Checked the first time, and again for a runner that requires it.
             script = _write_launch_script(engine)
-            works = False
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    script,
-                    LAUNCHER_CHECK,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                try:
-                    out, _ = await asyncio.wait_for(proc.communicate(), 30)
-                    works = proc.returncode == 0 and out.strip() == b"ok"
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-            except OSError:
-                works = False
-            if not works:
-                warnings.warn(
-                    f"temporalio.claude_agent_sdk: cannot run {script}, so Claude Code "
-                    "starts directly, and if this Worker process dies, its engine "
-                    "finishes its current turn first. Make the temporary folder "
-                    "allow running programs.",
-                    stacklevel=2,
-                )
-            _launch_scripts[engine] = script if works else None
-        return _launch_scripts[engine]
+            problem = await _launch_problem(script)
+            if problem is None:
+                _launch_scripts[engine] = script
+                return script
+            if not self._cleanup_required:
+                _launch_scripts[engine] = None  # not checked again
+            _cleanup_problem(
+                f"cannot run {script} ({problem}): without it, Claude Code would not "
+                "end with this Worker process, and would finish its current turn if "
+                "the process died. Make the temporary folder allow running programs "
+                "(for example, set TMPDIR to a folder on a local disk).",
+                required=self._cleanup_required,
+                key=f"launch {engine}",
+            )
+            return None
+        return script
 
     async def _prepare_engine(self) -> None:
-        """Arrange for engines to end with this Worker process (see ``_launcher``)."""
+        """Arrange for engines to end with this Worker process.
+
+        Linux and macOS: the launcher (``_launch_path``). Windows: the Worker's job
+        object, created once; each engine joins it as it starts (``_JobWatch``).
+
+        Raises:
+            ApplicationError: If that cannot be arranged and cleanup is required,
+                before any engine starts.
+        """
         self._launch = await self._launch_path()
+        problem = _worker_job()
+        if problem is not None:
+            _cleanup_problem(
+                _job_problem(problem), required=self._cleanup_required, key="job"
+            )
 
     async def _engine_version(self) -> str | None:
         """``claude -v`` of the engine, checked once per executable (None if unknown)."""
@@ -2267,32 +2452,42 @@ class ClaudeAgentSdkRunner:
             if activity.in_activity()
             else None
         )
-        joining = _join_job_while_starting()
+        job = _JobWatch(hook_dir, required=self._cleanup_required)
+        joined = False  # the engine's first message came (``_JobWatch.joined``)
         try:
-            lock = _hold_worker_lock(hook_dir)
-            async for message in query(
-                prompt="", options=ClaudeAgentOptions(**options)
-            ):
-                if joining is not None and not joining.done():
-                    joining.cancel()
-                    _engines_end_with_worker()
-                if not isinstance(message, UserMessage) or isinstance(
-                    message.content, str
-                ):
-                    continue
-                for block in message.content:
-                    if (
-                        isinstance(block, ToolResultBlock)
-                        and block.tool_use_id == call.id
+            lock = _hold_worker_lock(hook_dir, required=self._cleanup_required)
+            engine = cast(  # query() is typed as an iterator; it is a generator
+                "AsyncGenerator[Any, None]",
+                query(prompt="", options=ClaudeAgentOptions(**options)),
+            )
+            async with contextlib.aclosing(engine) as messages:
+                async for message in messages:
+                    if not joined:
+                        joined = True
+                        job.joined()
+                    if not isinstance(message, UserMessage) or isinstance(
+                        message.content, str
                     ):
-                        result = block
-                        # The engine's temporary folder still exists: read the end
-                        # of an output it saved to a file before the folder goes.
-                        saved = _saved_output_tail(
-                            block.content, key["project_key"], step.session_id
-                        )
+                        continue
+                    for block in message.content:
+                        if (
+                            isinstance(block, ToolResultBlock)
+                            and block.tool_use_id == call.id
+                        ):
+                            result = block
+                            # The engine's temporary folder still exists: read the
+                            # end of an output it saved to a file before it goes.
+                            saved = _saved_output_tail(
+                                block.content, key["project_key"], step.session_id
+                            )
+            if not joined:
+                joined = True
+                job.joined()  # the engine ended without a message
         except Exception as err:
             if result is None:
+                if not joined:
+                    joined = True
+                    job.joined()  # the engine ended before its first message: why
                 raise
             # The call ran; the engine failed afterwards (for example the model call
             # that follows the tool). Running the step again would run it again.
@@ -2300,8 +2495,7 @@ class ClaudeAgentSdkRunner:
         finally:
             if stopper is not None:
                 stopper.cancel()
-            if joining is not None:
-                joining.cancel()
+            job.stop()
             denials = _hook_denials(hook_dir)
             _release_worker_lock(lock)
             shutil.rmtree(hook_dir, ignore_errors=True)
@@ -2465,7 +2659,8 @@ class ClaudeAgentSdkRunner:
         feed: _Feed | None = warm.feed if warm is not None else None
         parked = False
         stopper: asyncio.Future[None] | None = None
-        joining: Any = None
+        job: _JobWatch | None = None  # a new engine joins the Worker's job (Windows)
+        joined = False
         try:
             if warm is None:
                 options = self._engine_options(
@@ -2510,8 +2705,8 @@ class ClaudeAgentSdkRunner:
                         client, feed, False, stay=True, answered=set(injected)
                     )
                 else:
-                    joining = _join_job_while_starting()
-                    lock = _hold_worker_lock(hook_dir)
+                    job = _JobWatch(hook_dir, required=self._cleanup_required)
+                    lock = _hold_worker_lock(hook_dir, required=self._cleanup_required)
                     first = await _as_messages(prompt)
                     if self._may_park(inp) and not local_copy:
                         feed = _Feed(first)
@@ -2521,9 +2716,9 @@ class ClaudeAgentSdkRunner:
                         messages = _engine_messages(options, first, resume)
                 async with contextlib.aclosing(messages):
                     async for message in messages:
-                        if joining is not None and not joining.done():
-                            joining.cancel()
-                            _engines_end_with_worker()
+                        if job is not None and not joined:
+                            joined = True
+                            job.joined()
                         if isinstance(message, MirrorErrorMessage):
                             store_error = message.error or "unknown error"
                         elif (
@@ -2546,6 +2741,9 @@ class ClaudeAgentSdkRunner:
                             )
                         elif isinstance(message, ResultMessage):
                             result = message
+                if job is not None and not joined:
+                    joined = True
+                    job.joined()  # the engine ended without a message
                 marker = Path(hook_dir) / "paused_call"  # written when the hook defers
                 if marker.exists():
                     paused_by_hook = marker.read_text(encoding="utf-8").strip() or None
@@ -2561,12 +2759,18 @@ class ClaudeAgentSdkRunner:
             except RuntimeError as err:
                 if _moved(err):
                     raise _SessionMoved(str(err)) from err
+                if job is not None and not joined:
+                    job.joined()  # the engine ended before its first message: why
+                raise
+            except Exception:
+                if job is not None and not joined:
+                    job.joined()
                 raise
             finally:
                 if stopper is not None:
                     stopper.cancel()
-                if joining is not None:
-                    joining.cancel()
+                if job is not None:
+                    job.stop()
             if warm is not None and result is None:
                 # The engine ended after it was taken (it was alive then): a new
                 # engine can do the step.
