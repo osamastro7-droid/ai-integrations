@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 import uuid
 from pathlib import Path
 from typing import Any
@@ -18,18 +20,21 @@ from typing import Any
 import pytest
 
 from temporalio.claude_agent_sdk import (
+    TOOL_CALL_NOT_RUN,
     ClaudeAgentPlugin,
     ClaudeAgentSdkRunner,
     FileSessionStore,
     _runner,
 )
-from temporalio.client import Client, WorkflowHandle
+from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
+from temporalio.exceptions import ApplicationError
 from temporalio.worker import Worker
 from tests.endless.activities import ALL as COUNTING
 from tests.engine_tools.policy import shell_policy
 from tests.engine_tools.workflows import ShellOptions, ShellWorkflow
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
 from tests.helpers.workers import FAIL_FAST
+from tests.test_crash import wait_until
 from tests.test_workflow_engine import hang_on_request
 
 # Every test gets its own shop ledger, where the durable ``count`` tool records runs.
@@ -736,7 +741,156 @@ def test_hook_in_a_tool_step_allows_exactly_its_call(
     assert _decision("Bash", "t1") == "deny"
 
 
+def test_hook_records_when_a_tool_steps_call_may_run(
+    hook_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Just before it lets the step's call run, the hook writes ``allowed``: after a
+    failure, the runner knows whether the call may have run."""
+    from temporalio.claude_agent_sdk import _defer_hook
+
+    monkeypatch.setenv("TCA_ALLOW_ID", "t1")
+    assert _decision("Bash", "t2") == "deny"
+    assert not (hook_env / _defer_hook.ALLOWED).exists()
+    assert _decision("Bash", "t1") == "allow"
+    assert (hook_env / _defer_hook.ALLOWED).read_text() == "t1"
+
+
+def test_hook_lets_no_call_run_once_its_step_ended(
+    hook_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A step that ends (it failed, timed out or was cancelled) claims the record
+    first, so an engine still shutting down cannot start the call afterwards: the
+    step says the call did not run, and it never does."""
+    monkeypatch.setenv("TCA_ALLOW_ID", "t1")
+    assert _runner._close_call(str(hook_env)) is False  # not run
+    assert _decision("Bash", "t1") == "deny"
+    assert (hook_env / "denied" / "t1").read_text() == "stopped"
+
+
+def test_a_step_knows_the_hook_let_its_call_run(
+    hook_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the hook claimed the record, the step reads the call as one that may have
+    run; the hook asked again for the same call lets it run again (the record is its
+    own), and for any other call it does not."""
+    from temporalio.claude_agent_sdk import _defer_hook
+
+    monkeypatch.setenv("TCA_ALLOW_ID", "t1")
+    assert _decision("Bash", "t1") == "allow"
+    assert _defer_hook._note_allowed(str(hook_env), "t1") is True
+    assert _defer_hook._note_allowed(str(hook_env), "t2") is False
+    assert _runner._close_call(str(hook_env)) is True
+
+
+def test_a_step_whose_folder_went_reads_its_call_as_one_that_may_have_run(
+    hook_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A command can remove its step's folder (``rm -rf /tmp/*``), the record with
+    it: only a folder still there without the record shows the call never started."""
+    monkeypatch.setenv("TCA_ALLOW_ID", "t1")
+    folder = hook_env / "run"
+    folder.mkdir()
+    monkeypatch.setenv("TCA_HOOK_DIR", str(folder))
+    assert _decision("Bash", "t1") == "allow"
+    shutil.rmtree(folder)
+    assert _runner._close_call(str(folder)) is True
+
+
+def test_no_hook_lets_a_call_run_while_its_folder_is_removed(
+    hook_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The folder is renamed before its files go: a hook that runs meanwhile finds
+    no folder and denies, instead of a folder without its ``stop`` and claim."""
+    monkeypatch.setenv("TCA_ALLOW_ID", "t1")
+    folder = hook_env / "run"
+    folder.mkdir()
+    monkeypatch.setenv("TCA_HOOK_DIR", str(folder))
+    assert _runner._close_call(str(folder)) is False  # the step ended: not run
+    (folder / "stop").touch()
+    seen: list[str] = []
+    real = os.rmdir
+
+    def rmdir(path: Any, *args: Any, **kwargs: Any) -> None:
+        # The folder's last step: its files (the claim and ``stop`` with them) are
+        # gone, the folder itself not yet.
+        seen.append(_decision("Bash", "t1"))
+        real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rmdir", rmdir)
+    _runner._remove_hook_folder(str(folder))
+    assert seen and set(seen) == {"deny"}
+    assert not folder.exists() and not Path(f"{folder}.gone").exists()
+
+
+def test_a_hook_never_brings_back_a_removed_folder(
+    hook_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hook that decided while its folder was still there, and writes its records
+    after the runner removed it, neither creates the folder again (a later hook would
+    find it without ``stop``, the lock or the claim) nor lets its call through."""
+    from temporalio.claude_agent_sdk import _defer_hook
+
+    monkeypatch.setenv("TCA_TOOL_ACTIVITIES", "Bash")
+    folder = hook_env / "run"
+    monkeypatch.setenv("TCA_HOOK_DIR", str(folder))
+    _defer_hook._record(str(folder), "t1", _defer_hook._deny(_defer_hook.STOPPED))
+    assert not folder.exists()
+    # The folder goes between the hook's check and its pause record.
+    monkeypatch.setattr(os.path, "isdir", lambda path: True)
+    assert _decision("Bash", "t1") == "deny"
+    assert not folder.exists()
+
+
+async def test_a_folder_that_cannot_be_renamed_yet_stays_stopped_and_goes_later(
+    hook_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows cannot rename a folder with a file open in it (an engine still
+    ending): the folder keeps its records, gets ``stop``, and goes once it can."""
+    monkeypatch.setenv("TCA_ALLOW_ID", "t1")
+    folder = hook_env / "run"
+    folder.mkdir()
+    monkeypatch.setenv("TCA_HOOK_DIR", str(folder))
+    assert _runner._close_call(str(folder)) is False
+    real = os.rename
+    refused: list[str] = []
+
+    def rename(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+        if not refused:
+            refused.append(str(src))
+            raise PermissionError(13, "in use")
+        real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", rename)
+    monkeypatch.setattr(_runner, "EXIT_GRACE_SECONDS", 0.05)
+    _runner._remove_hook_folder(str(folder))
+    assert (folder / "stop").exists() and (folder / "allowed").exists()
+    assert _decision("Bash", "t1") == "deny"
+    await wait_until(lambda: not folder.exists(), 5)
+    assert refused == [str(folder)] and not Path(f"{folder}.gone").exists()
+
+
+def test_hook_does_not_let_a_call_run_whose_start_cannot_be_recorded(
+    hook_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Otherwise a failure after the call ran would look like one before it, and
+    Claude would be told the call did not run."""
+    from temporalio.claude_agent_sdk import _defer_hook
+
+    monkeypatch.setenv("TCA_ALLOW_ID", "t1")
+    (hook_env / _defer_hook.ALLOWED).mkdir()  # cannot be written as a file
+    assert _decision("Bash", "t1") == "deny"
+    assert (hook_env / "denied" / "t1").read_text() == "stopped"
+
+
 # ---- configuration ----
+
+
+def test_repeatable_tools_must_run_as_activities() -> None:
+    from temporalio.claude_agent_sdk._workflow import _check_tool_activities
+
+    _check_tool_activities(["Bash", "mcp__*"], [], ["Bash", "mcp__notes__*"])
+    with pytest.raises(ValueError, match="repeatable_tools: 'Glob' does not run"):
+        _check_tool_activities(["Bash"], [], ["Glob"])
 
 
 @pytest.mark.parametrize(
@@ -801,3 +955,421 @@ async def test_scripted_claude_plays_claude_code_tools_in_tool_steps(
         kinds = [n for n, _ in await activity_types(handle)]
     assert result == "pretend output of make test" and ran == ["make test"]
     assert kinds == ["run_claude_segment", "run_claude_tool_step", "run_claude_segment"]
+
+
+# ---- one attempt: a call that may have run is never run again ----
+
+
+async def scripted_bash(
+    client: Client, options: ShellOptions, bash: Any, command: str = "make test"
+) -> tuple[str, list[str]]:
+    """Run ShellWorkflow with ScriptedClaude, ``bash`` standing in for Bash; return
+    the answer and the tool step Activities' ids."""
+    from temporalio.claude_agent_sdk.testing import ScriptedClaude
+
+    runner = ScriptedClaude(shell_policy, engine_tools={"Bash": bash})
+    queue = f"once-{uuid.uuid4().hex[:8]}"
+    async with worker(client, queue, runner):
+        handle = await client.start_workflow(
+            ShellWorkflow.run,
+            args=[f"run: {command}", options],
+            id=queue,
+            task_queue=queue,
+        )
+        result = await asyncio.wait_for(handle.result(), 90)
+        steps = [i for n, i in await activity_types(handle) if n.endswith("tool_step")]
+    return result, steps
+
+
+async def test_a_tool_step_whose_call_may_have_run_is_not_run_again(
+    client: Client,
+) -> None:
+    """The step failed after Claude Code was let run the call: by default it gets no
+    other attempt (the Workflow's retry policy allows 5), and Claude learns the call
+    may have run."""
+    from temporalio.claude_agent_sdk._models import TOOL_CALL_INTERRUPTED
+
+    ran: list[str] = []
+
+    def bash(args: dict[str, Any]) -> str:
+        ran.append(args["command"])
+        raise ApplicationError("the engine went away", type=TOOL_CALL_INTERRUPTED)
+
+    result, steps = await scripted_bash(client, ShellOptions(), bash)
+    assert ran == ["make test"] and len(steps) == 1
+    assert result == (
+        "error: This call was interrupted (its step failed after the call started), "
+        "so it may have run, in full or in part. Check its effects before you run it "
+        "again."
+    )  # the step's own error stays in Temporal: it can name the Worker's folders
+
+
+async def test_a_tool_step_that_timed_out_is_not_run_again(client: Client) -> None:
+    """A step that times out (or whose Worker stops) cannot say whether its call ran,
+    so it is not run again either."""
+    ran: list[str] = []
+
+    async def bash(args: dict[str, Any]) -> str:
+        ran.append(args["command"])
+        await asyncio.sleep(10)
+        return "too late"
+
+    result, steps = await scripted_bash(client, ShellOptions(tool_timeout=1.5), bash)
+    assert ran == ["make test"] and len(steps) == 1
+    assert result.startswith(
+        "error: This call was interrupted (its step timed out), so it may have run"
+    )
+
+
+async def test_a_tool_step_whose_call_did_not_run_is_tried_again(
+    client: Client,
+) -> None:
+    """A step that failed before Claude Code could run its call is tried again, each
+    time as a new Activity, so a step on a Worker set up the other way, or one that
+    shut down, still runs on another one."""
+
+    tries: list[str] = []
+
+    def bash(args: dict[str, Any]) -> str:
+        tries.append(args["command"])
+        if len(tries) < 3:
+            raise ApplicationError(
+                "this Worker is set up the other way", type=TOOL_CALL_NOT_RUN
+            )
+        return "built"
+
+    result, steps = await scripted_bash(client, ShellOptions(), bash)
+    assert result == "built" and len(tries) == 3
+    assert steps[1:] == [f"{steps[0]}-2", f"{steps[0]}-3"]
+
+
+async def test_a_tool_step_that_never_ran_its_call_says_so(client: Client) -> None:
+    """When the retry policy gives up (here after 5 attempts), Claude learns that the
+    call did not run, so it can call it again."""
+
+    tries: list[str] = []
+
+    def bash(args: dict[str, Any]) -> str:
+        tries.append(args["command"])
+        raise ApplicationError(
+            "this Worker is set up the other way", type=TOOL_CALL_NOT_RUN
+        )
+
+    result, steps = await scripted_bash(client, ShellOptions(), bash)
+    assert len(tries) == len(steps) == 5
+    assert result == (
+        "error: This call did not run: its step failed before the call could start. "
+        "You can call it again."
+    )
+
+
+async def test_tool_step_attempts_back_off_up_to_the_policys_maximum_interval(
+    client: Client,
+) -> None:
+    """Each attempt waits as the retry policy says, never longer than its maximum
+    interval, whatever the backoff coefficient (no overflow)."""
+    from temporalio.claude_agent_sdk.testing import ScriptedClaude
+
+    tries: list[str] = []
+
+    def bash(args: dict[str, Any]) -> str:
+        tries.append(args["command"])
+        raise ApplicationError("not here", type=TOOL_CALL_NOT_RUN)
+
+    options = ShellOptions(
+        tool_retry_initial=0.05,
+        tool_retry_backoff=1e300,
+        tool_retry_max_interval=0.3,
+        tool_retry_attempts=6,
+    )
+    runner = ScriptedClaude(shell_policy, engine_tools={"Bash": bash})
+    queue = f"backoff-{uuid.uuid4().hex[:8]}"
+    async with worker(client, queue, runner):
+        handle = await client.start_workflow(
+            ShellWorkflow.run,
+            args=["run: make test", options],
+            id=queue,
+            task_queue=queue,
+        )
+        result = await asyncio.wait_for(handle.result(), 90)
+        waits = [
+            event.timer_started_event_attributes.start_to_fire_timeout.ToTimedelta()
+            async for event in handle.fetch_history_events()
+            if event.HasField("timer_started_event_attributes")
+        ]
+    assert len(tries) == 6 and result.startswith("error: This call did not run")
+    assert [w.total_seconds() for w in waits] == [0.05, 0.3, 0.3, 0.3, 0.3]
+
+
+@pytest.mark.parametrize("limit", ["history", "attempts"])
+async def test_tool_step_attempts_stop_before_the_history_is_full(
+    client: Client, monkeypatch: pytest.MonkeyPatch, limit: str
+) -> None:
+    """Each attempt adds events to the history (Temporal's own retries add none), so
+    with unlimited attempts they stop while the run has room, or once the attempts at
+    one call added their share, and Claude learns the call did not run. (The limits
+    are lowered here.)"""
+    from temporalio.claude_agent_sdk import _workflow
+
+    if limit == "history":
+        monkeypatch.setattr(_workflow, "_HISTORY_EVENTS", 200)
+        monkeypatch.setattr(_workflow, "_ROOM_EVENTS", 40)
+    else:
+        monkeypatch.setattr(_workflow, "_ATTEMPT_EVENTS", 100)
+    tries: list[str] = []
+
+    def bash(args: dict[str, Any]) -> str:
+        tries.append(args["command"])
+        raise ApplicationError("not here", type=TOOL_CALL_NOT_RUN)
+
+    options = ShellOptions(
+        tool_retry_initial=0.01, tool_retry_max_interval=0.01, tool_retry_attempts=0
+    )
+    from temporalio.claude_agent_sdk.testing import ScriptedClaude
+
+    runner = ScriptedClaude(shell_policy, engine_tools={"Bash": bash})
+    queue = f"room-{uuid.uuid4().hex[:8]}"
+    async with worker(client, queue, runner):
+        handle = await client.start_workflow(
+            ShellWorkflow.run,
+            args=["run: make test", options],
+            id=queue,
+            task_queue=queue,
+        )
+        result = await asyncio.wait_for(handle.result(), 120)
+        events = len((await handle.fetch_history()).events)
+    assert result.startswith("error: This call did not run")
+    assert 5 < len(tries) < 20 and events < 200, (len(tries), events)
+
+
+async def test_a_tool_call_waiting_to_be_tried_again_is_not_run_when_cancelled(
+    client: Client,
+) -> None:
+    """Cancelled between attempts: no attempt let the call run, and its status says
+    so (a task that continues later tells Claude it did not run)."""
+    from temporalio.claude_agent_sdk.testing import ScriptedClaude
+
+    tries: list[str] = []
+
+    def bash(args: dict[str, Any]) -> str:
+        tries.append(args["command"])
+        raise ApplicationError("not here", type=TOOL_CALL_NOT_RUN)
+
+    runner = ScriptedClaude(shell_policy, engine_tools={"Bash": bash})
+    queue = f"wait-{uuid.uuid4().hex[:8]}"
+    async with worker(client, queue, runner):
+        handle = await client.start_workflow(
+            ShellWorkflow.run,
+            args=["run: make test", ShellOptions(tool_retry_initial=60)],
+            id=queue,
+            task_queue=queue,
+        )
+        while not tries:
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(1)  # the first attempt failed: the Workflow waits
+        await handle.cancel()
+        with pytest.raises(WorkflowFailureError):
+            await asyncio.wait_for(handle.result(), 60)
+        calls = await handle.query(ShellWorkflow.tool_calls)
+    assert len(tries) == 1
+    assert [c["status"] for c in calls] == ["not run"]
+
+
+class FailingStep:
+    """A runner whose tool step fails with ``error``."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    async def run_tool_step(self, step: Any, attempt: int) -> Any:
+        del step, attempt
+        raise self.error
+
+
+def not_run(behind: BaseException | None = None, **kw: Any) -> ApplicationError:
+    """``ToolCallNotRun``, raised from ``behind`` like the real runner's."""
+    error = ApplicationError("not here", type=TOOL_CALL_NOT_RUN, **kw)
+    error.__cause__ = behind
+    return error
+
+
+@pytest.mark.parametrize(
+    ("attempt", "maximum", "listed", "error", "expected"),
+    [
+        (1, 5, [], not_run(), True),
+        (4, 5, [], not_run(), True),
+        (5, 5, [], not_run(), False),  # no attempt left
+        (9, 0, [], not_run(), True),  # no limit
+        (1, 5, [], not_run(non_retryable=True), False),
+        (1, 5, ["ToolCallNotRun"], not_run(), False),
+        (1, 5, ["RuntimeError"], not_run(RuntimeError("x")), False),
+        (1, 5, ["RuntimeError"], not_run(ValueError("x")), True),
+        (
+            1,
+            5,
+            ["EngineCleanupUnavailable"],
+            not_run(ApplicationError("x", type="EngineCleanupUnavailable")),
+            False,
+        ),
+    ],
+)
+async def test_a_step_whose_call_did_not_run_records_if_it_may_try_again(
+    attempt: int, maximum: int, listed: list[str], error: Any, expected: bool
+) -> None:
+    """The step decides from its input, as Temporal's retry policy would, and its
+    failure carries the answer, so the Workflow follows the history."""
+    from temporalio.claude_agent_sdk import (
+        DeferredCall,
+        ToolStepInput,
+        ToolStepRetry,
+        make_tool_step_activity,
+    )
+    from temporalio.claude_agent_sdk._models import TRY_AGAIN
+    from temporalio.testing import ActivityEnvironment
+
+    step = ToolStepInput(
+        session_id="s",
+        checkpoint="c",
+        call=DeferredCall("toolu_1", "Bash", {}, kind="engine"),
+        attempt=attempt,
+        retry=ToolStepRetry(maximum, listed),
+    )
+    with pytest.raises(ApplicationError) as failed:
+        await ActivityEnvironment().run(
+            make_tool_step_activity(FailingStep(error)), step
+        )
+    assert failed.value.type == TOOL_CALL_NOT_RUN
+    assert failed.value.details == ({TRY_AGAIN: expected},)
+    assert failed.value.non_retryable == error.non_retryable
+    assert failed.value.__cause__ is error.__cause__
+
+
+@pytest.mark.parametrize("repeatable", [True, False])
+async def test_other_step_failures_are_left_as_they_are(repeatable: bool) -> None:
+    """A step that may have run its call is never tried again, and a repeatable
+    step's failures are Temporal's to retry: neither gets a decision."""
+    from temporalio.claude_agent_sdk import (
+        TOOL_CALL_INTERRUPTED,
+        DeferredCall,
+        ToolStepInput,
+        ToolStepRetry,
+        make_tool_step_activity,
+    )
+    from temporalio.testing import ActivityEnvironment
+
+    error = (
+        not_run() if repeatable else ApplicationError("x", type=TOOL_CALL_INTERRUPTED)
+    )
+    step = ToolStepInput(
+        session_id="s",
+        checkpoint="c",
+        call=DeferredCall("toolu_1", "Bash", {}, kind="engine"),
+        retry=None if repeatable else ToolStepRetry(5),
+    )
+    with pytest.raises(ApplicationError) as failed:
+        await ActivityEnvironment().run(
+            make_tool_step_activity(FailingStep(error)), step
+        )
+    assert failed.value is error and not failed.value.details
+
+
+async def test_a_repeatable_tool_step_is_retried(client: Client) -> None:
+    """``repeatable_tools``: calls safe to run again keep Temporal's retries, even
+    after the call may have run."""
+    from temporalio.claude_agent_sdk._models import TOOL_CALL_INTERRUPTED
+
+    ran: list[str] = []
+
+    def bash(args: dict[str, Any]) -> str:
+        ran.append(args["command"])
+        if len(ran) == 1:
+            raise ApplicationError("the engine went away", type=TOOL_CALL_INTERRUPTED)
+        return "listed"
+
+    result, steps = await scripted_bash(
+        client, ShellOptions(repeatable_tools=["Bash"]), bash, "ls"
+    )
+    assert result == "listed" and ran == ["ls", "ls"] and len(steps) == 1
+
+
+@pytest.mark.parametrize("repeatable", [False, True], ids=["once", "repeatable"])
+async def test_real_engine_a_command_still_running_when_its_step_times_out(
+    client: Client, tmp_path: Path, repeatable: bool
+) -> None:
+    """The command outlives its step's timeout. By default it is not run again, and
+    Claude learns it may have run; as a repeatable tool, its step is retried and it
+    runs again (here it is quick the second time)."""
+    effects = tmp_path / "effects.log"
+    marker = tmp_path / "first"
+    api = start_with_policy(shell_policy)
+    runner = make_runner(tmp_path, api)
+    queue = f"timeout-{uuid.uuid4().hex[:8]}"
+    command = (
+        f"echo ran >> {posix(effects)}; "
+        f"if [ ! -e {posix(marker)} ]; then touch {posix(marker)}; sleep 90; fi; "
+        "echo done"
+    )
+    options = ShellOptions(
+        tool_timeout=30, repeatable_tools=["Bash"] if repeatable else []
+    )
+    try:
+        async with worker(client, queue, runner):
+            result = await client.execute_workflow(
+                ShellWorkflow.run,
+                args=[f"run: {command}", options],
+                id=queue,
+                task_queue=queue,
+            )
+    finally:
+        api.stop()
+    if repeatable:
+        assert result == "done" and effects.read_text().split() == ["ran", "ran"]
+    else:
+        assert result.startswith(
+            "error: This call was interrupted (its step timed out), so it may have run"
+        )
+        assert effects.read_text().split() == ["ran"]
+    assert api.errors == []
+
+
+async def test_real_engine_a_tool_step_that_could_not_start_did_not_run(
+    client: Client, tmp_path: Path
+) -> None:
+    """The step broke before Claude Code could run the call: it is tried again, and
+    the call runs once."""
+    effects = tmp_path / "effects.log"
+    api = start_with_policy(shell_policy)
+    broken = [2]
+
+    class FlakyRunner(ClaudeAgentSdkRunner):
+        def _step_env(self, env: dict[str, str], hook_dir: str, call_id: str) -> Any:
+            if broken[0]:
+                broken[0] -= 1
+                raise ConnectionError("the engine could not start")
+            return super()._step_env(env, hook_dir, call_id)
+
+    (tmp_path / "work").mkdir()
+    runner = FlakyRunner(
+        cwd=str(tmp_path / "work"), env=engine_env(api, str(tmp_path / "cfg"))
+    )
+    queue = f"notrun-{uuid.uuid4().hex[:8]}"
+    try:
+        async with worker(client, queue, runner):
+            result = await client.execute_workflow(
+                ShellWorkflow.run,
+                args=[
+                    f"run: echo ran >> {posix(effects)} && echo done",
+                    ShellOptions(),
+                ],
+                id=queue,
+                task_queue=queue,
+            )
+            steps = [
+                i
+                for n, i in await activity_types(client.get_workflow_handle(queue))
+                if n.endswith("tool_step")
+            ]
+    finally:
+        api.stop()
+    assert result == "done" and effects.read_text().split() == ["ran"]
+    assert steps[1:] == [f"{steps[0]}-2", f"{steps[0]}-3"]

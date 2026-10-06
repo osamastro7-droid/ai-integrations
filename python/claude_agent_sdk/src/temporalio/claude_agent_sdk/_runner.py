@@ -106,12 +106,21 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from ._conversation import external_storage_on, read_conversation, too_large
-from ._defer_hook import ANSWERED, REASON_KEYS, STOPPED, WORKER_LOCK, denial_name
+from ._defer_hook import (
+    ALLOWED,
+    ANSWERED,
+    REASON_KEYS,
+    STOPPED,
+    WORKER_LOCK,
+    denial_name,
+)
 from ._defer_hook import NOT_RUN as NOT_RUN_REASON
 from ._events import emit
 from ._launcher import CHECK as LAUNCHER_CHECK
 from ._launcher import WORKER_PID
 from ._models import (
+    TOOL_CALL_INTERRUPTED,
+    TOOL_CALL_NOT_RUN,
     DeferredCall,
     SegmentInput,
     SegmentOutput,
@@ -743,6 +752,38 @@ def _hook_entry() -> dict[str, Any]:
     }
 
 
+_REMOVE_TRIES = 6
+"""How often a hook folder that cannot be renamed yet is tried again."""
+
+
+def _remove_hook_folder(hook_dir: str, tries: int = _REMOVE_TRIES) -> None:
+    """Remove a run's hook folder: from then on its hook denies every call.
+
+    Renamed first (atomic), so a hook that runs while the files go never finds the
+    folder without its ``stop``, ``worker.lock`` or ``allowed`` file. When it cannot
+    be renamed (Windows: an engine still ending has a file in it open), it stays as
+    it is, with ``stop`` added, and is tried again every ``EXIT_GRACE_SECONDS`` while
+    the event loop runs, and when the Worker exits.
+    """
+    gone = f"{hook_dir}.gone"
+    try:
+        os.rename(hook_dir, gone)
+    except FileNotFoundError:
+        return
+    except OSError:
+        with contextlib.suppress(OSError):
+            Path(hook_dir, "stop").touch()
+        if tries == _REMOVE_TRIES:
+            atexit.register(shutil.rmtree, hook_dir, True)
+        if tries > 1:
+            with contextlib.suppress(RuntimeError):  # no event loop runs
+                asyncio.get_running_loop().call_later(
+                    EXIT_GRACE_SECONDS, _remove_hook_folder, hook_dir, tries - 1
+                )
+        return
+    shutil.rmtree(gone, ignore_errors=True)
+
+
 def _hook_folder() -> str:
     """A new folder with the settings file that registers the hook for every tool."""
     hook_dir = tempfile.mkdtemp(prefix="tca-hook-")
@@ -1265,6 +1306,39 @@ def _cleanup_problem(problem: str, *, required: bool, key: str) -> None:
     )
 
 
+def _tool_step_failure(
+    reason: str, allowed: bool, *, non_retryable: bool
+) -> ApplicationError:
+    """The error of a failed tool step: whether its call may have run, and why.
+
+    Args:
+        reason: Why the step failed.
+        allowed: Whether the hook had let the call run.
+        non_retryable: Whether retrying cannot help.
+    """
+    return ApplicationError(
+        reason.removesuffix(" Retrying."),
+        type=TOOL_CALL_INTERRUPTED if allowed else TOOL_CALL_NOT_RUN,
+        non_retryable=non_retryable,
+    )
+
+
+def _cancelled_by_shutdown() -> bool:
+    """Whether this Activity was cancelled because its Worker is shutting down.
+
+    Only then: a cancel the Workflow requested, a pause, a reset or a timeout keeps
+    its own meaning, even while the Worker shuts down.
+    """
+    if not activity.in_activity():
+        return False
+    details = activity.cancellation_details()
+    return (
+        details is not None
+        and details.worker_shutdown
+        and not (details.cancel_requested or details.paused or details.reset)
+    )
+
+
 def _job_problem(problem: str) -> str:
     """``problem`` with what it means: the engine would outlive a dead Worker."""
     return (
@@ -1416,6 +1490,25 @@ def _hold_worker_lock(hook_dir: str, *, required: bool) -> int | None:
             key="lock",
         )
         return None
+
+
+def _close_call(hook_dir: str) -> bool:
+    """End a tool step's chance to run its call; whether the hook let it run.
+
+    Creates the hook's ``allowed`` record (atomic, empty) if the hook has not: from
+    then on no hook of this step lets the call run, even while the engine is still
+    shutting down. If the record is there, the hook let the call run.
+    """
+    path = os.path.join(hook_dir, ALLOWED)
+    try:
+        os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        return True
+    except OSError:
+        # Only a folder that is still there without the record shows that the call
+        # never started (a command may have removed the folder, record and all).
+        return not os.path.isdir(hook_dir) or os.path.lexists(path)
+    return False
 
 
 def _release_worker_lock(fd: int | None) -> None:
@@ -2146,7 +2239,7 @@ class ClaudeAgentSdkRunner:
             _ending.discard(task)
             _stop_now(process, resumed)
             _release_worker_lock(warm.lock)
-            shutil.rmtree(warm.hook_dir, ignore_errors=True)
+            _remove_hook_folder(warm.hook_dir)
 
         task.add_done_callback(ended)
 
@@ -2372,6 +2465,11 @@ class ClaudeAgentSdkRunner:
         a result the step already has is kept even if the engine fails afterwards,
         so the Activity is not retried for a call that ran.
 
+        A step that fails says on which side of the call's start it failed: the hook
+        writes ``allowed`` just before it lets the call run. So the Workflow can tell
+        Claude whether the call ran; it gives the step one attempt unless the tool
+        is in ``repeatable_tools``.
+
         Args:
             step: The call, and where its session paused.
             attempt: The Activity attempt number.
@@ -2380,13 +2478,36 @@ class ClaudeAgentSdkRunner:
             What the tool returned, as Claude Code would show it to Claude.
 
         Raises:
-            ApplicationError: If the session did not pause at this call, the engine
-                did not run it, or a hook in ``extra_options`` tried to decide on it
-                (not retried: Claude sees the error).
-            RuntimeError: If the Workflow did not serve its conversation, or the
-                conversation is kept where this runner does not keep it (retried).
+            ApplicationError: Of type ``ToolCallNotRun`` if the step failed before
+                Claude Code could run the call (it did not run), or
+                ``ToolCallInterrupted`` if it failed after the hook let the call run
+                (it may have run). Not retryable where retrying cannot help: the
+                session did not pause at this call, the hook refused it, or a hook in
+                ``extra_options`` tried to decide on it.
         """
         del attempt
+        allowed = [False]  # whether the hook let the call run (``_tool_step`` sets it)
+        try:
+            return await self._tool_step(step, allowed)
+        except asyncio.CancelledError:
+            if not _cancelled_by_shutdown():
+                raise  # the Workflow cancelled the step, or it timed out, or ...
+            raise _tool_step_failure(
+                "Its Worker shut down.", allowed[0], non_retryable=False
+            ) from None
+        except ApplicationError as err:
+            if err.type in (TOOL_CALL_NOT_RUN, TOOL_CALL_INTERRUPTED):
+                raise
+            raise _tool_step_failure(
+                err.message, allowed[0], non_retryable=err.non_retryable
+            ) from err
+        except Exception as err:
+            raise _tool_step_failure(
+                str(err) or repr(err), allowed[0], non_retryable=False
+            ) from err
+
+    async def _tool_step(self, step: ToolStepInput, allowed: list[bool]) -> ToolOutcome:
+        """``run_tool_step``'s work; sets ``allowed[0]`` once the hook let the call run."""
         await self._prepare_engine()
         call = step.call
         key = {
@@ -2430,21 +2551,25 @@ class ClaudeAgentSdkRunner:
             checkpoint=step.checkpoint,
         )
         violations: list[str] = []
-        options = self._engine_options(
-            inp,
-            {},
-            step.session_id,
-            True,
-            store,
-            None,
-            hook_dir,
-            self._durable_server(step.tools, []),
-            violations,
-        )
-        options["env"] = self._step_env(options["env"], hook_dir, call.id)
+        try:
+            options = self._engine_options(
+                inp,
+                {},
+                step.session_id,
+                True,
+                store,
+                None,
+                hook_dir,
+                self._durable_server(step.tools, []),
+                violations,
+            )
+            options["env"] = self._step_env(options["env"], hook_dir, call.id)
+        except BaseException:
+            _remove_hook_folder(hook_dir)
+            raise
         result: ToolResultBlock | None = None
         saved: str | None = None
-        failure: Exception | None = None
+        failure: BaseException | None = None
         denials: dict[str, str] = {}
         lock: int | None = None
         stopper = (
@@ -2483,6 +2608,10 @@ class ClaudeAgentSdkRunner:
             if not joined:
                 joined = True
                 job.joined()  # the engine ended without a message
+        except asyncio.CancelledError as err:
+            if result is None or not _cancelled_by_shutdown():
+                raise
+            failure = err  # the call ran, then the Worker began to shut down
         except Exception as err:
             if result is None:
                 if not joined:
@@ -2497,12 +2626,18 @@ class ClaudeAgentSdkRunner:
                 stopper.cancel()
             job.stop()
             denials = _hook_denials(hook_dir)
+            allowed[0] = _close_call(hook_dir)
             _release_worker_lock(lock)
-            shutil.rmtree(hook_dir, ignore_errors=True)
+            _remove_hook_folder(hook_dir)
         violation = _hook_violation(violations)
         if violation is not None:
             raise ApplicationError(violation, non_retryable=True)
         text = _text(result.content) if result is not None else ""
+        if result is None and allowed[0]:
+            raise ApplicationError(
+                f"Claude Code was let run tool call {call.id} ({call.name}) in its "
+                "step, but the step ended without its result."
+            )
         if (
             result is None
             or denial_name(call.id) in denials
@@ -2519,7 +2654,7 @@ class ClaudeAgentSdkRunner:
                 "is kept.",
                 call.id,
                 call.name,
-                failure,
+                failure if str(failure) else type(failure).__name__,
             )
         is_error = bool(result.is_error)
         if isinstance(result.content, list):
@@ -2833,8 +2968,7 @@ class ClaudeAgentSdkRunner:
                         await _disconnect(client)
                 finally:
                     _release_worker_lock(lock)
-                    # The hook denies from now on.
-                    shutil.rmtree(hook_dir, ignore_errors=True)
+                    _remove_hook_folder(hook_dir)  # the hook denies from now on
                     _forget_local_copy(local_copy)
 
     def _parks(

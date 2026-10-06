@@ -15,11 +15,20 @@ from typing import Any, NoReturn, cast
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
-from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
+from temporalio.exceptions import (
+    ActivityError,
+    ApplicationError,
+    CancelledError,
+    TimeoutType,
+)
+from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 from ._conversation import PAGE_BYTES, PAYLOAD_LIMIT_BYTES, QUERY, entry_text, page
 from ._events import TOPIC, cap_event
 from ._models import (
+    TOOL_CALL_INTERRUPTED,
+    TOOL_CALL_NOT_RUN,
+    TRY_AGAIN,
     AgentState,
     ConversationRef,
     DeferredCall,
@@ -28,6 +37,7 @@ from ._models import (
     ToolOutcome,
     ToolSpec,
     ToolStepInput,
+    ToolStepRetry,
 )
 
 SEGMENT_ACTIVITY_NAME = "run_claude_segment"
@@ -49,6 +59,10 @@ _CHECKS_PATCH = "temporalio-claude-agent-sdk-continue-as-new-checks"
 (766c647): Workflows that version started keep their decisions on replay."""
 _CARRY_PATCH = "temporalio-claude-agent-sdk-measured-stream-carry"
 """Patch ID of the check of the new run's input with the live output stream in it."""
+_ONCE_PATCH = "temporalio-claude-agent-sdk-tool-steps-run-once"
+"""Tool steps outside ``repeatable_tools`` get one try per attempt, each step records
+whether its call may be tried again, and a failed step tells Claude whether its call
+ran."""
 _HISTORY_EVENTS = 51_200
 _HISTORY_BYTES = 50 * 1024 * 1024
 """Temporal's default limits for one run's history: the server ends a run past them."""
@@ -56,6 +70,8 @@ _ROOM_EVENTS = 500
 _ROOM_BYTES = 3 * PAYLOAD_LIMIT_BYTES
 """Least room kept for the next step (a result near the payload limit is stored three
 times), or twice the largest step so far, whichever is more."""
+_ATTEMPT_EVENTS = 5_000
+"""History events the attempts at one tool call may add: about 450 attempts."""
 
 
 def _is_cancellation(err: BaseException) -> bool:
@@ -74,7 +90,9 @@ _ENGINE_ACTIVITY_TOOLS = ("Bash", "PowerShell")
 """Claude Code built-in tools that can run as their own Activities (and MCP tools)."""
 
 
-def _check_tool_activities(patterns: Sequence[str], approvals: Sequence[str]) -> None:
+def _check_tool_activities(
+    patterns: Sequence[str], approvals: Sequence[str], repeatable: Sequence[str] = ()
+) -> None:
     """Refuse Claude Code tools that cannot run as their own Activities.
 
     A tool step answers the engine's model calls with a stand-in, and Claude Code
@@ -96,6 +114,64 @@ def _check_tool_activities(patterns: Sequence[str], approvals: Sequence[str]) ->
                 f"tool_approvals: {pattern!r} does not run as its own Activity, so it "
                 "could not wait for a decision. Add it to tool_activities."
             )
+    for pattern in repeatable:
+        if not any(fnmatch.fnmatchcase(pattern, p) for p in patterns):
+            raise ValueError(
+                f"repeatable_tools: {pattern!r} does not run as its own Activity, so "
+                "it has no steps to retry. Add it to tool_activities."
+            )
+
+
+def _may_try_again(err: ActivityError) -> bool:
+    """Whether a failed tool step says its call did not run and may be tried again.
+
+    The step decides (``make_tool_step_activity``), and its answer is in the history,
+    so a change to the retry settings never changes a decision already made.
+    """
+    cause = err.cause
+    if not isinstance(cause, ApplicationError) or cause.type != TOOL_CALL_NOT_RUN:
+        return False
+    details = cause.details
+    said = details[0] if details else None
+    return isinstance(said, dict) and said.get(TRY_AGAIN) is True
+
+
+def _failed_step(err: ActivityError, record: dict[str, Any]) -> ToolOutcome:
+    """What Claude gets for a tool step that failed: whether its call ran.
+
+    Only the step itself can know that its call did not run (``ToolCallNotRun``): a
+    timeout, a lost Worker or any other failure means the call may have run. The
+    step's own error stays in Temporal: it can name the Worker's folders and
+    settings, which Claude has no use for.
+    """
+    cause = err.cause
+    if isinstance(cause, ApplicationError) and cause.type == TOOL_CALL_NOT_RUN:
+        record["status"] = "not run"
+        return ToolOutcome(
+            content=(
+                "This call did not run: its step failed before the call could start. "
+                "You can call it again."
+            ),
+            is_error=True,
+        )
+    if isinstance(cause, ActivityTimeoutError):
+        how = (
+            "its Worker stopped responding"
+            if cause.type == TimeoutType.HEARTBEAT
+            else "its step timed out"
+        )
+    elif isinstance(cause, ApplicationError) and cause.type == TOOL_CALL_INTERRUPTED:
+        how = "its step failed after the call started"
+    else:
+        how = "its step failed"
+    record["status"] = "interrupted"
+    return ToolOutcome(
+        content=(
+            f"This call was interrupted ({how}), so it may have run, in full or in "
+            "part. Check its effects before you run it again."
+        ),
+        is_error=True,
+    )
 
 
 def _check_tool_name(name: str) -> None:
@@ -286,6 +362,7 @@ class DurableClaudeAgent:
         builtin_tools: Sequence[str] = (),
         tool_activities: Sequence[str] = ("Bash", "mcp__*"),
         tool_approvals: Sequence[str] = (),
+        repeatable_tools: Sequence[str] = (),
         tool_activity_timeout: timedelta = timedelta(minutes=10),
         tool_activity_retry_policy: RetryPolicy | None = None,
         segment_timeout: timedelta = timedelta(minutes=10),
@@ -324,12 +401,24 @@ class DurableClaudeAgent:
             tool_approvals: Patterns of ``tool_activities`` whose calls wait for a
                 human decision first, like ``needs_approval`` tools. Each must fall
                 within a ``tool_activities`` pattern.
+            repeatable_tools: Patterns of ``tool_activities`` whose calls are safe to
+                run again (read-only or idempotent): their steps are retried like
+                any Activity. A step of any other call never runs again once its call
+                may have run (its Worker died, or the step timed out): Claude gets a
+                result that says the call was interrupted and may have run. Only a
+                step that failed before Claude Code could run its call is tried
+                again, each time as a new Activity (``tool-<tool_use_id>-<n>``); if
+                none runs it, Claude gets a result that says it did not run. Each
+                pattern must fall within a ``tool_activities`` pattern. Claude Code
+                sends each MCP call its ``tool_use_id``
+                (``_meta["claudecode/toolUseId"]``), the same in every attempt, so an
+                MCP server can recognize a repeated call.
             tool_activity_timeout: Timeout of each attempt of such a call.
-            tool_activity_retry_policy: Retry policy of such a call. A failing command
-                is a result for Claude, not a failed Activity: the Activity fails only
-                when the step breaks before it has the call's result. By default
-                Temporal retries it without limit, so the command can run again then;
-                ``maximum_attempts=1`` runs it at most once.
+            tool_activity_retry_policy: How tool steps are retried: every failure for
+                ``repeatable_tools``, and for other calls only a failure before the
+                call could run. A failing command is a result for Claude, not a
+                failed Activity: the step fails only when it breaks before it has the
+                call's result. None means Temporal's defaults (no limit).
             segment_timeout: Timeout of each model segment attempt.
             segment_heartbeat_timeout: Heartbeat timeout of each segment attempt, and
                 of each tool step. It also bounds how late a cancel reaches a running
@@ -373,7 +462,8 @@ class DurableClaudeAgent:
             ValueError: If two tools share a name, a tool name is not 1 to 50 letters,
                 digits, ``_`` or ``-``, ``max_segments`` is below 1,
                 ``tool_activities`` names a tool that cannot run as its own Activity,
-                or a ``tool_approvals`` pattern falls outside ``tool_activities``.
+                or a ``tool_approvals`` or ``repeatable_tools`` pattern falls outside
+                ``tool_activities``.
             RuntimeError: If ``live_output`` is on and the Workflow is already
                 initialized, or another agent in this Workflow already uses it.
         """
@@ -390,9 +480,10 @@ class DurableClaudeAgent:
         self._model = model
         self._max_turns = max_turns
         self._builtin_tools = list(builtin_tools)
-        _check_tool_activities(tool_activities, tool_approvals)
+        _check_tool_activities(tool_activities, tool_approvals, repeatable_tools)
         self._tool_activities = list(tool_activities)
         self._tool_approvals = list(tool_approvals)
+        self._repeatable_tools = list(repeatable_tools)
         self._tool_activity_timeout = tool_activity_timeout
         self._tool_activity_retry_policy = tool_activity_retry_policy
         self._segment_timeout = segment_timeout
@@ -469,7 +560,14 @@ class DurableClaudeAgent:
 
     @property
     def tool_calls(self) -> list[dict[str, Any]]:
-        """Durable tool calls of the current run, with their status."""
+        """The tool calls of the current run, with their status.
+
+        Durable tools and Claude Code tools in ``tool_activities``. Each has ``id``,
+        ``name``, ``input`` and ``status``: ``started``, ``waiting for approval``,
+        ``rejected``, ``done``, ``failed`` (its Activity failed), ``not run`` or
+        ``interrupted`` (a Claude Code tool's step failed before or after its call
+        could start), ``cancelled`` or ``unknown tool``.
+        """
         return list(self._calls.values())
 
     # ---- handlers the user's Workflow exposes ----
@@ -1107,10 +1205,127 @@ class DurableClaudeAgent:
         if self._stream is not None:
             self._topic.publish(cap_event({**event, "at": workflow.now().isoformat()}))
 
-    def _tool_step(self, call: DeferredCall) -> ToolStepInput:
+    async def _tool_step_activity(
+        self,
+        call: DeferredCall,
+        activity_id: str,
+        retry_policy: RetryPolicy | None,
+        attempt: int = 1,
+        retry: ToolStepRetry | None = None,
+    ) -> ToolOutcome:
+        return await workflow.execute_activity(
+            TOOL_STEP_ACTIVITY_NAME,
+            self._tool_step(call, attempt, retry),
+            result_type=ToolOutcome,
+            activity_id=activity_id,
+            start_to_close_timeout=self._tool_activity_timeout,
+            heartbeat_timeout=self._segment_heartbeat_timeout,
+            retry_policy=retry_policy,
+            cancellation_type=self._segment_cancellation_type,
+            summary=f"tool {call.name}",
+        )
+
+    async def _step_until_its_call_runs(
+        self, call: DeferredCall, record: dict[str, Any], repeatable: bool
+    ) -> ToolOutcome:
+        """Run the tool step of a call.
+
+        A call that must not run twice gets one try per attempt, each attempt its own
+        Activity, so Temporal never runs a step again after its call may have run
+        (the Worker died, the step timed out). A step that failed before Claude Code
+        could run the call (``ToolCallNotRun``; for example on a Worker set up the
+        other way, or one that shut down) is tried again when the step says so
+        (from ``tool_activity_retry_policy``, see ``ToolStepRetry``), after its
+        backoff, while the history has room: each attempt adds about ten events,
+        where Temporal's own retries add none. A call in ``repeatable_tools`` gets
+        Temporal's own retries in one Activity. Every decision follows what the
+        steps recorded, so a change to these settings never breaks a replay.
+
+        Raises:
+            ActivityError: Of the last attempt, when the call may have run, or no
+                more attempts are left.
+        """
+        policy = self._tool_activity_retry_policy or RetryPolicy()
+        delay = policy.initial_interval.total_seconds()
+        cap = (
+            policy.maximum_interval.total_seconds()
+            if policy.maximum_interval is not None
+            else 100 * delay
+        )
+        retry = (
+            None
+            if repeatable
+            else ToolStepRetry(
+                maximum_attempts=policy.maximum_attempts,
+                non_retryable_error_types=list(policy.non_retryable_error_types or ()),
+            )
+        )
+        start = workflow.info().get_current_history_length()
+        attempt = 1
+        while True:
+            try:
+                return await self._tool_step_activity(
+                    call,
+                    f"tool-{call.id}" if attempt == 1 else f"tool-{call.id}-{attempt}",
+                    self._tool_activity_retry_policy
+                    if repeatable
+                    else RetryPolicy(maximum_attempts=1),
+                    attempt,
+                    retry,
+                )
+            except ActivityError as err:
+                if (
+                    _is_cancellation(err)
+                    or not _may_try_again(err)
+                    or not self._room_for_another_attempt(start)
+                ):
+                    raise
+            try:
+                await workflow.sleep(timedelta(seconds=min(delay, cap)))
+            except asyncio.CancelledError:
+                record["status"] = "not run"  # no attempt let the call run
+                raise
+            delay = min(delay * policy.backoff_coefficient, cap)
+            attempt += 1
+
+    def _room_for_another_attempt(self, start: int) -> bool:
+        """Whether the history has room for one more tool step attempt.
+
+        Not once the attempts at this call (since history length ``start``) added
+        ``_ATTEMPT_EVENTS`` events, and with ``auto_continue_as_new``, not once it is
+        time to continue as new: the next segment continues in a new run instead,
+        where Claude can call again. Unlike ``_history_nearly_full`` it measures
+        nothing: it is asked between attempts, not between steps.
+        """
+        info = workflow.info()
+        if info.get_current_history_length() - start >= _ATTEMPT_EVENTS:
+            return False
+        if self._auto_continue:
+            if self._continue_as_new_after_events is not None:
+                due = (
+                    info.get_current_history_length()
+                    >= self._continue_as_new_after_events
+                )
+            else:
+                due = info.is_continue_as_new_suggested()
+            if due:
+                return False
+        most_events = max(_HISTORY_EVENTS, self._continue_as_new_after_events or 0)
+        events = max(_ROOM_EVENTS, 2 * self._largest_step[0])
+        size = max(_ROOM_BYTES, 2 * self._largest_step[1])
+        return (
+            info.get_current_history_length() + events < most_events
+            and info.get_current_history_size() + size < _HISTORY_BYTES
+        )
+
+    def _tool_step(
+        self, call: DeferredCall, attempt: int = 1, retry: ToolStepRetry | None = None
+    ) -> ToolStepInput:
         """What the tool step needs: the call, and where its session paused."""
         state = self._state
         return ToolStepInput(
+            attempt=attempt,
+            retry=retry,
             session_id=state.session_id or "",
             checkpoint=state.checkpoint or "",
             call=call,
@@ -1196,18 +1411,19 @@ class DurableClaudeAgent:
                     is_error=True,
                 )
             record["status"] = "started"
+        # Asked only for tool steps, so other histories get no marker.
+        once = engine and self._new_checks(_ONCE_PATCH)
         try:
-            if tool is None:  # a Claude Code tool: its own Activity, a tool step
-                outcome: ToolOutcome = await workflow.execute_activity(
-                    TOOL_STEP_ACTIVITY_NAME,
-                    self._tool_step(call),
-                    result_type=ToolOutcome,
-                    activity_id=f"tool-{call.id}",
-                    start_to_close_timeout=self._tool_activity_timeout,
-                    heartbeat_timeout=self._segment_heartbeat_timeout,
-                    retry_policy=self._tool_activity_retry_policy,
-                    cancellation_type=self._segment_cancellation_type,
-                    summary=f"tool {call.name}",
+            if tool is None and once:  # a Claude Code tool: its own Activity
+                repeatable = any(
+                    fnmatch.fnmatchcase(call.name, p) for p in self._repeatable_tools
+                )
+                outcome = await self._step_until_its_call_runs(call, record, repeatable)
+                record["status"] = "done"
+                return outcome
+            if tool is None:  # as in Workflows started before ``_ONCE_PATCH``
+                outcome = await self._tool_step_activity(
+                    call, f"tool-{call.id}", self._tool_activity_retry_policy
                 )
                 record["status"] = "done"
                 return outcome
@@ -1227,6 +1443,8 @@ class DurableClaudeAgent:
             if _is_cancellation(err):
                 record["status"] = "cancelled"
                 raise  # the Workflow is being cancelled: do not hide it from Claude's loop
+            if once:
+                return _failed_step(err, record)
             cause = err.cause
             message = (
                 cause.message

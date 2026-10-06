@@ -7,9 +7,17 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from ._events import emit, publishing
-from ._models import SegmentInput, SegmentOutput, ToolOutcome, ToolStepInput
+from ._models import (
+    TOOL_CALL_NOT_RUN,
+    TRY_AGAIN,
+    SegmentInput,
+    SegmentOutput,
+    ToolOutcome,
+    ToolStepInput,
+)
 from ._workflow import SEGMENT_ACTIVITY_NAME, TOOL_STEP_ACTIVITY_NAME
 
 
@@ -87,6 +95,15 @@ def make_tool_step_activity(
 ) -> Callable[..., Any]:
     """Build the tool step Activity around a runner that has ``run_tool_step``.
 
+    ``run_tool_step(step, attempt)`` returns the call's result. A step that fails says
+    on which side of the call's start it failed: an ``ApplicationError`` of type
+    ``TOOL_CALL_NOT_RUN`` means the call did not run, so the Workflow may try again
+    (as a new Activity); any other failure means it may have run
+    (``TOOL_CALL_INTERRUPTED`` says so), so it is not run again unless the tool is in
+    ``repeatable_tools``. The Activity adds to a ``TOOL_CALL_NOT_RUN`` failure whether
+    the call may be tried again (``step.retry``), so the Workflow's decision is in
+    the history.
+
     Args:
         runner: Runs the tool step (``ClaudeAgentSdkRunner``, ``ScriptedClaude``).
         heartbeat_every: Seconds between heartbeats while the step runs (more often
@@ -111,7 +128,40 @@ def make_tool_step_activity(
         beater = asyncio.create_task(beat())
         try:
             return await runner.run_tool_step(step, info.attempt)
+        except ApplicationError as err:
+            if step.retry is None or err.type != TOOL_CALL_NOT_RUN:
+                raise
+            raise ApplicationError(
+                err.message,
+                {TRY_AGAIN: _may_try_again(step, err)},  # first: the Workflow reads it
+                *err.details,
+                type=TOOL_CALL_NOT_RUN,
+                non_retryable=err.non_retryable,
+                next_retry_delay=err.next_retry_delay,
+                category=err.category,
+            ) from err.__cause__
         finally:
             beater.cancel()
 
     return run_claude_tool_step
+
+
+def _may_try_again(step: ToolStepInput, err: ApplicationError) -> bool:
+    """Whether a step whose call did not run may be tried again (``step.retry``).
+
+    Not when the step's error is non-retryable, when its type or that of the error
+    behind it (as Temporal names it: an ``ApplicationError``'s type, or the class
+    name) is one of the non-retryable types, or when no attempt is left.
+    """
+    retry = step.retry
+    if retry is None or err.non_retryable:
+        return False
+    behind = err.__cause__
+    types = {TOOL_CALL_NOT_RUN}
+    if isinstance(behind, ApplicationError):
+        types.add(behind.type or "")
+    elif behind is not None:
+        types.add(type(behind).__name__)
+    if types & set(retry.non_retryable_error_types):
+        return False
+    return not 0 < retry.maximum_attempts <= step.attempt

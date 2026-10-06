@@ -16,6 +16,8 @@ from temporalio.claude_agent_sdk._activity import (
 )
 from temporalio.claude_agent_sdk._events import follow_agent
 from temporalio.claude_agent_sdk._models import (
+    TOOL_CALL_INTERRUPTED,
+    TOOL_CALL_NOT_RUN,
     AgentState,
     ConversationRef,
     DeferredCall,
@@ -24,6 +26,7 @@ from temporalio.claude_agent_sdk._models import (
     ToolOutcome,
     ToolSpec,
     ToolStepInput,
+    ToolStepRetry,
 )
 from temporalio.claude_agent_sdk._plugin import ClaudeAgentPlugin
 from temporalio.claude_agent_sdk._runner import ClaudeAgentSdkRunner
@@ -40,6 +43,8 @@ from . import testing
 
 __all__ = [
     "SEGMENT_ACTIVITY_NAME",
+    "TOOL_CALL_INTERRUPTED",
+    "TOOL_CALL_NOT_RUN",
     "TOOL_STEP_ACTIVITY_NAME",
     "AgentState",
     "ClaudeAgentPlugin",
@@ -55,6 +60,7 @@ __all__ = [
     "ToolOutcome",
     "ToolSpec",
     "ToolStepInput",
+    "ToolStepRetry",
     "activity_as_tool",
     "follow_agent",
     "make_segment_activity",

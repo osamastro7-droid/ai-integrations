@@ -8,6 +8,8 @@ came with a fix failed before it; the fault tests check paths that already held.
 
 from __future__ import annotations
 
+import asyncio
+import errno
 import json
 import logging
 import os
@@ -25,6 +27,7 @@ import claude_agent_sdk
 import pytest
 from claude_agent_sdk import HookMatcher
 
+from temporalio.activity import ActivityCancellationDetails
 from temporalio.claude_agent_sdk import (
     ClaudeAgentSdkRunner,
     FileSessionStore,
@@ -35,6 +38,10 @@ from temporalio.claude_agent_sdk import (
     _runner,
     _stand_in,
 )
+from temporalio.claude_agent_sdk._models import (
+    TOOL_CALL_INTERRUPTED,
+    TOOL_CALL_NOT_RUN,
+)
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 from tests.engine_tools.policy import shell_policy
@@ -44,6 +51,8 @@ from tests.helpers.fake_messages_api import (
     history_of,
     start_with_policy,
 )
+from tests.helpers.processes import alive
+from tests.test_crash import wait_until
 
 pytestmark = pytest.mark.timeout(240)
 TOOLS = [ToolSpec("count", "Count one step.", {"type": "object"})]
@@ -146,14 +155,14 @@ async def test_in_an_activity_a_kept_result_is_logged_with_the_engines_failure(
     )
 
 
-async def test_a_tool_step_whose_engine_breaks_before_the_result_is_retried(
+async def test_a_tool_step_whose_engine_breaks_before_the_result_may_have_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Here the command ran, but the engine broke just before the step got its result.
-    The step cannot tell this from a command that never ran, so it fails with the
-    engine's error and Temporal retries it, which runs the command again: the
-    documented at-least-once of this path (``maximum_attempts=1`` runs it at most
-    once). It never makes up a result."""
+    The hook had let the call run, so the step fails as ``ToolCallInterrupted``: the
+    Workflow then gives it no other attempt (unless the tool is in
+    ``repeatable_tools``) and tells Claude the call may have run. It never makes up a
+    result. A step run again anyway (a repeatable tool) runs the command again."""
     effects = tmp_path / "work" / "effects.log"
     api = start_with_policy(shell_policy)
     runner = make_runner(tmp_path, api)
@@ -171,8 +180,11 @@ async def test_a_tool_step_whose_engine_breaks_before_the_result_is_retried(
     try:
         out = await pause_at_bash(runner, "echo ran >> effects.log && echo local")
         monkeypatch.setattr(_runner, "query", breaks_before_the_result)
-        with pytest.raises(ConnectionResetError, match="the engine went away"):
+        with pytest.raises(ApplicationError) as failed:
             await runner.run_tool_step(step_for(out), 1)
+        assert failed.value.type == TOOL_CALL_INTERRUPTED
+        assert failed.value.message == "the engine went away"
+        assert isinstance(failed.value.__cause__, ConnectionResetError)
         assert lines(effects) == ["ran"]
         monkeypatch.setattr(_runner, "query", real)
         outcome = await runner.run_tool_step(step_for(out), 2)  # Temporal's retry
@@ -204,7 +216,7 @@ async def test_a_tool_step_that_stopped_says_its_call_did_not_run(
             await runner.run_tool_step(step_for(out), 1)
     finally:
         api.stop()
-    assert failed.value.non_retryable
+    assert failed.value.non_retryable and failed.value.type == TOOL_CALL_NOT_RUN
     assert failed.value.message.startswith(
         f"Claude Code did not run tool call {out.deferred.id} (Bash) in its step: "
     )
@@ -809,11 +821,12 @@ async def test_commands_see_none_of_the_plugins_variables(
     assert seen == "none"
 
 
-async def test_a_tool_step_on_a_worker_set_up_the_other_way_is_retried(
+async def test_a_tool_step_on_a_worker_set_up_the_other_way_did_not_run(
     tmp_path: Path,
 ) -> None:
     """Like a segment, a tool step that lands on a Worker that keeps conversations
-    elsewhere fails in a way Temporal retries, until a matching Worker takes it."""
+    elsewhere fails in a way the Workflow retries, until a matching Worker takes it:
+    the call did not run (``ToolCallNotRun``, retryable)."""
     api = start_with_policy(shell_policy)
     held = make_runner(tmp_path, api)
     stored = make_runner(
@@ -821,15 +834,234 @@ async def test_a_tool_step_on_a_worker_set_up_the_other_way_is_retried(
     )
     try:
         out = await pause_at_bash(held, "echo hi")
-        with pytest.raises(RuntimeError, match="kept in its Workflow.*Retrying"):
-            await stored.run_tool_step(step_for(out), 1)
         no_conversation = step_for(out)
         no_conversation.transcript = None
-        with pytest.raises(RuntimeError, match="session store this runner.*Retrying"):
-            await held.run_tool_step(no_conversation, 1)
-        with pytest.raises(ApplicationError):  # a real mismatch is final
+        for runner, step, words in [
+            (stored, step_for(out), "kept in its Workflow"),
+            (held, no_conversation, "session store this runner"),
+        ]:
+            with pytest.raises(ApplicationError) as failed:
+                await runner.run_tool_step(step, 1)
+            assert failed.value.type == TOOL_CALL_NOT_RUN
+            assert not failed.value.non_retryable
+            assert words in failed.value.message
+            assert not failed.value.message.endswith("Retrying.")
+        with pytest.raises(ApplicationError) as failed:  # a real mismatch is final
             wrong = step_for(out)
             wrong.checkpoint = str(uuid.uuid4())
             await held.run_tool_step(wrong, 1)
+        assert failed.value.type == TOOL_CALL_NOT_RUN and failed.value.non_retryable
     finally:
         api.stop()
+
+
+# ---- a tool step that cannot end with its Worker, or whose Worker shuts down ----
+
+
+def refuse_locks(fd: int) -> None:
+    """Like some network and FUSE file systems."""
+    del fd
+    raise OSError(errno.ENOLCK, "No locks available")
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [
+        pytest.param(
+            "launcher",
+            marks=pytest.mark.skipif(
+                sys.platform == "win32", reason="Windows starts the engine directly"
+            ),
+        ),
+        "lock",
+        "job",
+    ],
+)
+async def test_a_tool_step_whose_engine_could_not_end_with_its_worker_did_not_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str
+) -> None:
+    """By default (``engine_cleanup="required"``) the step stops before Claude Code
+    runs the call, and says the call did not run, so the Workflow tries it again
+    (on another Worker, or this one once fixed). The job object of Windows is
+    simulated, on every system: its engine had started, and is ended."""
+    from claude_agent_sdk._internal.transport import subprocess_cli
+
+    effects = tmp_path / "work" / "effects.log"
+    api = start_with_policy(shell_policy)
+    runner = make_runner(tmp_path, api)
+    before = _runner._child_pids()  # earlier tests' processes, if any
+    started: set[int] = set()
+
+    def outside_the_job() -> dict[int, str]:
+        failed: dict[int, str] = {}
+        for child in subprocess_cli._ACTIVE_CHILDREN:
+            pid = getattr(child, "pid", None)
+            if isinstance(pid, int) and pid not in before:
+                started.add(pid)
+                failed[pid] = _runner._job_problem("cannot join (Windows error 5)")
+        return failed
+
+    try:
+        out = await pause_at_bash(runner, "echo ran >> effects.log")
+        if cause == "launcher":
+            script = tmp_path / "launch"
+            script.write_text("#!/bin/sh\nexit 0\n")  # not executable
+            monkeypatch.setattr(_runner, "_launch_scripts", {})
+            monkeypatch.setattr(_runner, "_write_launch_script", lambda _: str(script))
+        elif cause == "lock":
+            monkeypatch.setattr(_runner, "_lock_file", refuse_locks)
+        else:
+            monkeypatch.setattr(_runner, "_engines_end_with_worker", outside_the_job)
+            monkeypatch.setattr(_runner, "_JOB_POLL", True)  # as on Windows
+        with pytest.raises(ApplicationError) as failed:
+            await runner.run_tool_step(step_for(out), 1)
+    finally:
+        api.stop()
+    assert failed.value.type == TOOL_CALL_NOT_RUN and not failed.value.non_retryable
+    assert {"launcher": "cannot run", "lock": "cannot lock files", "job": "error 5"}[
+        cause
+    ] in failed.value.message
+    assert lines(effects) == []
+    if cause == "job":
+        assert started, "the engine had started"
+        await wait_until(lambda: not [pid for pid in started if alive(pid)], 15)
+    else:
+        assert runner._stand_in.requests == 0  # Claude Code never started
+
+
+async def run_until_cancelled(
+    runner: ClaudeAgentSdkRunner,
+    step: ToolStepInput,
+    ready: Any,
+    shutting_down: bool,
+    **details: bool,
+) -> Any:
+    """Run ``step`` as an Activity, cancel it once ``ready()`` (with ``details``, after
+    the Worker began to shut down if ``shutting_down``), and return what the Activity
+    returned or raised."""
+    env = ActivityEnvironment()
+    task = asyncio.ensure_future(env.run(runner.run_tool_step, step, 1))
+    deadline = time.monotonic() + 120
+    while not ready():
+        assert time.monotonic() < deadline and not task.done()
+        await asyncio.sleep(0.05)
+    if shutting_down:
+        env.worker_shutdown()
+    env.cancel(cancellation_details=ActivityCancellationDetails(**details))
+    try:
+        return await asyncio.wait_for(task, 60)
+    except BaseException as err:  # noqa: BLE001
+        return err
+
+
+@pytest.mark.parametrize("when", ["before the engine started", "during the call"])
+async def test_a_tool_step_cut_by_its_workers_shutdown_says_whether_its_call_ran(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, when: str
+) -> None:
+    """A Worker that shuts down cancels its steps. Before the hook let the call run
+    (here: before Claude Code started), the call did not run (the Workflow tries it
+    again elsewhere); after, it may have run (it is not run again)."""
+    effects = tmp_path / "work" / "effects.log"
+    api = start_with_policy(shell_policy)
+    runner = make_runner(tmp_path, api)
+    real = claude_agent_sdk.query
+    starting = [False]
+
+    async def slow_to_start(*args: Any, **kwargs: Any) -> Any:
+        starting[0] = True
+        await asyncio.sleep(60)
+        async for message in real(*args, **kwargs):
+            yield message
+
+    try:
+        command = "echo ran >> effects.log; sleep 60"
+        out = await pause_at_bash(runner, command)
+        if when == "before the engine started":
+            monkeypatch.setattr(_runner, "query", slow_to_start)
+            ready: Any = lambda: starting[0]  # noqa: E731
+        else:
+            ready = lambda: lines(effects) == ["ran"]  # noqa: E731
+        raised = await run_until_cancelled(
+            runner, step_for(out), ready, True, worker_shutdown=True
+        )
+    finally:
+        api.stop()
+    assert isinstance(raised, ApplicationError), raised
+    assert raised.message == "Its Worker shut down."
+    early = when == "before the engine started"
+    assert raised.type == (TOOL_CALL_NOT_RUN if early else TOOL_CALL_INTERRUPTED)
+    assert not raised.non_retryable
+    assert lines(effects) == ([] if early else ["ran"])
+
+
+async def test_a_tool_step_keeps_its_result_when_its_worker_shuts_down_after_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The call ran and the step has its result; the Worker shuts down while the
+    engine finishes: the step returns the result, so the call is not reported as
+    interrupted."""
+    api = start_with_policy(shell_policy)
+    runner = make_runner(tmp_path, api)
+    real = claude_agent_sdk.query
+    has_result = [False]
+
+    async def hangs_after_the_result(*args: Any, **kwargs: Any) -> Any:
+        async for message in real(*args, **kwargs):
+            yield message
+            if isinstance(message, claude_agent_sdk.UserMessage) and any(
+                isinstance(block, claude_agent_sdk.ToolResultBlock)
+                for block in message.content
+            ):
+                has_result[0] = True
+                await asyncio.sleep(60)
+
+    try:
+        out = await pause_at_bash(runner, "echo local")
+        monkeypatch.setattr(_runner, "query", hangs_after_the_result)
+        kept = await run_until_cancelled(
+            runner, step_for(out), lambda: has_result[0], True, worker_shutdown=True
+        )
+    finally:
+        api.stop()
+    assert not isinstance(kept, BaseException), kept
+    assert kept.content == "local" and not kept.is_error
+
+
+@pytest.mark.parametrize(
+    ("shutting_down", "details"),
+    [
+        (False, {"cancel_requested": True}),
+        (True, {"cancel_requested": True}),
+        (True, {"timed_out": True}),
+    ],
+    ids=["workflow", "workflow-during-shutdown", "timeout-during-shutdown"],
+)
+async def test_a_tool_step_cancelled_for_another_reason_stays_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shutting_down: bool,
+    details: dict[str, bool],
+) -> None:
+    """Only a cancel because the Worker shuts down becomes a failure that says
+    whether the call ran: a cancel the Workflow requested, even while the Worker
+    shuts down, or a timeout, keeps its meaning."""
+    api = start_with_policy(shell_policy)
+    runner = make_runner(tmp_path, api)
+    real = claude_agent_sdk.query
+    starting = [False]
+
+    async def slow_to_start(*args: Any, **kwargs: Any) -> Any:
+        starting[0] = True
+        await asyncio.sleep(60)
+        async for message in real(*args, **kwargs):
+            yield message
+
+    try:
+        out = await pause_at_bash(runner, "echo local")
+        monkeypatch.setattr(_runner, "query", slow_to_start)
+        raised = await run_until_cancelled(
+            runner, step_for(out), lambda: starting[0], shutting_down, **details
+        )
+    finally:
+        api.stop()
+    assert isinstance(raised, asyncio.CancelledError), raised

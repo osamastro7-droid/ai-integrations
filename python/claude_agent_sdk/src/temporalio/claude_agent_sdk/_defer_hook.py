@@ -9,7 +9,10 @@ path, where a later "defer" is ignored.
 
 Tool steps: with ``$TCA_ALLOW_ID`` set, the engine resumed a session that paused at a
 Claude Code tool call, to run exactly that call; the hook allows it and denies
-anything else.
+anything else. Just before it allows the call, it creates ``$TCA_HOOK_DIR/allowed``,
+so after a failure the runner knows whether the call may have run. The runner creates
+the same file when its step ends; whichever creates it first wins, so a call the
+runner reports as not run can never start afterwards.
 
 Subagents (``agent_id`` in the event) cannot pause the run. A subagent's call to a
 tool that runs as an Activity (a durable tool, or a Claude Code tool in
@@ -91,6 +94,12 @@ WORKER_LOCK = "worker.lock"
 ANSWERED = "answered"
 """The file in ``$TCA_HOOK_DIR`` with calls answered after a warm engine started."""
 
+ALLOWED = "allowed"
+"""The file in ``$TCA_HOOK_DIR`` that a tool step's hook creates just before it lets the
+step's call run (with the call's id in it): from then on, the call may have run. The
+runner creates it (empty) when the step ends, if the hook has not: then the call
+never runs."""
+
 REASON_KEYS = {
     NOT_RUN: "not_run",
     STOPPED: "stopped",
@@ -117,6 +126,36 @@ def _deny(reason: str = NOT_RUN) -> dict[str, Any]:
     }
 
 
+def _note_allowed(run_dir: str | None, tool_use_id: str) -> bool:
+    """Record that a tool step's call is about to run; False if it must not run.
+
+    The record is ``allowed``, created only if it does not exist yet (atomic), with
+    the call's id in it. The runner creates the same file when its step ends: if it
+    is there first, the step is over and the call must not run. After a failure the
+    runner knows: no record, the call did not run; a record, it may have run. A call
+    whose start cannot be recorded must not run.
+    """
+    if run_dir is None:
+        return True  # no runner folder to tell (not a step this plugin started)
+    path = os.path.join(run_dir, ALLOWED)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        try:  # this call's own record (asked again), or the runner's
+            with open(path, encoding="utf-8") as handle:
+                return handle.read() == tool_use_id
+        except OSError:
+            return False
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(tool_use_id)
+    except OSError:
+        pass  # the record exists: the runner takes the call to have run
+    return True
+
+
 def _record(run_dir: str | None, tool_use_id: str, output: dict[str, Any]) -> None:
     """Write the denial record of a call the hook denies (when the folder exists)."""
     reason = REASON_KEYS.get(str(output.get("permissionDecisionReason")))
@@ -124,7 +163,10 @@ def _record(run_dir: str | None, tool_use_id: str, output: dict[str, Any]) -> No
         return
     try:
         folder = os.path.join(run_dir, "denied")
-        os.makedirs(folder, exist_ok=True)
+        try:
+            os.mkdir(folder)  # never the run's folder itself: a removed one stays gone
+        except FileExistsError:
+            pass
         with open(
             os.path.join(folder, denial_name(tool_use_id)), "w", encoding="utf-8"
         ) as handle:
@@ -213,8 +255,10 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
     elif allow_id is not None:  # a tool step: exactly this call, nothing else
         if stopped:
             output = _deny(STOPPED)
-        elif tool_use_id == allow_id:
+        elif tool_use_id == allow_id and _note_allowed(run_dir, tool_use_id):
             output = {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
+        elif tool_use_id == allow_id:
+            output = _deny(STOPPED)  # its start could not be recorded: it must not run
         else:
             output = _deny(STEP_ONLY)
     elif tool_use_id in answered and not event.get("agent_id"):
@@ -246,6 +290,8 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
                 with open(marker, encoding="utf-8") as handle:
                     if handle.read().strip() != tool_use_id:
                         output = _deny()
+            except OSError:
+                output = _deny(STOPPED)  # the folder went meanwhile: the run ended
     if run_dir is not None and os.path.isdir(run_dir):
         _record(run_dir, tool_use_id, output)
     log = os.environ.get("TCA_HOOK_LOG")

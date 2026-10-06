@@ -464,6 +464,39 @@ async def test_a_fixed_history_length_decides_continue_as_new(
     assert agent.should_continue_as_new()
 
 
+def test_tool_step_attempts_leave_room_in_the_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another attempt of a tool step whose call did not run needs room for a step
+    under Temporal's limits, within the call's own share of the history; with
+    ``auto_continue_as_new``, none once it is time to continue as new (the next
+    segment does, and Claude can call again there)."""
+    outside = OutsideWorkflow().install(monkeypatch)
+
+    def room(
+        events: int, size: int = 0, suggested: bool = False, start: int = 0, **kw: Any
+    ) -> bool:
+        outside.history.events, outside.history.size = events, size
+        outside.history.suggested = suggested
+        return DurableClaudeAgent(**kw)._room_for_another_attempt(start)
+
+    assert room(1_000)
+    assert room(1_000 + wf._ATTEMPT_EVENTS - 1, start=1_000)
+    assert not room(1_000 + wf._ATTEMPT_EVENTS, start=1_000)  # this call's share
+    assert not room(wf._HISTORY_EVENTS - wf._ROOM_EVENTS)
+    assert not room(1_000, size=wf._HISTORY_BYTES - wf._ROOM_BYTES)
+    more: dict[str, Any] = {"continue_as_new_after_events": 100_000}  # allowed more
+    assert room(wf._HISTORY_EVENTS, start=wf._HISTORY_EVENTS - 10, **more)
+    assert room(1_000, suggested=True)  # this agent does not continue as new
+    assert not room(1_000, suggested=True, auto_continue_as_new=True)
+    after: dict[str, Any] = {
+        "auto_continue_as_new": True,
+        "continue_as_new_after_events": 500,
+    }
+    assert room(499, suggested=True, **after)  # the fixed length decides
+    assert not room(500, **after)
+
+
 async def test_a_state_too_large_to_carry_is_said_once(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

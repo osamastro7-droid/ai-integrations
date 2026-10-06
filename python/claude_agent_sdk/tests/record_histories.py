@@ -19,7 +19,13 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from temporalio.claude_agent_sdk import ClaudeAgentPlugin, SegmentInput, SegmentOutput
+from temporalio.claude_agent_sdk import (
+    TOOL_CALL_INTERRUPTED,
+    TOOL_CALL_NOT_RUN,
+    ClaudeAgentPlugin,
+    SegmentInput,
+    SegmentOutput,
+)
 from temporalio.claude_agent_sdk.testing import ScriptedClaude
 from temporalio.client import Client, WorkflowHandle
 from temporalio.exceptions import ApplicationError
@@ -264,6 +270,38 @@ async def bash(client: Client, queue: str) -> str:
     return queue
 
 
+async def bash_retried(client: Client, queue: str) -> str:
+    """A Bash call whose first step fails before the call could start (it is tried
+    again, as a new Activity) and whose second step fails after it (Claude learns
+    the call may have run)."""
+    handle = await client.start_workflow(
+        ShellWorkflow.run,
+        args=["run: make test", ShellOptions()],
+        id=queue,
+        task_queue=queue,
+    )
+    await handle.result()
+    return queue
+
+
+def pretend_bash() -> Callable[[dict[str, Any]], str]:
+    """Bash in tool steps: it prints what it would have run."""
+    return lambda args: f"pretend output of {args['command']}"
+
+
+def bash_that_fails_twice() -> Callable[[dict[str, Any]], str]:
+    """Bash in tool steps: not run the first time, interrupted the second."""
+    tries: list[str] = []
+
+    def bash(args: dict[str, Any]) -> str:
+        tries.append(args["command"])
+        if len(tries) == 1:
+            raise ApplicationError("not here", type=TOOL_CALL_NOT_RUN)
+        raise ApplicationError("the engine went away", type=TOOL_CALL_INTERRUPTED)
+
+    return bash
+
+
 async def failed_task(client: Client, queue: str) -> str:
     """A task stopped by max_segments, then a task that answers the waiting call."""
     handle = await client.start_workflow(
@@ -293,10 +331,16 @@ SCENARIOS: dict[str, tuple[Scenario, Callable[[], Any], str]] = {
     "update-chat": (update_chat, lambda: count_policy, "held"),
     "signal-approval": (signal_approval, lambda: count_policy, "held"),
     "bash-approval": (bash, lambda: shell_policy, "held"),
+    "bash-retried": (bash_retried, lambda: shell_policy, "held"),
     "failed-task": (failed_task, lambda: count_policy, "held"),
     "failed-segment": (failed_segment, lambda: count_policy, "held"),
 }
 """Name: (how to run it, the scripted policy, where the conversation lives)."""
+
+ENGINE_TOOLS: dict[str, Callable[[], Callable[[dict[str, Any]], str]]] = {
+    "bash-retried": bash_that_fails_twice
+}
+"""Scenarios whose Bash tool steps do something else than ``pretend_bash``."""
 
 
 def scrub(history_json: str) -> str:
@@ -320,7 +364,7 @@ async def record(client: Client, name: str, folder: Path) -> list[Path]:
     runner: Any = ScriptedClaude(
         policy(),
         folder / name if mode == "store" else None,
-        engine_tools={"Bash": lambda args: f"pretend output of {args['command']}"},
+        engine_tools={"Bash": ENGINE_TOOLS.get(name, pretend_bash)()},
     )
     if name == "failed-segment":
         runner = ExplodingRunner(runner)

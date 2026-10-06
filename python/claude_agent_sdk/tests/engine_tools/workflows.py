@@ -24,11 +24,24 @@ class ShellOptions:
         tool_activities: The agent's ``tool_activities``.
         tool_approvals: The agent's ``tool_approvals``.
         segment_timeout: Seconds each model segment attempt may take.
+        repeatable_tools: The agent's ``repeatable_tools``.
+        tool_timeout: Seconds each tool step attempt may take.
+        tool_retry_initial: The tool steps' retry policy: first interval, seconds.
+        tool_retry_backoff: Its backoff coefficient.
+        tool_retry_max_interval: Its maximum interval in seconds (0: Temporal's
+            default, 100 times the first).
+        tool_retry_attempts: Its maximum attempts (0: unlimited).
     """
 
     tool_activities: list[str] = field(default_factory=lambda: ["Bash", "mcp__*"])
     tool_approvals: list[str] = field(default_factory=list)
     segment_timeout: float = 120
+    repeatable_tools: list[str] = field(default_factory=list)
+    tool_timeout: float = 600
+    tool_retry_initial: float = 0.2
+    tool_retry_backoff: float = 2.0
+    tool_retry_max_interval: float = 0
+    tool_retry_attempts: int = 5
 
 
 @workflow.defn
@@ -49,10 +62,19 @@ class ShellWorkflow:
             builtin_tools=["Bash"],
             tool_activities=options.tool_activities,
             tool_approvals=options.tool_approvals,
+            repeatable_tools=options.repeatable_tools,
+            tool_activity_timeout=timedelta(seconds=options.tool_timeout),
             segment_timeout=timedelta(seconds=options.segment_timeout),
             segment_heartbeat_timeout=timedelta(seconds=10),
             segment_retry_policy=FAST,
-            tool_activity_retry_policy=FAST,
+            tool_activity_retry_policy=RetryPolicy(  # FAST unless a test says otherwise
+                initial_interval=timedelta(seconds=options.tool_retry_initial),
+                backoff_coefficient=options.tool_retry_backoff,
+                maximum_interval=timedelta(seconds=options.tool_retry_max_interval)
+                if options.tool_retry_max_interval
+                else None,
+                maximum_attempts=options.tool_retry_attempts,
+            ),
         )
 
     @workflow.run

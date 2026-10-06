@@ -7,6 +7,18 @@ from typing import Any
 
 from temporalio.contrib.workflow_streams import WorkflowStreamState
 
+TOOL_CALL_NOT_RUN = "ToolCallNotRun"
+"""Type of the ``ApplicationError`` of a tool step that failed before Claude Code ran
+its call: the call did not run, and Claude can call it again."""
+
+TOOL_CALL_INTERRUPTED = "ToolCallInterrupted"
+"""Type of the ``ApplicationError`` of a tool step that failed after its call was let
+run: the call may have run, in full or in part."""
+
+TRY_AGAIN = "try_again"
+"""Key in the details of a ``ToolCallNotRun`` failure: whether the Workflow may run
+the call in a new attempt (see ``ToolStepRetry``)."""
+
 
 @dataclass
 class ToolSpec:
@@ -126,6 +138,27 @@ class SegmentInput:
 
 
 @dataclass
+class ToolStepRetry:
+    """When a tool step whose call did not run may be tried again.
+
+    For calls outside ``repeatable_tools``, the Workflow runs each attempt as its own
+    Activity with one try. The tool step Activity decides from this whether its
+    ``ToolCallNotRun`` failure may be tried again, and says so in the failure's
+    details: the decision is then in the history, so a later change to the retry
+    settings never changes it on replay.
+
+    Attributes:
+        maximum_attempts: Attempts in all (0: no limit), from
+            ``tool_activity_retry_policy``.
+        non_retryable_error_types: Error types not tried again: the step's own, or
+            the type of the error that made it fail.
+    """
+
+    maximum_attempts: int = 0
+    non_retryable_error_types: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ToolStepInput:
     """Input of a tool step: one Claude Code tool call, run as its own Activity.
 
@@ -140,6 +173,9 @@ class ToolStepInput:
         builtin_tools: The Claude Code built-in tools the segment enabled.
         conversation: Where the conversation the Workflow holds can be read.
         transcript: The committed conversation itself, for direct calls (tests).
+        attempt: Which attempt at the call this step is, from 1.
+        retry: When the step may be tried again if its call did not run; None when
+            Temporal's own retries run the step (``repeatable_tools``).
     """
 
     session_id: str
@@ -149,6 +185,8 @@ class ToolStepInput:
     builtin_tools: list[str] = field(default_factory=list)
     conversation: ConversationRef | None = None
     transcript: list[dict[str, Any]] | None = None
+    attempt: int = 1
+    retry: ToolStepRetry | None = None
 
 
 @dataclass

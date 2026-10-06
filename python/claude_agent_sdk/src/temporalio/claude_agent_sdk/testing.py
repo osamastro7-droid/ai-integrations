@@ -146,7 +146,9 @@ class ScriptedClaude:
             engine_tools: Stand-ins for Claude Code tools (such as ``Bash``) that run
                 as their own Activities: a call to a name in the agent's
                 ``tool_activities`` runs the function with the call's input in a tool
-                step. Others return ``{"ran": <name>}``.
+                step. Others return ``{"ran": <name>}``. To fail the step as a real
+                one can, raise ``ApplicationError`` of type ``TOOL_CALL_NOT_RUN``
+                (the call did not run) or ``TOOL_CALL_INTERRUPTED`` (it may have).
         """
         self._policy = policy
         self._engine_tools = dict(engine_tools or {})
