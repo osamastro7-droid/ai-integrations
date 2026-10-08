@@ -67,3 +67,20 @@ def file_policy(prompt: str, history: list[HistoryItem]) -> list[ToolCall] | Fin
             for h in history
         )
     )
+
+
+def edit_policy(prompt: str, history: list[HistoryItem]) -> list[ToolCall] | Final:
+    """'edit: <path>' edits the file together with a ``count``, then writes over it
+    (for the scripted runner, which has no Read). The answer says how each call went,
+    in order."""
+    path = prompt.split(": ", 1)[1]
+    edit = {"file_path": path, "old_string": "draft", "new_string": "final"}
+    plan = {
+        0: [ToolCall("Edit", edit), ToolCall("count", {"n": 1})],
+        2: [ToolCall("Write", {"file_path": path, "content": "written\n"})],
+    }
+    if len(history) in plan and not any(h.is_error for h in history):
+        return plan[len(history)]
+    return Final(
+        " ".join(f"{h.name}:" + ("error" if h.is_error else "ok") for h in history)
+    )

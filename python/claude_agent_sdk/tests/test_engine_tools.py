@@ -1126,10 +1126,15 @@ async def test_scripted_claude_plays_claude_code_tools_in_tool_steps(
 
 
 async def scripted_bash(
-    client: Client, options: ShellOptions, bash: Any, command: str = "make test"
+    client: Client,
+    options: ShellOptions,
+    bash: Any,
+    command: str = "make test",
+    calls: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[str]]:
     """Run ShellWorkflow with ScriptedClaude, ``bash`` standing in for Bash; return
-    the answer and the tool step Activities' ids."""
+    the answer and the tool step Activities' ids (and add ``tool_calls()`` to
+    ``calls``)."""
     from temporalio.claude_agent_sdk.testing import ScriptedClaude
 
     runner = ScriptedClaude(shell_policy, engine_tools={"Bash": bash})
@@ -1143,6 +1148,8 @@ async def scripted_bash(
         )
         result = await asyncio.wait_for(handle.result(), 90)
         steps = [i for n, i in await activity_types(handle) if n.endswith("tool_step")]
+        if calls is not None:
+            calls += await handle.query(ShellWorkflow.tool_calls)
     return result, steps
 
 
@@ -1160,8 +1167,10 @@ async def test_a_tool_step_whose_call_may_have_run_is_not_run_again(
         ran.append(args["command"])
         raise ApplicationError("the engine went away", type=TOOL_CALL_INTERRUPTED)
 
-    result, steps = await scripted_bash(client, ShellOptions(), bash)
+    calls: list[dict[str, Any]] = []
+    result, steps = await scripted_bash(client, ShellOptions(), bash, calls=calls)
     assert ran == ["make test"] and len(steps) == 1
+    assert [c["status"] for c in calls] == ["interrupted"]
     assert result == (
         "error: This call was interrupted (its step failed after the call started), "
         "so it may have run, in full or in part. Check its effects before you run it "
@@ -1220,8 +1229,10 @@ async def test_a_tool_step_that_never_ran_its_call_says_so(client: Client) -> No
             "this Worker is set up the other way", type=TOOL_CALL_NOT_RUN
         )
 
-    result, steps = await scripted_bash(client, ShellOptions(), bash)
+    calls: list[dict[str, Any]] = []
+    result, steps = await scripted_bash(client, ShellOptions(), bash, calls=calls)
     assert len(tries) == len(steps) == 5
+    assert [c["status"] for c in calls] == ["not run"]
     assert result == (
         "error: This call did not run: its step failed before the call could start. "
         "You can call it again."

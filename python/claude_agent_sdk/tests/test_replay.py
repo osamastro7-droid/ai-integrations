@@ -5,7 +5,8 @@
 the tool or while waiting for approval; calls in one message; Continue-As-New in a
 long task, with live output, and in chats over Signals and Updates; approval by
 Signal; a Claude Code tool with approval, and one whose steps fail before and after
-its call could start; and tasks that fail. A change to the Workflow code that would
+its call could start; Edits and a Write whose steps return Claude Code's own record;
+and tasks that fail. A change to the Workflow code that would
 break Workflows already running fails here.
 
 The ``first-version-*`` histories were recorded with the plugin as first published
@@ -47,6 +48,7 @@ def test_every_scenario_has_a_golden_history() -> None:
         "parallel-approval",
         "bash-approval",
         "bash-retried",
+        "file-steps",
     }
 
 

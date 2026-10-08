@@ -15,7 +15,6 @@ of that engine gets a short text, and is counted.
 
 from __future__ import annotations
 
-import copy
 import hmac
 import json
 import secrets
@@ -41,12 +40,14 @@ class RecordedCall:
         served: How many times the block was sent (one, when all went well).
         other: Model calls answered with ``ANSWER`` instead, after the block was sent
             or in a request that did not offer the call's tool.
+        closed: The step ended (``StandInModel.done``): the block is not sent again.
     """
 
     key: str
     block: dict[str, Any]
     served: int = 0
     other: int = 0
+    closed: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -108,7 +109,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not self.path.startswith("/v1/messages"):
             return self._send({})
         with call.lock:  # handlers run in threads
-            first = call.served == 0 and _offers(body, str(call.block.get("name")))
+            first = (
+                not call.closed
+                and call.served == 0
+                and _offers(body, str(call.block.get("name")))
+            )
             if first:
                 call.served += 1
             else:
@@ -120,7 +125,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "type": "tool_use",
                     "id": block.get("id"),
                     "name": block.get("name"),
-                    "input": copy.deepcopy(block.get("input") or {}),
+                    "input": block.get("input") or {},  # only read, to send it
                 }
             ]
         else:
@@ -204,15 +209,26 @@ class StandInModel:
 
     def serve(self, block: dict[str, Any]) -> RecordedCall:
         """Answer the engine that sends the returned key with ``block``, once."""
-        call = RecordedCall(key=secrets.token_hex(16), block=copy.deepcopy(block))
+        # A copy, made through json: as deep as the conversation can be (deepcopy
+        # takes two Python frames per level).
+        call = RecordedCall(
+            key=secrets.token_hex(16), block=json.loads(json.dumps(block))
+        )
         with self._lock:
             self._calls[call.key] = call
         return call
 
-    def done(self, call: RecordedCall) -> None:
-        """Stop answering the step's engine (its key gets 401 from now on)."""
+    def done(self, call: RecordedCall) -> bool:
+        """Stop answering the step's engine; whether it was ever sent the call.
+
+        Its key gets 401 from now on, and a request already in flight gets the short
+        text instead of the call, so the answer stays true.
+        """
         with self._lock:
             self._calls.pop(call.key, None)
+        with call.lock:
+            call.closed = True
+            return call.served > 0
 
     def call_for(self, key: str) -> RecordedCall | None:
         """The running step that ``key`` belongs to, compared in constant time."""

@@ -152,6 +152,8 @@ def test_denials_claude_may_retry_say_first_that_nothing_failed() -> None:
     assert hook.MAIN_AGENT_ONLY.startswith("Not an error, ")
     assert "Call this tool again" in hook.NOT_RUN
     assert "calling it again will not help" in hook.MAIN_AGENT_ONLY
+    # A hook that failed denies the call; Claude reads first that it did not run.
+    assert hook.FAILED.startswith("This call did not run: ")
 
 
 def test_the_hooks_records_name_each_reason() -> None:
@@ -162,8 +164,36 @@ def test_the_hooks_records_name_each_reason() -> None:
         hook.MAIN_AGENT_ONLY: "main_agent_only",
         hook.STEP_ONLY: "step_only",
         hook.OTHER_INPUT: "other_input",
+        hook.FAILED: "failed",
     }
     assert hook.WORKER_LOCK == "worker.lock"
+
+
+# ---- tool steps (the README states these) ----
+
+
+def test_tool_step_settings_the_readme_states() -> None:
+    """Edit and Write go back as Claude Code's own record; a step's turn ends after
+    its call; a continuing segment gets 2 minutes to start its turn, 3 times."""
+    assert runner.RECORDED_TOOLS == ("Edit", "Write")
+    assert runner.STEP_MAX_TURNS == 1
+    assert runner.CONTINUE_START_SECONDS == 120.0
+    assert runner.CONTINUE_ATTEMPTS == 3
+    # Claude Code's own switch (not documented): the segment after a record needs it.
+    assert runner.RESUME == "CLAUDE_CODE_RESUME_INTERRUPTED_TURN"
+    assert runner.CONTINUE_ENV[runner.RESUME] == "1"
+    assert runner.STEP_ENV[runner.RESUME] == ""
+
+
+def test_engine_flags_that_approve_calls_are_refused_in_extra_args() -> None:
+    """A tool step replaces permission_mode and the permission prompt tool; a flag in
+    extra_args would come after its own and win."""
+    assert runner._APPROVING_FLAGS == {  # type: ignore[reportPrivateUsage]
+        "permission-mode",
+        "dangerously-skip-permissions",
+        "allow-dangerously-skip-permissions",
+        "permission-prompt-tool",
+    }
 
 
 @pytest.mark.parametrize(

@@ -35,7 +35,8 @@ again.)
 
 Every denial is also written to ``$TCA_HOOK_DIR/denied/<tool_use_id>`` (the reason's
 key), so the runner knows which calls the hook denied without reading tool output,
-which a tool controls.
+which a tool controls. If deciding fails, the hook denies the call (``FAILED``): it
+never leaves a call to Claude Code's own permission check by giving no answer.
 
 Stopped runs: when the segment Activity is cancelled or times out, the runner writes
 ``$TCA_HOOK_DIR/stop``, so an engine that is still shutting down cannot start another
@@ -91,6 +92,9 @@ STEP_ONLY = "This step runs one tool call only."
 OTHER_INPUT = "This step runs its tool call only with the input it was given."
 """The reason in a tool step when the call's input is not the one the step was given."""
 
+FAILED = "This call did not run: the plugin's hook failed while it decided on it."
+"""The reason when the hook itself failed (``main``): it denies the call."""
+
 
 DURABLE_PREFIX = "mcp__durable__"
 """Names of durable tools as the engine sees them (the runner's ``PREFIX``)."""
@@ -113,6 +117,7 @@ REASON_KEYS = {
     MAIN_AGENT_ONLY: "main_agent_only",
     STEP_ONLY: "step_only",
     OTHER_INPUT: "other_input",
+    FAILED: "failed",
 }
 """What the hook writes in ``denied/<tool_use_id>`` for each reason."""
 
@@ -318,9 +323,12 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
         _record(run_dir, tool_use_id, output)
     log = os.environ.get("TCA_HOOK_LOG")
     if log:  # debugging aid: one line per decision
-        with open(log, "a", encoding="utf-8") as handle:
-            decision = output.get("permissionDecision", "none")
-            handle.write(f"{tool_use_id} {decision}\n")
+        try:
+            with open(log, "a", encoding="utf-8") as handle:
+                decision = output.get("permissionDecision", "none")
+                handle.write(f"{tool_use_id} {decision}\n")
+        except OSError:
+            pass  # the decision stands without its log line
     return output
 
 
@@ -329,9 +337,29 @@ def main() -> None:
 
     The engine sends UTF-8; read bytes, so a Windows code page cannot garble or
     reject the tool input. The answer is ASCII (``json.dumps`` escapes the rest).
+
+    Fails closed: if deciding fails (for example, a tool input nested deeper than
+    ``json`` reads), the call is denied (``FAILED``). With no answer, Claude Code's
+    own permission check would decide, and a rule in a settings file could let the
+    call run in a segment, or in a tool step without its ``allowed`` record. If even
+    the answer cannot be written, exit code 2 denies the call.
     """
-    event = json.loads(sys.stdin.buffer.read().decode("utf-8"))
-    print(json.dumps({"hookSpecificOutput": decide(event)}))
+    event: Any = None
+    try:
+        event = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+        output = decide(event)
+    except BaseException:  # any failure at all denies the call
+        output = _deny(FAILED)
+        try:
+            tool_use_id = str(event.get("tool_use_id") or "")
+            _record(os.environ.get("TCA_HOOK_DIR"), tool_use_id, output)
+        except Exception:  # no event, or no record: the denial stands
+            pass
+    try:
+        sys.stdout.write(json.dumps({"hookSpecificOutput": output}) + "\n")
+        sys.stdout.flush()
+    except BaseException:  # the answer cannot be written: exit code 2 denies
+        os._exit(2)
 
 
 if __name__ == "__main__":

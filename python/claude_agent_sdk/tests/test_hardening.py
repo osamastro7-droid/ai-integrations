@@ -112,6 +112,25 @@ def test_extra_args_cannot_pass_the_same_engine_flags(tmp_path: Path) -> None:
     _runner_in(tmp_path, extra_options={"extra_args": {"debug-to-stderr": None}})
 
 
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--permission-mode",
+        "permission-mode",
+        "--dangerously-skip-permissions",
+        "--allow-dangerously-skip-permissions",
+        "--permission-prompt-tool",
+    ],
+)
+def test_extra_args_cannot_approve_tool_calls(tmp_path: Path, flag: str) -> None:
+    """A tool step replaces the permission mode and the permission prompt tool, so
+    that only its hook approves its call: a flag in extra_args would win over them."""
+    with pytest.raises(ValueError, match="set permission_mode or"):
+        _runner_in(tmp_path, extra_options={"extra_args": {flag: "bypassPermissions"}})
+    # The same through extra_options is fine: a tool step replaces it.
+    _runner_in(tmp_path, extra_options={"permission_mode": "bypassPermissions"})
+
+
 @pytest.mark.parametrize("one_at_a_time", [False, True], ids=["default", "one-call"])
 def test_extra_options_can_set_a_default_prompt_and_settings(
     tmp_path: Path, one_at_a_time: bool

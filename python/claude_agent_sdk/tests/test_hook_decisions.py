@@ -12,6 +12,7 @@ hand the cases where rules meet.
 from __future__ import annotations
 
 import builtins
+import io
 import itertools
 import json
 import os
@@ -426,6 +427,118 @@ def test_a_tool_step_runs_its_call_only_with_the_input_it_was_given(
         assert (run_dir / "denied" / CALL_ID).read_text(encoding="utf-8") == (
             "other_input"
         )
+
+
+def hook_env(run_dir: Path, **more: str) -> dict[str, str]:
+    """The environment of a hook process for ``run_dir``, as a tool step's own."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in ("TCA_ALLOW_ID", "TCA_ALLOW_INPUT", "TCA_ANSWERED_IDS", "TCA_HOOK_LOG")
+    }
+    return {**env, "TCA_HOOK_DIR": str(run_dir), **more}
+
+
+@pytest.mark.parametrize("stdin", ["nested too deep", "not JSON"])
+def test_a_hook_that_cannot_read_its_event_denies_the_call(
+    tmp_path: Path, stdin: str
+) -> None:
+    """With no answer, Claude Code's own permission check would decide, and a rule
+    from a settings file could let the call run. So a hook that fails denies. Here it
+    cannot even read the event (as the runner starts it: isolated, no ``site``)."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    approved = {"command": "ls"}
+    env = hook_env(
+        run_dir, TCA_ALLOW_ID=CALL_ID, TCA_ALLOW_INPUT=hook.input_digest(approved)
+    )
+    if stdin == "nested too deep":
+        deep = "[" * 100_000 + "]" * 100_000
+        data = (
+            '{"tool_name": "Bash", "tool_use_id": "%s", "tool_input": '
+            '{"command": "ls", "x": %s}}' % (CALL_ID, deep)
+        )
+    else:
+        data = "{not json"
+    done = subprocess.run(
+        [sys.executable, "-I", "-S", str(HOOK)],
+        input=data.encode("utf-8"),
+        capture_output=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny"
+    assert out["permissionDecisionReason"] == hook.FAILED
+    assert not (run_dir / hook.ALLOWED).exists()  # never let run
+
+
+def test_a_hook_that_fails_while_it_decides_denies_and_records_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The event was read, so the denial is recorded under the call's id: the runner
+    knows the call did not run without reading the tool output."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TCA_HOOK_DIR", str(run_dir))
+    monkeypatch.setenv("TCA_ALLOW_ID", CALL_ID)
+    monkeypatch.setenv("TCA_ALLOW_INPUT", "x")
+    for name in ("TCA_ANSWERED_IDS", "TCA_HOOK_LOG"):
+        monkeypatch.delenv(name, raising=False)
+
+    def fails(tool_input: Any) -> str:
+        del tool_input
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(hook, "input_digest", fails)
+    event = {"tool_name": "Bash", "tool_use_id": CALL_ID, "tool_input": {}}
+    stdin = io.TextIOWrapper(io.BytesIO(json.dumps(event).encode("utf-8")))
+    monkeypatch.setattr(sys, "stdin", stdin)
+    hook.main()
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny"
+    assert out["permissionDecisionReason"] == hook.FAILED
+    assert (run_dir / "denied" / CALL_ID).read_text(encoding="utf-8") == "failed"
+    assert not (run_dir / hook.ALLOWED).exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a closed pipe is POSIX-specific")
+def test_a_hook_that_cannot_write_its_answer_exits_with_2(tmp_path: Path) -> None:
+    """Exit code 2 is Claude Code's other way to deny a call."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    read_end, write_end = os.pipe()
+    os.close(read_end)  # nobody reads the answer: writing it fails
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-S", str(HOOK)],
+            stdin=subprocess.PIPE,
+            stdout=write_end,
+            stderr=subprocess.DEVNULL,
+            env=hook_env(run_dir),
+        )
+    finally:
+        os.close(write_end)
+    event = {"tool_name": "Read", "tool_use_id": CALL_ID}
+    process.communicate(json.dumps(event).encode("utf-8"), timeout=60)
+    assert process.returncode == 2
+
+
+def test_a_debug_log_that_cannot_be_written_changes_no_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TCA_HOOK_DIR", str(run_dir))
+    monkeypatch.setenv("TCA_ALLOW_ID", CALL_ID)
+    monkeypatch.setenv("TCA_HOOK_LOG", str(tmp_path))  # a folder: it cannot be opened
+    for name in ("TCA_ALLOW_INPUT", "TCA_ANSWERED_IDS"):
+        monkeypatch.delenv(name, raising=False)
+    got = hook.decide({"tool_name": "Bash", "tool_use_id": CALL_ID, "tool_input": {}})
+    assert got == {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
 
 
 class Interleaved:

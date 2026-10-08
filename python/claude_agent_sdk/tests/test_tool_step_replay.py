@@ -12,7 +12,6 @@ results go as a message, as before.
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import sys
 import time
@@ -38,6 +37,7 @@ from temporalio.claude_agent_sdk import (
     ToolSpec,
     ToolStepInput,
     _runner,
+    _stand_in,
 )
 from temporalio.claude_agent_sdk._models import TOOL_CALL_NOT_RUN
 from temporalio.converter import DataConverter
@@ -245,7 +245,7 @@ async def test_real_engine_a_tool_step_returns_claude_codes_own_record_of_its_ca
     record = outcome.entry
     assert record is not None and record["type"] == "user"
     assert record["message"]["content"] == []  # the result is the outcome's
-    assert record["toolUseResult"]["filePath"] == str(notes)
+    assert "toolUseResult" not in record  # no copy of the file in the history
     # The next segment: the record replaces the pause's hook entries.
     owner = next(
         e
@@ -265,7 +265,7 @@ async def test_real_engine_a_tool_step_returns_claude_codes_own_record_of_its_ca
             "is_error": False,
         }
     ]
-    assert placed["toolUseResult"] == record["toolUseResult"]
+    assert "toolUseResult" not in placed
     # What Claude saw: the result, then Claude Code's own line, and nothing else.
     blocks = answered_with(model.api.requests[-1], call.id)
     assert [b["type"] for b in blocks] == ["tool_result", "text"]
@@ -309,6 +309,30 @@ async def test_real_engine_a_commands_result_goes_as_a_message(
     assert seen_after(model.api.requests[-1], paused.deferred.id) == [("result", None)]  # type: ignore[union-attr]
     assert RESUME_LINE not in json.dumps(model.api.requests)
     assert final.result == "FINAL Bash:hi"
+    assert model.api.errors == []
+
+
+async def test_real_engine_a_command_that_fails_is_its_calls_result(
+    tmp_path: Path,
+) -> None:
+    """A command that exits with an error ran: the step returns its output as an
+    error result (Claude sees what it printed), not a failure of the step."""
+    effects = (tmp_path / "work" / "effects.log").as_posix()
+    command = f"echo ran >> {effects}; echo out; echo err >&2; exit 3"
+    model = Turns([[("Bash", {"command": command, "description": "fail"})]])
+    runner = make_runner(tmp_path, model.api)
+    session = Session(runner, ["Bash"], ["Bash"], store=False)
+    try:
+        paused = await session.segment("Run it.")
+        outcome = await session.step(paused)
+        final = await session.segment(injected={paused.deferred.id: outcome})  # type: ignore[union-attr]
+    finally:
+        model.api.stop()
+    assert outcome.is_error and outcome.entry is None
+    text = str(outcome.content)
+    assert "out" in text and "err" in text and "3" in text, text
+    assert Path(effects).read_text() == "ran\n"  # once
+    assert final.result is not None and final.result.startswith("FINAL Bash:error ")
     assert model.api.errors == []
 
 
@@ -430,11 +454,11 @@ async def test_real_engine_an_edit_claude_code_refuses_in_its_step(
 
 
 async def test_real_engine_edits_after_records_without_their_metadata(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    """A record whose metadata was too large goes without it. Claude Code needs it
-    neither to go on, nor for the next Edit of the same file."""
-    monkeypatch.setattr(_runner, "RESULT_METADATA_LIMIT", 0)
+    """A record goes without Claude Code's metadata of the call (it can hold the whole
+    file). Claude Code needs it neither to go on, nor for the next Edit of the same
+    file."""
     notes = tmp_path / "work" / "notes.txt"
     model = Turns(edit_turns(notes, ("one", "ONE"), ("two", "TWO")))
     runner = make_runner(tmp_path, model.api)
@@ -607,7 +631,9 @@ async def test_real_engine_a_new_task_after_a_tool_steps_result(
     assert len(model.api.requests) == asked + 1  # one turn: the new task's
     _, texts, history = history_of(model.api.requests[-1])
     assert [(h.name, h.is_error) for h in history] == [("Write", False)]
-    assert user_words(texts)[-1] == NEXT_TASK
+    # The result, Claude Code's own line for an interrupted turn (whatever the
+    # Worker's environment says), then the new task.
+    assert texts[-2:] == [RESUME_LINE, NEXT_TASK], texts
     if store:
         assert final.session_id != paused.session_id  # a copy with the record
     assert model.api.errors == []
@@ -862,6 +888,123 @@ async def test_real_engine_the_workers_own_resume_settings_change_nothing(
     assert model.api.errors == []
 
 
+@pytest.mark.parametrize("rule", ["ask", "deny", "no rule"])
+async def test_real_engine_deny_and_ask_rules_still_apply_in_a_tool_step(
+    tmp_path: Path, rule: str
+) -> None:
+    """Claude Code checks deny and ask rules after the hook's "allow" (a deny rule
+    for a whole tool takes the tool away from Claude, so here it names commands). A
+    tool step never asks a permission callback (only the hook decides there), so an
+    ``ask`` rule for the tool refuses its call in the step, whatever the callback
+    would say: decide on such calls with ``tool_approvals``. Without a rule, the call
+    runs."""
+    asked: list[str] = []
+
+    async def callback(
+        name: str, args: dict[str, Any], context: ToolPermissionContext
+    ) -> Any:
+        del args, context
+        asked.append(name)
+        return PermissionResultAllow()
+
+    work = tmp_path / "work"
+    (work / ".claude").mkdir(parents=True)
+    rules: dict[str, list[str]] = {
+        "ask": {"ask": ["Bash"]},
+        "deny": {"deny": ["Bash(echo:*)"]},
+        "no rule": {},
+    }[rule]
+    (work / ".claude" / "settings.json").write_text(json.dumps({"permissions": rules}))
+    effects = (work / "effects.log").as_posix()
+    model = Turns(
+        [[("Bash", {"command": f"echo ran >> {effects}", "description": "run"})]]
+    )
+    runner = make_runner(
+        tmp_path,
+        model.api,
+        extra_options={"can_use_tool": callback, "setting_sources": ["project"]},
+    )
+    session = Session(runner, ["Bash"], ["Bash"], store=False)
+    try:
+        paused = await session.segment("Run it.")
+        outcome = await session.step(paused)
+    finally:
+        model.api.stop()
+    assert asked == []  # neither in the segment (the hook paused it) nor in the step
+    assert model.api.errors == []
+    if rule == "no rule":
+        assert not outcome.is_error and Path(effects).read_text() == "ran\n"
+    else:
+        # Refused (with Claude Code's own reason, which differs by version), as the
+        # same step without a rule shows.
+        assert outcome.is_error and not Path(effects).exists()
+
+
+@pytest.mark.parametrize(
+    "where", ["in the working directory", "outside it", ".git", ".claude"]
+)
+async def test_real_engine_an_edit_step_keeps_claude_codes_guard_of_its_own_files(
+    tmp_path: Path, where: str
+) -> None:
+    """The hook's "allow" does not lift Claude Code's own guard of sensitive files: an
+    Edit of ``.git/config`` or of ``.claude/settings.json`` is refused in the step. It
+    does lift the working directory check: an Edit outside it runs, as a command
+    could. To decide on each edit, use ``tool_approvals``."""
+    work = tmp_path / "work"
+    target = {
+        "in the working directory": work / "notes.txt",
+        "outside it": tmp_path / "outside.txt",
+        ".git": work / ".git" / "config",
+        ".claude": work / ".claude" / "settings.json",
+    }[where]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text('{"old": 1}\n')
+    model = Turns(edit_turns(target, ("old", "new")))
+    runner = make_runner(tmp_path, model.api)
+    session = Session(runner, ["Read", "Edit"], ["Edit"], store=False)
+    try:
+        paused = await session.segment("Edit it.")
+        outcome = await session.step(paused)
+    finally:
+        model.api.stop()
+    guarded = where in (".git", ".claude")
+    assert outcome.is_error is guarded, outcome.content
+    assert target.read_text() == ('{"old": 1}\n' if guarded else '{"new": 1}\n')
+    assert model.api.errors == []
+
+
+async def test_real_engine_tool_steps_run_in_plan_mode(tmp_path: Path) -> None:
+    """The permission mode does not decide on calls in ``tool_activities``: the hook
+    pauses them in the segment before Claude Code's permission check, and the step
+    runs them in the default mode. So even ``plan`` mode runs a command and an edit."""
+    notes = tmp_path / "work" / "notes.txt"
+    effects = (tmp_path / "work" / "effects.log").as_posix()
+    model = Turns(
+        [
+            [("Bash", {"command": f"echo ran >> {effects}", "description": "run"})],
+            *edit_turns(notes, ("old", "new")),
+        ]
+    )
+    runner = make_runner(tmp_path, model.api, extra_options={"permission_mode": "plan"})
+    notes.write_text("old\n")
+    session = Session(runner, ["Bash", "Read", "Edit"], ["Bash", "Edit"], store=False)
+    ran: list[str] = []
+    try:
+        out = await session.segment("Go.")
+        while out.deferred is not None:
+            call = out.deferred
+            ran.append(call.name)
+            outcome = await session.step(out)
+            assert not outcome.is_error, outcome.content
+            out = await session.segment(injected={call.id: outcome})
+    finally:
+        model.api.stop()
+    assert ran == ["Bash", "Edit"]
+    assert Path(effects).read_text() == "ran\n" and notes.read_text() == "new\n"
+    assert out.result is not None and out.result.startswith("FINAL ")
+    assert model.api.errors == []
+
+
 @pytest.mark.parametrize("change", ["name", "input"])
 async def test_a_tool_step_runs_only_the_call_the_segment_reported(
     tmp_path: Path, change: str
@@ -1081,6 +1224,28 @@ def test_a_tool_steps_copy_of_the_conversation_ends_before_its_call() -> None:
     ]
 
 
+def test_a_steps_copy_takes_data_nested_as_deep_as_temporal_carries_it() -> None:
+    """``copy.deepcopy`` takes two Python frames per level: on a call input nested
+    700 levels deep it failed, so every later tool step failed. Temporal's own
+    converter carries such data, and so do the step's copy and its call."""
+    deep: Any = "x"
+    for _ in range(700):
+        deep = [deep]
+    assert DataConverter.default.payload_converter.to_payloads([deep])
+    entries = one_call()
+    entries[1] = json.loads(json.dumps(entries[1]))
+    entries[1]["message"]["content"][0]["input"] = {"deep": deep}  # the Read
+    entries[2] = json.loads(json.dumps(entries[2]))
+    entries[2]["message"]["content"][0]["input"] = {"deep": deep}  # the Edit
+    context = _runner._step_context(entries, 5)  # type: ignore[reportPrivateUsage]
+    assert context[1]["message"]["content"][0]["input"] == {"deep": deep}
+    block = _runner._recorded_call(entries[:5], "e")  # type: ignore[reportPrivateUsage]
+    assert block is not None and block["input"] == {"deep": deep}
+    stand_in = _stand_in.StandInModel()
+    call = stand_in.serve(block)
+    assert call.block == block and stand_in.done(call) is False
+
+
 def test_the_record_goes_where_the_calls_result_belongs() -> None:
     entries = one_call()
     outcome = ToolOutcome(content="edited", entry=record())
@@ -1208,22 +1373,24 @@ def test_the_record_is_only_placed_where_it_belongs(case: str) -> None:
     assert _runner._place(entries, checkpoint, results) is None  # type: ignore[reportPrivateUsage]
 
 
-def test_a_large_record_leaves_its_metadata_out() -> None:
-    """An Edit's metadata holds the whole file; Claude Code does not need it to go
-    on, so a record never carries more than ``RESULT_METADATA_LIMIT`` bytes of it."""
-    small = {**record(), "message": {"role": "user", "content": ["the result"]}}
-    kept = _runner._result_record(small)  # type: ignore[reportPrivateUsage]
-    assert kept["message"]["content"] == [] and kept["toolUseResult"] == {
-        "filePath": "/f"
+def test_a_record_never_carries_the_calls_metadata() -> None:
+    """An Edit's metadata holds the whole file as it was; Claude Code does not need it
+    to go on, so the record the step returns leaves it out, and the result too (the
+    outcome carries that)."""
+    given = {
+        **record(),
+        "message": {"role": "user", "content": ["the result"]},
+        "toolUseResult": {"filePath": "/f", "originalFile": "secret=1\n"},
     }
-    assert small["message"]["content"] == ["the result"]  # not changed in place
-    large = copy.deepcopy(small)
-    large["toolUseResult"] = {"originalFile": "x" * _runner.RESULT_METADATA_LIMIT}
-    assert "toolUseResult" not in _runner._result_record(large)  # type: ignore[reportPrivateUsage]
-    # Bytes, not characters: each of these takes two.
-    wide = copy.deepcopy(small)
-    wide["toolUseResult"] = {"originalFile": "é" * (_runner.RESULT_METADATA_LIMIT // 2)}
-    assert "toolUseResult" not in _runner._result_record(wide)  # type: ignore[reportPrivateUsage]
+    kept = _runner._result_record(given)  # type: ignore[reportPrivateUsage]
+    assert kept["message"] == {"role": "user", "content": []}
+    assert "toolUseResult" not in kept
+    assert {k: v for k, v in kept.items() if k != "message"} == {
+        k: v for k, v in given.items() if k not in ("message", "toolUseResult")
+    }
+    # Not changed in place.
+    assert given["message"]["content"] == ["the result"]
+    assert given["toolUseResult"]["originalFile"] == "secret=1\n"
 
 
 def test_a_segment_that_never_continues_stops_after_its_attempts() -> None:
@@ -1231,6 +1398,7 @@ def test_a_segment_that_never_continues_stops_after_its_attempts() -> None:
     stops with an error that says what to change, instead of trying forever."""
     err = _runner._not_continued("9.9.9")  # type: ignore[reportPrivateUsage]
     assert "Claude Code 9.9.9 did not continue the turn" in str(err)
+    assert _runner.RESUME in str(err) and "tested on Claude Code 2.1.273" in str(err)
     for attempt in range(1, _runner.CONTINUE_ATTEMPTS):
         with pytest.raises(RuntimeError, match="Retrying"):
             _runner._not_continued_output("s1", err, attempt)  # type: ignore[reportPrivateUsage]

@@ -75,7 +75,6 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
-import copy
 import dataclasses
 import fnmatch
 import hashlib
@@ -131,6 +130,7 @@ from ._defer_hook import (
     denial_name,
     input_digest,
 )
+from ._defer_hook import FAILED as HOOK_FAILED
 from ._defer_hook import NOT_RUN as NOT_RUN_REASON
 from ._events import emit
 from ._launcher import CHECK as LAUNCHER_CHECK
@@ -244,8 +244,20 @@ Claude Code's own line "Continue from where you left off.". Sending a message in
 and "(no content)"). ``MAX_AGE_MS=0``: however long the step took, the turn continues
 (the Worker's environment could set a maximum age). ``PROMPT`` and ``REASON`` empty:
 Claude Code's own line and reason, whatever the Worker's environment says. Other
-segments get ``RESUME`` empty, whatever the Worker has. Commands see the Worker's own
-values.
+segments get ``NEW_TURN_ENV``. Commands see the Worker's own values.
+"""
+
+NEW_TURN_ENV = {
+    RESUME: "",
+    "CLAUDE_CODE_RESUME_PROMPT": "",
+    "CLAUDE_CODE_RESUME_REASON": "",
+}
+"""Set for every other segment, whatever the Worker's environment says.
+
+Claude Code does not continue an interrupted turn by itself, and Claude reads Claude
+Code's own lines: a new task right after a tool step's result comes after Claude
+Code's line for an interrupted turn, "Continue from where you left off." (tested).
+Commands see the Worker's own values.
 """
 
 CONTINUE_START_SECONDS = 120.0
@@ -265,13 +277,6 @@ with an error that names the Claude Code version, instead of being retried forev
 
 STEP_MAX_TURNS = 1
 """A tool step's turn ends right after its call (a test may let it go on)."""
-
-RESULT_METADATA_LIMIT = 64 * 1024
-"""Largest ``toolUseResult`` a tool step returns with its record (UTF-8 bytes of JSON).
-
-That metadata can hold a whole file (an Edit's ``originalFile``), and Claude Code does
-not need it to continue (tested: two Edits of one file, each record without it).
-Larger metadata is left out, so it does not grow the Workflow's history."""
 
 SAVED_OUTPUT_TAIL = 4096
 """Bytes of the end of an output Claude Code saved to a file, added to the preview."""
@@ -353,6 +358,20 @@ _MANAGED_FLAGS = frozenset(
 )
 """Engine flags the plugin sets, refused in ``extra_options["extra_args"]`` too."""
 
+_APPROVING_FLAGS = frozenset(
+    {
+        "permission-mode",
+        "dangerously-skip-permissions",
+        "allow-dangerously-skip-permissions",
+        "permission-prompt-tool",
+    }
+)
+"""Engine flags that approve tool calls, refused in ``extra_options["extra_args"]``.
+
+``extra_options`` sets the same with ``permission_mode`` and
+``permission_prompt_tool_name``, which a tool step replaces: there, nothing but the
+hook approves the call. A flag would come after the step's own and win."""
+
 
 def _check_extra_options(extra: dict[str, Any]) -> None:
     """Refuse ``extra_options`` that would replace what the plugin relies on.
@@ -377,6 +396,11 @@ def _check_extra_options(extra: dict[str, Any]) -> None:
         f"extra_args[{flag!r}] (the plugin sets that engine flag)"
         for flag in sorted(flags)
         if flag.lstrip("-") in _MANAGED_FLAGS
+    ] + [
+        f"extra_args[{flag!r}] (set permission_mode or permission_prompt_tool_name "
+        "in extra_options instead: a tool step must be able to replace it)"
+        for flag in sorted(flags)
+        if flag.lstrip("-") in _APPROVING_FLAGS
     ]
     if extra.get("enable_file_checkpointing"):
         problems.append(
@@ -528,6 +552,16 @@ def _without_cost_state(entries: list[Any]) -> list[Any]:
     cost (``max_budget_usd`` stays per run either way, tested on 2.1.287).
     """
     return [e for e in entries if not _is_cost_state(e)]
+
+
+def _json_copy(value: Any) -> Any:
+    """A deep copy of JSON data (conversation entries), made through ``json``.
+
+    As deep as Temporal's own payload converter can carry it: ``copy.deepcopy``
+    takes two Python frames per level, so it fails on data nested a few hundred
+    levels deep that ``json`` still reads.
+    """
+    return json.loads(json.dumps(value))
 
 
 def _last_entry(entries: list[Any]) -> str | None:
@@ -716,7 +750,7 @@ def _denied_after(
             continue
         if calls is not None and not set(ids) <= set(calls):
             continue
-        entry = copy.deepcopy(entry)
+        entry = _json_copy(entry)
         for block in entry["message"]["content"]:
             outcome = results.get(str(block.get("tool_use_id")))
             if block.get("type") != "tool_result" or outcome is None:
@@ -811,7 +845,7 @@ def _recorded_call(entries: list[Any], call_id: str) -> dict[str, Any] | None:
         return None
     for block in found[0]["message"]["content"]:
         if isinstance(block, dict) and block.get("id") == call_id:
-            return copy.deepcopy(block)
+            return _json_copy(block)
     return None
 
 
@@ -832,7 +866,7 @@ def _step_context(entries: list[Any], first: int) -> list[Any]:
     context: list[Any] = []
     left_out: dict[str, Any] = {}  # uuid -> its parent
     for original in _without_cost_state(part):
-        entry = copy.deepcopy(original)
+        entry = _json_copy(original)
         message = entry.get("message")
         if entry.get("type") == "assistant" and isinstance(message, dict):
             content = message.get("content")
@@ -865,24 +899,19 @@ def _step_context(entries: list[Any], first: int) -> list[Any]:
 def _result_record(entry: dict[str, Any]) -> dict[str, Any]:
     """A tool step's record of its result as the step returns it (``ToolOutcome.entry``).
 
-    Without the result itself (the outcome carries it), and without metadata larger
-    than ``RESULT_METADATA_LIMIT``.
+    Without the result itself (the outcome carries it), and without Claude Code's
+    metadata of the call (``toolUseResult``): an Edit's or a Write's holds the whole
+    file as it was before (``originalFile``), which would put the file in the
+    Workflow's history. Claude Code does not need it to go on (tested: two Edits of
+    one file, and a Write over a file Claude read).
     """
-    record = copy.deepcopy(entry)
-    message = record.get("message")
+    message = entry.get("message")
+    record = {k: v for k, v in entry.items() if k != "toolUseResult"}
     record["message"] = {
         **(message if isinstance(message, dict) else {}),
         "content": [],
     }
-    metadata = record.get("toolUseResult")
-    if metadata is not None and _size(metadata) > RESULT_METADATA_LIMIT:
-        del record["toolUseResult"]
-    return record
-
-
-def _size(value: Any) -> int:
-    """UTF-8 bytes of ``value`` as JSON."""
-    return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+    return _json_copy(record)
 
 
 def _result_block(call_id: str, outcome: ToolOutcome) -> dict[str, Any]:
@@ -934,7 +963,7 @@ def _record(
         and isinstance(given.get("uuid"), str)
         and given["uuid"] not in taken
     ):
-        record = copy.deepcopy(given)
+        record = _json_copy(given)
     else:
         record = {k: owner[k] for k in _RECORD_FIELDS if k in owner}
         record["type"] = "user"
@@ -1292,8 +1321,8 @@ class _NotContinued(RuntimeError):
 def _not_continued(version: str) -> _NotContinued:
     return _NotContinued(
         f"Claude Code {version} did not continue the turn after the result of an Edit "
-        f"or a Write: it said nothing within {CONTINUE_START_SECONDS:.0f} seconds of "
-        f"starting. This plugin asks it to with {RESUME} (tested on Claude Code "
+        f"or a Write: it said nothing for {CONTINUE_START_SECONDS:.0f} seconds before "
+        f"the turn. This plugin asks it to with {RESUME} (tested on Claude Code "
         "2.1.273, 2.1.274 and 2.1.288)."
     )
 
@@ -1785,7 +1814,8 @@ def _tool_step_failure(
 
     Args:
         reason: Why the step failed.
-        allowed: Whether the hook had let the call run.
+        allowed: Whether the call may have run: the hook let it run, or nothing
+            shows that it did not (see ``_tool_step``).
         non_retryable: Whether retrying cannot help.
     """
     return ApplicationError(
@@ -2338,8 +2368,9 @@ class ClaudeAgentSdkRunner:
                 ``thinking``). ``env``, ``mcp_servers`` and ``allowed_tools`` are
                 merged with the plugin's; ``system_prompt`` (a string or a preset) is
                 the default for agents that set none. Options the agent or the plugin
-                sets itself, and ``extra_args`` for the same engine flags, are
-                refused.
+                sets itself are refused, and so are ``extra_args`` for the same engine
+                flags or for flags that approve tool calls (set ``permission_mode``
+                here instead).
             one_tool_at_a_time: Ask Claude for one tool call per message. Not needed
                 for durable tools: when Claude calls several at once, they all run.
             model: Default model when the agent does not set one.
@@ -3037,20 +3068,24 @@ class ClaudeAgentSdkRunner:
         2.1.273, 2.1.274 and 2.1.288 with Bash, Edit and Write: the tool runs once,
         with the engine's own result, and one model answer.
 
-        No rule, permission mode or callback approves a tool in the step: only the
-        hook's "allow" lets the call run, and only with the input the segment
-        reported (which is what an approval saw), as Claude Code is about to run it.
-        If the hook gives no answer, Claude Code refuses the call, and the step fails
-        as one whose call did not run.
+        No permission mode, ``allowed_tools`` or callback approves a tool in the
+        step: the hook's "allow" lets the call run, and only with the input the
+        segment reported (which is what an approval saw), as Claude Code is about to
+        run it. If deciding fails, the hook denies the call. Only a hook that gives
+        no answer at all (it could not start) leaves the call to Claude Code's own
+        permission check, which refuses it unless a rule in a settings file allows
+        it.
 
         The command still sees the Worker's own environment (see ``_step_env``), and
         a result the step already has is kept even if the engine fails afterwards,
         so the Activity is not retried for a call that ran.
 
         A step that fails says on which side of the call's start it failed: the hook
-        writes ``allowed`` just before it lets the call run. So the Workflow can tell
-        Claude whether the call ran; it gives the step one attempt unless the tool
-        is in ``repeatable_tools``.
+        writes ``allowed`` just before it lets the call run. Without that record, the
+        call did not run only if the engine never got it, or the hook or Claude
+        Code's permission check refused it; otherwise it may have run. So the
+        Workflow can tell Claude whether the call ran; it gives the step one attempt
+        unless the tool is in ``repeatable_tools``.
 
         Args:
             step: The call, and where its session paused.
@@ -3064,12 +3099,13 @@ class ClaudeAgentSdkRunner:
                 Claude Code could run the call (it did not run), or
                 ``ToolCallInterrupted`` if it failed after the hook let the call run
                 (it may have run). Not retryable where retrying cannot help: the
-                session did not pause at this call, the hook refused it (also for
-                other input than the segment reported), or a hook in
-                ``extra_options`` tried to decide on it.
+                session did not pause at this call, or the hook refused it (also
+                for other input than the segment reported, or when it failed). (A
+                hook in ``extra_options`` that decides on the call already stopped
+                the task in the segment, where the same call came first.)
         """
         del attempt
-        allowed = [False]  # whether the hook let the call run (``_tool_step`` sets it)
+        allowed = [False]  # whether the call may have run (``_tool_step`` sets it)
         try:
             return await self._tool_step(step, allowed)
         except asyncio.CancelledError:
@@ -3090,7 +3126,7 @@ class ClaudeAgentSdkRunner:
             ) from err
 
     async def _tool_step(self, step: ToolStepInput, allowed: list[bool]) -> ToolOutcome:
-        """``run_tool_step``'s work; sets ``allowed[0]`` once the hook let the call run."""
+        """``run_tool_step``'s work; sets ``allowed[0]`` when the call may have run."""
         await self._prepare_engine()
         call = step.call
         key = {
@@ -3159,10 +3195,9 @@ class ClaudeAgentSdkRunner:
                 violations,
             )
             options["max_turns"] = STEP_MAX_TURNS  # the turn ends after the call
-            # No rule or callback approves a tool here: only the hook's "allow" lets
-            # the call run. If the hook gave no answer (it could not start, or
-            # failed), Claude Code refuses the call, so it never runs without the
-            # step knowing.
+            # No permission mode or callback approves a tool here: the hook's "allow"
+            # lets the call run. (A rule in a settings file could, if the hook gave
+            # no answer: so a failed step does not take that for "not run".)
             options["allowed_tools"] = []
             options["permission_mode"] = DEFAULT_PERMISSION_MODE
             options.pop("can_use_tool", None)
@@ -3190,6 +3225,7 @@ class ClaudeAgentSdkRunner:
         )
         job = _JobWatch(hook_dir, required=self._cleanup_required)
         joined = False  # the engine's first message came (``_JobWatch.joined``)
+        completed = False  # the engine's run ended by itself, not by a failure
         try:
             lock = _hold_worker_lock(hook_dir, required=self._cleanup_required)
             engine = cast(  # query() is typed as an iterator; it is a generator
@@ -3227,6 +3263,7 @@ class ClaudeAgentSdkRunner:
                             saved = _saved_output_tail(
                                 content.content, key["project_key"], step.session_id
                             )
+            completed = True
             if not joined:
                 joined = True
                 job.joined()  # the engine ended without a message
@@ -3237,6 +3274,7 @@ class ClaudeAgentSdkRunner:
         except Exception as err:
             if isinstance(err, ResultError) and err.subtype == "error_max_turns":
                 bounded = True  # how the turn ends: right after the call
+                completed = True
             elif result is None:
                 if not joined:
                     joined = True
@@ -3250,9 +3288,19 @@ class ClaudeAgentSdkRunner:
             if stopper is not None:
                 stopper.cancel()
             job.stop()
-            self._stand_in.done(recorded)
+            sent = self._stand_in.done(recorded)
             denials = _hook_denials(hook_dir)
-            allowed[0] = _close_call(hook_dir)
+            allowed[0] = _close_call(hook_dir) or (
+                # A run that failed with no result: the hook did not let the call
+                # run, but if the hook gave no answer, a rule in a settings file (or
+                # a managed policy) may have. It did not run only if the engine never
+                # got it, or the hook or Claude Code's permission check refused it.
+                not completed
+                and result is None
+                and sent
+                and denial_name(call.id) not in denials
+                and call.id not in refused
+            )
             _release_worker_lock(lock)
             _remove_hook_folder(hook_dir)
         violation = _hook_violation(violations)
@@ -3268,6 +3316,9 @@ class ClaudeAgentSdkRunner:
             result is None
             or denial_name(call.id) in denials
             or (bool(result.is_error) and _says_only(result.content, STOPPED))
+            # The hook failed and could not record its denial: Claude Code refused
+            # the call with the hook's reason. Trying again would fail the same way.
+            or (call.id in refused and _says_only(result.content, HOOK_FAILED))
         ):
             raise ApplicationError(
                 f"Claude Code did not run tool call {call.id} ({call.name}) in its "
@@ -3505,7 +3556,7 @@ class ClaudeAgentSdkRunner:
                     options["env"],
                     hook_dir,
                     self._cwd,
-                    CONTINUE_ENV if waits else {RESUME: ""},
+                    CONTINUE_ENV if waits else NEW_TURN_ENV,
                     {},
                 )
             else:

@@ -784,6 +784,30 @@ def test_the_stand_in_answers_with_the_steps_call_once() -> None:
     assert stand_in.requests == 6  # the POSTs with the step's key
 
 
+def test_a_request_in_flight_when_the_step_ends_never_gets_its_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A step that ended says whether its engine was sent the call (``done``). A
+    request whose key was checked just before the step ended still gets only the
+    short text: the call is never sent after that answer, so the answer stays true."""
+    stand_in = _stand_in.StandInModel()
+    call = stand_in.serve(BASH_CALL)
+    found = stand_in.call_for(call.key)
+    assert found is call
+    assert stand_in.done(call) is False  # not sent: the step reports "not run"
+    monkeypatch.setattr(stand_in, "call_for", lambda key: found)  # checked before
+    status, answer = ask(stand_in, "/v1/messages", OFFERS_BASH, call.key)
+    assert status == 200
+    assert answer["content"] == [{"type": "text", "text": _stand_in.ANSWER}]
+    assert call.served == 0
+    other = _stand_in.StandInModel()
+    sent = other.serve(BASH_CALL)
+    assert ask(other, "/v1/messages", OFFERS_BASH, sent.key)[1]["content"] == [
+        BASH_CALL
+    ]
+    assert other.done(sent) is True  # sent: the call may have run
+
+
 def test_the_stand_in_streams_the_steps_call_as_the_api_would() -> None:
     """Claude Code streams its model calls: the call arrives as one tool_use block,
     its input as JSON, and the message stops for the tool."""
@@ -1061,6 +1085,55 @@ async def test_a_tool_step_cut_by_its_workers_shutdown_says_whether_its_call_ran
     assert raised.type == (TOOL_CALL_NOT_RUN if early else TOOL_CALL_INTERRUPTED)
     assert not raised.non_retryable
     assert lines(effects) == ([] if early else ["ran"])
+
+
+async def test_a_call_a_settings_rule_let_run_is_never_reported_as_not_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hook gave no answer (it could not start), so Claude Code's own check
+    decided, and an allow rule from a settings file Claude Code trusts (here the
+    engine's own; a managed policy would do the same) let the command run. The Worker
+    then shuts down while it runs. There is no ``allowed`` record, yet the step says
+    the call may have run (it did), so the Workflow never runs it again. (Claude
+    Code ignores allow rules in a project's own settings until its folder is
+    trusted.)"""
+    effects = tmp_path / "work" / "effects.log"
+    api = start_with_policy(shell_policy)
+    runner = make_runner(tmp_path, api)
+    real_folder = _runner._hook_folder  # type: ignore[reportPrivateUsage]
+
+    def with_an_allow_rule() -> str:
+        folder = real_folder()
+        settings = Path(folder, "settings.json")
+        content = json.loads(settings.read_text(encoding="utf-8"))
+        content["permissions"] = {"allow": ["Bash"]}
+        settings.write_text(json.dumps(content), encoding="utf-8")
+        return folder
+
+    try:
+        out = await pause_at_bash(runner, "echo ran >> effects.log; sleep 60")
+        monkeypatch.setattr(
+            _runner,
+            "_hook_entry",
+            lambda: {
+                "type": "command",
+                "command": sys.executable,
+                "args": ["-c", "import sys; sys.exit(1)"],
+            },
+        )
+        monkeypatch.setattr(_runner, "_hook_folder", with_an_allow_rule)
+        raised = await run_until_cancelled(
+            runner,
+            step_for(out),
+            lambda: lines(effects) == ["ran"],
+            True,
+            worker_shutdown=True,
+        )
+    finally:
+        api.stop()
+    assert isinstance(raised, ApplicationError), raised
+    assert raised.type == TOOL_CALL_INTERRUPTED  # it ran: never "did not run"
+    assert lines(effects) == ["ran"]
 
 
 async def test_a_tool_step_keeps_its_result_when_its_worker_shuts_down_after_it(

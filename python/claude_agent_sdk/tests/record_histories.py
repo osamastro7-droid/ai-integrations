@@ -25,6 +25,7 @@ from temporalio.claude_agent_sdk import (
     ClaudeAgentPlugin,
     SegmentInput,
     SegmentOutput,
+    ToolOutcome,
 )
 from temporalio.claude_agent_sdk.testing import ScriptedClaude
 from temporalio.client import Client, WorkflowHandle
@@ -35,7 +36,7 @@ from tests import DEV_SERVER_DOWNLOAD_VERSION
 from tests.endless.activities import ALL as COUNTING
 from tests.endless.policy import count_policy
 from tests.endless.workflows import ChatWorkflow, LongTaskWorkflow, TaskOptions
-from tests.engine_tools.policy import shell_policy
+from tests.engine_tools.policy import edit_policy, shell_policy
 from tests.engine_tools.workflows import ShellOptions, ShellWorkflow
 from tests.lifecycle.workflows import TasksWorkflow, UpdateChatWorkflow
 from tests.parallel.policy import parallel_policy
@@ -284,9 +285,54 @@ async def bash_retried(client: Client, queue: str) -> str:
     return queue
 
 
+async def file_steps(client: Client, queue: str) -> str:
+    """An Edit (with a durable call in the same message) and a Write as their own
+    Activities, each returning Claude Code's own record of its result
+    (``ToolOutcome.entry``)."""
+    options = ShellOptions(
+        builtin_tools=["Edit", "Write"], tool_activities=["Edit", "Write"]
+    )
+    handle = await client.start_workflow(
+        ShellWorkflow.run,
+        args=["edit: /work/notes.txt", options],
+        id=queue,
+        task_queue=queue,
+    )
+    await handle.result()
+    return queue
+
+
 def pretend_bash() -> Callable[[dict[str, Any]], str]:
     """Bash in tool steps: it prints what it would have run."""
     return lambda args: f"pretend output of {args['command']}"
+
+
+def pretend_file_tools() -> dict[str, Callable[[dict[str, Any]], Any]]:
+    """Edit and Write in tool steps: their result, with a record as Claude Code
+    writes it (without the result, which the outcome carries)."""
+    made: list[str] = []
+
+    def record() -> dict[str, Any]:
+        made.append(f"00000000-0000-4000-8000-{len(made) + 1:012d}")
+        return {
+            "type": "user",
+            "uuid": made[-1],
+            "sessionId": "pretend",
+            "message": {"role": "user", "content": []},
+            "sourceToolAssistantUUID": "pretend",
+        }
+
+    def edit(args: dict[str, Any]) -> ToolOutcome:
+        return ToolOutcome(
+            content=f"The file {args['file_path']} has been updated.", entry=record()
+        )
+
+    def write(args: dict[str, Any]) -> ToolOutcome:
+        return ToolOutcome(
+            content=f"The file {args['file_path']} has been written.", entry=record()
+        )
+
+    return {"Edit": edit, "Write": write}
 
 
 def bash_that_fails_twice() -> Callable[[dict[str, Any]], str]:
@@ -332,15 +378,17 @@ SCENARIOS: dict[str, tuple[Scenario, Callable[[], Any], str]] = {
     "signal-approval": (signal_approval, lambda: count_policy, "held"),
     "bash-approval": (bash, lambda: shell_policy, "held"),
     "bash-retried": (bash_retried, lambda: shell_policy, "held"),
+    "file-steps": (file_steps, lambda: edit_policy, "held"),
     "failed-task": (failed_task, lambda: count_policy, "held"),
     "failed-segment": (failed_segment, lambda: count_policy, "held"),
 }
 """Name: (how to run it, the scripted policy, where the conversation lives)."""
 
-ENGINE_TOOLS: dict[str, Callable[[], Callable[[dict[str, Any]], str]]] = {
-    "bash-retried": bash_that_fails_twice
+ENGINE_TOOLS: dict[str, Callable[[], dict[str, Callable[[dict[str, Any]], Any]]]] = {
+    "bash-retried": lambda: {"Bash": bash_that_fails_twice()},
+    "file-steps": pretend_file_tools,
 }
-"""Scenarios whose Bash tool steps do something else than ``pretend_bash``."""
+"""Scenarios whose tool steps do something else than ``pretend_bash``."""
 
 
 def scrub(history_json: str) -> str:
@@ -364,7 +412,7 @@ async def record(client: Client, name: str, folder: Path) -> list[Path]:
     runner: Any = ScriptedClaude(
         policy(),
         folder / name if mode == "store" else None,
-        engine_tools={"Bash": ENGINE_TOOLS.get(name, pretend_bash)()},
+        engine_tools=ENGINE_TOOLS.get(name, lambda: {"Bash": pretend_bash()})(),
     )
     if name == "failed-segment":
         runner = ExplodingRunner(runner)
