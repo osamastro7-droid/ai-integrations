@@ -1,6 +1,6 @@
 # Durable Claude Agent SDK agents on Temporal
 
-> ⚠️ **Experimental.** The API may change.
+> Release stage: **Pre-release**.
 
 Temporal integration for Anthropic's [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview), published as [`temporalio-claude-agent-sdk`](https://pypi.org/project/temporalio-claude-agent-sdk/) and imported as `temporalio.claude_agent_sdk`.
 

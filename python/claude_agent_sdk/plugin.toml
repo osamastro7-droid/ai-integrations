@@ -6,7 +6,7 @@ language = "python"
 coordinate = "temporalio-claude-agent-sdk"
 registry = "pypi"
 root-api = "temporalio.claude_agent_sdk"
-maturity = "experimental"
+maturity = "pre-release"
 
 [release]
 allow-final = true

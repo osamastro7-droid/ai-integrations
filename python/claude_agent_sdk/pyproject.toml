@@ -17,7 +17,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "temporalio>=1.33.0,<2",
+  "temporalio>=1.34.0,<2",
   # 0.2.153 bundles the oldest Claude Code that keeps every tool result (see README).
   "claude-agent-sdk>=0.2.153,<0.3; sys_platform != 'win32'",
   # On Windows, skip the releases with no Windows wheel (the Windows engine is over
