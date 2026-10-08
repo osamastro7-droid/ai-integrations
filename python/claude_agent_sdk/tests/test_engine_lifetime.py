@@ -558,6 +558,7 @@ def noexec_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str
     [
         pytest.param("launcher", marks=posix_only),
         "lock",
+        "job",
     ],
 )
 async def test_real_engine_a_step_without_its_cleanup_stops_before_claude_code_starts(
@@ -566,10 +567,15 @@ async def test_real_engine_a_step_without_its_cleanup_stops_before_claude_code_s
     """The default ``engine_cleanup="required"``: a step whose engine could not end
     with its Worker process stops before Claude Code starts (no model request), and
     the error says what to fix. A launcher check that failed is made again by the
-    next step, so a fixed Worker goes on."""
+    next step, so a fixed Worker goes on. (A Windows job object that cannot be
+    created is simulated here, on every system.)"""
     written = noexec_launcher(tmp_path, monkeypatch) if cause == "launcher" else []
     if cause == "lock":
         monkeypatch.setattr(_runner, "_lock_file", refuse_locks)
+    if cause == "job":
+        monkeypatch.setattr(
+            _runner, "_worker_job", lambda: "cannot create a job object (error 5)"
+        )
     api = start_with_policy(refund_policy)
     (tmp_path / "work").mkdir()
     runner = ClaudeAgentSdkRunner(
@@ -581,9 +587,11 @@ async def test_real_engine_a_step_without_its_cleanup_stops_before_claude_code_s
                 await runner.run(refund_step(), 1)
             assert raised.value.type == _runner.CLEANUP_UNAVAILABLE
             assert not raised.value.non_retryable
-            assert (
-                "cannot run" if cause == "launcher" else "cannot lock files"
-            ) in str(raised.value)
+            assert {
+                "launcher": "cannot run",
+                "lock": "cannot lock files",
+                "job": "cannot create a job object",
+            }[cause] in str(raised.value)
     finally:
         api.stop()
     assert api.requests == []  # Claude Code never ran

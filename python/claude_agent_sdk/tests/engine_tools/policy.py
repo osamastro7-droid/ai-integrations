@@ -84,3 +84,23 @@ def edit_policy(prompt: str, history: list[HistoryItem]) -> list[ToolCall] | Fin
     return Final(
         " ".join(f"{h.name}:" + ("error" if h.is_error else "ok") for h in history)
     )
+
+
+def edit_once_policy(prompt: str, history: list[HistoryItem]) -> ToolCall | Final:
+    """'edit once: <path>' reads the file, then adds a line under its first one (an
+    edit that changes the file again each time it runs)."""
+    path = prompt.split(": ", 1)[1]
+    if not history:
+        return ToolCall("Read", {"file_path": path})
+    if len(history) == 1 and not history[0].is_error:
+        return ToolCall(
+            "Edit",
+            {
+                "file_path": path,
+                "old_string": "first\n",
+                "new_string": "first\nedited\n",
+            },
+        )
+    return Final(
+        " ".join(f"{h.name}:" + ("error" if h.is_error else "ok") for h in history)
+    )

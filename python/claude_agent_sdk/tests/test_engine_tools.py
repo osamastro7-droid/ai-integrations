@@ -31,7 +31,7 @@ from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.exceptions import ApplicationError
 from temporalio.worker import Worker
 from tests.endless.activities import ALL as COUNTING
-from tests.engine_tools.policy import file_policy, shell_policy
+from tests.engine_tools.policy import edit_once_policy, file_policy, shell_policy
 from tests.engine_tools.workflows import ShellOptions, ShellWorkflow
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
 from tests.helpers.workers import FAIL_FAST
@@ -144,6 +144,44 @@ async def test_real_engine_a_step_that_runs_again_does_not_run_the_command_again
     assert effects.read_text().split() == (
         ["ran"] if tool_activities else ["ran", "ran"]
     )
+
+
+@pytest.mark.parametrize(
+    "tool_activities", [["Edit"], []], ids=["activity", "inside-the-segment"]
+)
+async def test_real_engine_a_step_that_runs_again_does_not_edit_again(
+    client: Client, tmp_path: Path, tool_activities: list[str]
+) -> None:
+    """The model call after the edit hangs past the step's timeout, and the step runs
+    again. As its own Activity the edit ran once, and Claude got Claude Code's own
+    result; inside the segment, the retry read the file again and edited it again."""
+    notes = tmp_path / "work" / "notes.txt"
+    api = start_with_policy(edit_once_policy)
+    arrived, release = hang_on_request(api, 3)  # the model call after the edit
+    runner = make_runner(tmp_path, api)
+    notes.write_bytes(b"first\n")  # LF on every system
+    queue = f"editretry-{uuid.uuid4().hex[:8]}"
+    options = ShellOptions(
+        builtin_tools=["Read", "Edit"],
+        tool_activities=tool_activities,
+        segment_timeout=12,
+    )
+    try:
+        async with worker(client, queue, runner):
+            result = await client.execute_workflow(
+                ShellWorkflow.run,
+                args=[f"edit once: {notes}", options],
+                id=queue,
+                task_queue=queue,
+            )
+    finally:
+        release.set()
+        api.stop()
+    assert result == "Read:ok Edit:ok" and arrived.is_set()
+    assert notes.read_bytes() == (
+        b"first\nedited\n" if tool_activities else b"first\nedited\nedited\n"
+    )
+    assert "modified since read" not in json.dumps(api.requests)
 
 
 @pytest.mark.parametrize("approved", [True, False], ids=["approved", "rejected"])
@@ -851,14 +889,21 @@ def test_hook_leaves_tools_that_run_as_activities_to_the_main_agent(
 ) -> None:
     """A subagent cannot pause the run, so its calls to such tools are denied: they
     would run inside the segment, without their approvals."""
-    monkeypatch.setenv("TCA_TOOL_ACTIVITIES", "Bash")
+    monkeypatch.setenv("TCA_TOOL_ACTIVITIES", "Bash\nEdit\nWrite")
     assert _decision("Bash", "s1", agent_id="sub-1") == "deny"
     assert _decision("mcp__durable__count", "s2", agent_id="sub-1") == "deny"
+    assert _decision("Edit", "s4", agent_id="sub-1") == "deny"
+    assert _decision("Write", "s5", agent_id="sub-1") == "deny"
     assert _decision("Glob", "s3", agent_id="sub-1") == "run"  # others as usual
     assert not (hook_env / "paused_call").exists()
     assert _decision("mcp__durable__count") == "defer"  # the main agent can
     denied = {p.name: p.read_text() for p in (hook_env / "denied").iterdir()}
-    assert denied == {"s1": "main_agent_only", "s2": "main_agent_only"}
+    assert denied == {
+        "s1": "main_agent_only",
+        "s2": "main_agent_only",
+        "s4": "main_agent_only",
+        "s5": "main_agent_only",
+    }
 
 
 def test_hook_records_its_denials(
@@ -1447,6 +1492,65 @@ async def test_other_step_failures_are_left_as_they_are(repeatable: bool) -> Non
             make_tool_step_activity(FailingStep(error)), step
         )
     assert failed.value is error and not failed.value.details
+
+
+@pytest.mark.parametrize(
+    ("cause", "how"),
+    [
+        ("not run", None),
+        ("heartbeat timeout", "its Worker stopped responding"),
+        ("start-to-close timeout", "its step timed out"),
+        ("interrupted", "its step failed after the call started"),
+        ("another error", "its step failed"),
+    ],
+)
+def test_what_claude_gets_for_each_way_a_tool_step_fails(
+    cause: str, how: str | None
+) -> None:
+    """Only the step itself can say that its call did not run (``ToolCallNotRun``). A
+    lost Worker, a timeout, the step's own report and any other failure mean the call
+    may have run, and Claude gets the cause."""
+    from temporalio.claude_agent_sdk import TOOL_CALL_INTERRUPTED
+    from temporalio.claude_agent_sdk import _workflow as wf
+    from temporalio.exceptions import ActivityError, RetryState, TimeoutType
+    from temporalio.exceptions import TimeoutError as ActivityTimeoutError
+
+    behind: BaseException = {
+        "not run": ApplicationError("x", type=TOOL_CALL_NOT_RUN),
+        "heartbeat timeout": ActivityTimeoutError(
+            "x", type=TimeoutType.HEARTBEAT, last_heartbeat_details=[]
+        ),
+        "start-to-close timeout": ActivityTimeoutError(
+            "x", type=TimeoutType.START_TO_CLOSE, last_heartbeat_details=[]
+        ),
+        "interrupted": ApplicationError("x", type=TOOL_CALL_INTERRUPTED),
+        "another error": ApplicationError("x", type="RuntimeError"),
+    }[cause]
+    error = ActivityError(
+        "activity failed",
+        scheduled_event_id=5,
+        started_event_id=6,
+        identity="worker",
+        activity_type="run_claude_tool_step",
+        activity_id="tool-toolu_1",
+        retry_state=RetryState.NON_RETRYABLE_FAILURE,
+    )
+    error.__cause__ = behind
+    record: dict[str, Any] = {}
+    outcome = wf._failed_step(error, record)  # type: ignore[reportPrivateUsage]
+    assert outcome.is_error
+    if how is None:
+        assert record["status"] == "not run"
+        assert outcome.content == (
+            "This call did not run: its step failed before the call could start. "
+            "You can call it again."
+        )
+    else:
+        assert record["status"] == "interrupted"
+        assert outcome.content == (
+            f"This call was interrupted ({how}), so it may have run, in full or in "
+            "part. Check its effects before you run it again."
+        )
 
 
 async def test_a_repeatable_tool_step_is_retried(client: Client) -> None:

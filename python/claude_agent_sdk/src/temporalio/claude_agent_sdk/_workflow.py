@@ -394,8 +394,8 @@ class DurableClaudeAgent:
                 Those in ``tool_activities`` run as their own Activities; the others
                 run inside the segment Activity.
             tool_activities: Claude Code tools that run as their own Activities, like
-                durable tools: ``Bash``, ``PowerShell``, and MCP tools (name patterns
-                such as ``mcp__github__*``). Each call is an Activity
+                durable tools: ``Bash``, ``PowerShell``, ``Edit``, ``Write``, and MCP tools
+                (name patterns such as ``mcp__github__*``). Each call is an Activity
                 ``run_claude_tool_step`` with ID ``tool-<tool_use_id>``. A subagent
                 cannot call them: its call is denied with a hint to leave it to the
                 main agent.

@@ -239,9 +239,9 @@ CONTINUE_ENV = {
 The conversation then ends with a tool result, which Claude Code takes for a turn that
 was interrupted. With these, it continues that turn by itself, with no new message
 (tested on Claude Code 2.1.273, 2.1.274 and 2.1.288): Claude sees the result, then
-Claude Code's own line "Continue from where you left off.". Sending a message instead
-(even an empty one) adds two more lines Claude did not write ("No response requested."
-and "(no content)"). ``MAX_AGE_MS=0``: however long the step took, the turn continues
+Claude Code's own line "Continue from where you left off.". With a message instead,
+Claude Code first closes the turn with a line in Claude's place that Claude did not
+write, "No response requested." (tested). ``MAX_AGE_MS=0``: however long the step took, the turn continues
 (the Worker's environment could set a maximum age). ``PROMPT`` and ``REASON`` empty:
 Claude Code's own line and reason, whatever the Worker's environment says. Other
 segments get ``NEW_TURN_ENV``. Commands see the Worker's own values.
@@ -256,7 +256,9 @@ NEW_TURN_ENV = {
 
 Claude Code does not continue an interrupted turn by itself, and Claude reads Claude
 Code's own lines: a new task right after a tool step's result comes after Claude
-Code's line for an interrupted turn, "Continue from where you left off." (tested).
+Code's answer in Claude's place, "No response requested." (tested; Claude Code
+2.1.280 and older first add their line for an interrupted turn, "Continue from
+where you left off.").
 Commands see the Worker's own values.
 """
 
@@ -264,7 +266,7 @@ CONTINUE_START_SECONDS = 120.0
 """How long a continuing segment waits for Claude Code to start the turn by itself,
 from the engine's start or its last notice before the turn (see ``_StartWatch``).
 
-Claude Code starts it at once (tested). One that does not would wait for a message
+Claude Code starts it within seconds (tested). One that does not would wait for a message
 forever: the segment ends its input, so the engine exits, and fails (see
 ``CONTINUE_ATTEMPTS``).
 """
@@ -934,8 +936,8 @@ _RECORD_FIELDS = (
     "gitBranch",
 )
 """Fields a record without the step's own entry takes from the call's assistant entry:
-those Claude Code writes in every entry of a session (2.1.273, 2.1.274 and 2.1.288,
-checked)."""
+fields Claude Code writes in the entries of a session (checked on 2.1.273, 2.1.274
+and 2.1.288)."""
 
 _RECORD_NAMESPACE = uuid.UUID("5c4f2d0e-8f8e-4c2e-9d55-7a1e0d6b9f21")
 """Names the uuid of such a record after its call, so every attempt makes the same."""
@@ -1322,8 +1324,8 @@ def _not_continued(version: str) -> _NotContinued:
     return _NotContinued(
         f"Claude Code {version} did not continue the turn after the result of an Edit "
         f"or a Write: it said nothing for {CONTINUE_START_SECONDS:.0f} seconds before "
-        f"the turn. This plugin asks it to with {RESUME} (tested on Claude Code "
-        "2.1.273, 2.1.274 and 2.1.288)."
+        f"the turn. This plugin asks it to with {RESUME} (tested on every Claude "
+        "Code release from 2.1.273 to 2.1.295)."
     )
 
 

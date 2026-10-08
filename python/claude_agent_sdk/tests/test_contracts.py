@@ -174,12 +174,14 @@ def test_the_hooks_records_name_each_reason() -> None:
 
 def test_tool_step_settings_the_readme_states() -> None:
     """Edit and Write go back as Claude Code's own record; a step's turn ends after
-    its call; a continuing segment gets 2 minutes to start its turn, 3 times."""
+    its call; a continuing segment gets 2 minutes to start its turn, 3 times; the
+    attempts of a step whose call did not run stop after about 5,000 events."""
     assert runner.RECORDED_TOOLS == ("Edit", "Write")
     assert runner.STEP_MAX_TURNS == 1
     assert runner.CONTINUE_START_SECONDS == 120.0
     assert runner.CONTINUE_ATTEMPTS == 3
-    # Claude Code's own switch (not documented): the segment after a record needs it.
+    assert wf._ATTEMPT_EVENTS == 5_000  # type: ignore[reportPrivateUsage]
+    # Claude Code's switch for SDK mode: the segment after a record needs it.
     assert runner.RESUME == "CLAUDE_CODE_RESUME_INTERRUPTED_TURN"
     assert runner.CONTINUE_ENV[runner.RESUME] == "1"
     assert runner.STEP_ENV[runner.RESUME] == ""

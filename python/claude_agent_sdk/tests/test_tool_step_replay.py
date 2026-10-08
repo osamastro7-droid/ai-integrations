@@ -197,6 +197,31 @@ def seen_after(body: dict[str, Any], call_id: str) -> list[tuple[str, Any]]:
     ]
 
 
+def from_result_on(body: dict[str, Any], call_id: str) -> list[tuple[str, str]]:
+    """Every block Claude sees from the call's result to the end, as (role, text),
+    without the engine's reminders."""
+    messages = body["messages"]
+    at = next(
+        i
+        for i, m in enumerate(messages)
+        if m["role"] == "user" and call_id in json.dumps(m)
+    )
+    seen: list[tuple[str, str]] = []
+    for message in messages[at:]:
+        if message["role"] not in ("user", "assistant"):
+            continue
+        content = message["content"]
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        for block in content:
+            text = str(block.get("text", ""))
+            if block.get("type") == "tool_result":
+                seen.append((message["role"], "result"))
+            elif not text.lstrip().startswith("<system-reminder>"):
+                seen.append((message["role"], text))
+    return seen
+
+
 async def stored(runner: ClaudeAgentSdkRunner, session_id: str) -> list[Any]:
     """A session as the runner's session store holds it."""
     store = runner._store  # type: ignore[reportPrivateUsage]
@@ -602,10 +627,12 @@ async def test_real_engine_a_new_task_after_a_tool_steps_result(
     tmp_path: Path, where: str
 ) -> None:
     """A task stopped right after its tool steps: the next task's prompt comes with
-    the step's record. Claude sees the call's result, and the new task last, in one
+    the step's record. Claude Code first closes the interrupted turn: Claude sees the
+    call's result, Claude Code's answer in Claude's place, then the new task, in one
     turn (also when the Worker's environment asks Claude Code to go on with an
-    interrupted turn by itself). In a session store, every attempt puts the record
-    into a copy."""
+    interrupted turn by itself). Claude Code 2.1.280 and older add their own line for
+    an interrupted turn before that answer. In a session store, every attempt puts the
+    record into a copy."""
     store = where.startswith("store")
     out = tmp_path / "work" / "out.txt"
     model = Turns([[("Write", {"file_path": str(out), "content": "x\n"})]])
@@ -629,11 +656,19 @@ async def test_real_engine_a_new_task_after_a_tool_steps_result(
         model.api.stop()
     assert final.result == "next task done"
     assert len(model.api.requests) == asked + 1  # one turn: the new task's
-    _, texts, history = history_of(model.api.requests[-1])
+    _, _, history = history_of(model.api.requests[-1])
     assert [(h.name, h.is_error) for h in history] == [("Write", False)]
-    # The result, Claude Code's own line for an interrupted turn (whatever the
-    # Worker's environment says), then the new task.
-    assert texts[-2:] == [RESUME_LINE, NEXT_TASK], texts
+    # The result, Claude Code's own line for an interrupted turn on 2.1.280 and older
+    # (whatever the Worker's environment says), its answer in Claude's place, then the
+    # new task.
+    version = _runner._version(await runner._engine_version() or "")  # type: ignore[reportPrivateUsage]
+    assert version is not None
+    expected = [("user", "result")]
+    if version <= (2, 1, 280):
+        expected.append(("user", RESUME_LINE))
+    expected += [("assistant", "No response requested."), ("user", NEXT_TASK)]
+    call_id = paused.deferred.id  # type: ignore[union-attr]
+    assert from_result_on(model.api.requests[-1], call_id) == expected
     if store:
         assert final.session_id != paused.session_id  # a copy with the record
     assert model.api.errors == []
@@ -746,9 +781,10 @@ async def test_real_engine_warm_engines_and_a_turn_that_goes_on(tmp_path: Path) 
     assert model.api.errors == []
 
 
+@pytest.mark.parametrize("mode", ["default", "bypassPermissions"])
 @pytest.mark.parametrize("tool", ["Bash", "Edit"])
 async def test_real_engine_in_a_tool_step_only_the_hook_lets_the_call_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool: str, mode: str
 ) -> None:
     """In a tool step, no rule, permission mode or callback from ``extra_options``
     approves the call: with a hook that gives no answer (it crashed), Claude Code
@@ -773,6 +809,8 @@ async def test_real_engine_in_a_tool_step_only_the_hook_lets_the_call_run(
         turns = edit_turns(notes, ("old", "new"))
         builtin = ["Read", "Edit"]
         extra["permission_mode"] = "acceptEdits"
+    if mode == "bypassPermissions":  # the segment runs in it; the step does not
+        extra["permission_mode"] = mode
     model = Turns(turns)
     runner = make_runner(tmp_path, model.api, extra_options=extra)
     notes.write_text("old\n")
@@ -850,21 +888,24 @@ async def test_real_engine_a_step_whose_record_did_not_reach_its_copy_still_retu
     assert model.api.errors == []
 
 
-@pytest.mark.parametrize("tool", ["Bash", "Write"])
+@pytest.mark.parametrize("tool", ["Bash", "Edit", "Write"])
 async def test_real_engine_the_workers_own_resume_settings_change_nothing(
     tmp_path: Path, tool: str
 ) -> None:
     """Claude Code's switches for continuing an interrupted turn, set in the Worker's
     environment, reach neither a segment that sends a message, nor a tool step (its
     copy ends with the Read's result, a turn Claude Code could go on with by itself),
-    nor the line Claude sees when a turn goes on."""
+    nor the line Claude sees when a turn goes on. Each step asks the stand-in once."""
     notes = tmp_path / "work" / "notes.txt"
     out = tmp_path / "work" / "out.txt"
-    call = (
-        ("Bash", {"command": "echo hi", "description": "run"})
-        if tool == "Bash"
-        else ("Write", {"file_path": str(out), "content": "x\n"})
-    )
+    call = {
+        "Bash": ("Bash", {"command": "echo hi", "description": "run"}),
+        "Edit": (
+            "Edit",
+            {"file_path": str(notes), "old_string": "notes", "new_string": "edited"},
+        ),
+        "Write": ("Write", {"file_path": str(out), "content": "x\n"}),
+    }[tool]
     model = Turns([[("Read", {"file_path": str(notes)})], [call]])
     runner = make_runner(tmp_path, model.api, extra_env=RESUME_SWITCHES)
     notes.write_text("notes\n")
@@ -881,23 +922,60 @@ async def test_real_engine_the_workers_own_resume_settings_change_nothing(
     assert final.result is not None and final.result.startswith("FINAL Read:")
     assert f"| {tool}:" in final.result
     expected: list[tuple[str, Any]] = [("result", None)]
-    if tool == "Write":
+    if tool != "Bash":  # Claude Code's own record: the turn goes on by itself
         expected.append(("text", RESUME_LINE))
     assert seen_after(model.api.requests[-1], paused.deferred.id) == expected
     assert "the Worker says" not in json.dumps(model.api.requests)
     assert model.api.errors == []
 
 
-@pytest.mark.parametrize("rule", ["ask", "deny", "no rule"])
+@pytest.mark.parametrize("own", [False, True], ids=["inherited", "its own"])
+async def test_real_engine_an_mcp_server_in_a_tool_step_sees_the_stand_in(
+    tmp_path: Path, own: bool
+) -> None:
+    """An MCP server that Claude Code starts gets the engine's environment: in a tool
+    step, ``ANTHROPIC_BASE_URL`` points at the stand-in (unlike a command, which gets
+    the Worker's own values back), unless the server's own ``env`` sets it. It also
+    sees the plugin's own variables (``TCA_*``)."""
+    name = "mcp__env__show"
+    server = Path(__file__).parent / "helpers" / "env_mcp_server.py"
+    config: dict[str, Any] = {
+        "type": "stdio",
+        "command": sys.executable,
+        "args": [str(server)],
+    }
+    if own:
+        config["env"] = {"ANTHROPIC_BASE_URL": "http://own.example"}
+    model = Turns([[(name, {})]])
+    runner = make_runner(
+        tmp_path,
+        model.api,
+        extra_options={"mcp_servers": {"env": config}, "allowed_tools": [name]},
+    )
+    session = Session(runner, [], [name], store=False)
+    try:
+        paused = await session.segment("Show it.")
+        assert paused.deferred is not None and paused.deferred.name == name
+        outcome = await session.step(paused)
+    finally:
+        model.api.stop()
+    assert not outcome.is_error and outcome.blocks is not None
+    seen = json.loads(outcome.blocks[0]["text"])
+    stand_in = runner._stand_in.base_url  # type: ignore[reportPrivateUsage]
+    assert seen["ANTHROPIC_BASE_URL"] == ("http://own.example" if own else stand_in)
+    assert seen["TCA_HOOK_DIR"]  # the step's folder
+    assert model.api.errors == []
+
+
+@pytest.mark.parametrize("rule", ["ask", "deny", "no rule", "deny the tool"])
 async def test_real_engine_deny_and_ask_rules_still_apply_in_a_tool_step(
     tmp_path: Path, rule: str
 ) -> None:
-    """Claude Code checks deny and ask rules after the hook's "allow" (a deny rule
-    for a whole tool takes the tool away from Claude, so here it names commands). A
-    tool step never asks a permission callback (only the hook decides there), so an
-    ``ask`` rule for the tool refuses its call in the step, whatever the callback
-    would say: decide on such calls with ``tool_approvals``. Without a rule, the call
-    runs."""
+    """Claude Code checks deny and ask rules after the hook's "allow". A tool step
+    never asks a permission callback (only the hook decides there), so an ``ask``
+    rule for the tool refuses its call in the step, whatever the callback would say:
+    decide on such calls with ``tool_approvals``. Without a rule, the call runs. A
+    deny rule for a whole tool takes the tool away from Claude: nothing pauses."""
     asked: list[str] = []
 
     async def callback(
@@ -913,6 +991,7 @@ async def test_real_engine_deny_and_ask_rules_still_apply_in_a_tool_step(
         "ask": {"ask": ["Bash"]},
         "deny": {"deny": ["Bash(echo:*)"]},
         "no rule": {},
+        "deny the tool": {"deny": ["Bash"]},
     }[rule]
     (work / ".claude" / "settings.json").write_text(json.dumps({"permissions": rules}))
     effects = (work / "effects.log").as_posix()
@@ -927,11 +1006,19 @@ async def test_real_engine_deny_and_ask_rules_still_apply_in_a_tool_step(
     session = Session(runner, ["Bash"], ["Bash"], store=False)
     try:
         paused = await session.segment("Run it.")
-        outcome = await session.step(paused)
+        outcome = None if paused.deferred is None else await session.step(paused)
     finally:
         model.api.stop()
     assert asked == []  # neither in the segment (the hook paused it) nor in the step
     assert model.api.errors == []
+    if rule == "deny the tool":
+        offered = [
+            str(t.get("name")) for r in model.api.requests for t in r.get("tools", [])
+        ]
+        assert "Bash" not in offered and outcome is None
+        assert not Path(effects).exists()
+        return
+    assert outcome is not None
     if rule == "no rule":
         assert not outcome.is_error and Path(effects).read_text() == "ran\n"
     else:
@@ -1398,7 +1485,7 @@ def test_a_segment_that_never_continues_stops_after_its_attempts() -> None:
     stops with an error that says what to change, instead of trying forever."""
     err = _runner._not_continued("9.9.9")  # type: ignore[reportPrivateUsage]
     assert "Claude Code 9.9.9 did not continue the turn" in str(err)
-    assert _runner.RESUME in str(err) and "tested on Claude Code 2.1.273" in str(err)
+    assert _runner.RESUME in str(err) and "from 2.1.273 to 2.1.295" in str(err)
     for attempt in range(1, _runner.CONTINUE_ATTEMPTS):
         with pytest.raises(RuntimeError, match="Retrying"):
             _runner._not_continued_output("s1", err, attempt)  # type: ignore[reportPrivateUsage]
