@@ -386,6 +386,48 @@ def test_a_denial_is_still_answered_when_its_record_cannot_be_written(
     assert got["permissionDecisionReason"] == hook.STOPPED
 
 
+def test_an_input_digest_takes_any_input_and_ignores_the_order_of_keys() -> None:
+    first = hook.input_digest({"content": "a\ud83d b \u00e9", "file_path": "/f"})
+    again = hook.input_digest({"file_path": "/f", "content": "a\ud83d b \u00e9"})
+    assert first == again and len(first) == 64
+    assert (
+        hook.input_digest({"content": "a\ud83d b \u00e8", "file_path": "/f"}) != first
+    )
+
+
+@pytest.mark.parametrize("given", ["the same input", "other input"])
+def test_a_tool_step_runs_its_call_only_with_the_input_it_was_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, given: str
+) -> None:
+    """With ``TCA_ALLOW_INPUT``, the step's call runs only with that input, as Claude
+    Code is about to run it (the order of its keys does not matter). With other input
+    it is denied, and never takes the ``allowed`` record, so it did not run."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TCA_HOOK_DIR", str(run_dir))
+    monkeypatch.setenv("TCA_ALLOW_ID", CALL_ID)
+    approved = {"command": "ls", "description": "list"}
+    monkeypatch.setenv("TCA_ALLOW_INPUT", hook.input_digest(approved))
+    for name in ("TCA_ANSWERED_IDS", "TCA_HOOK_LOG"):
+        monkeypatch.delenv(name, raising=False)
+    runs = (
+        {"description": "list", "command": "ls"}
+        if given == "the same input"
+        else {**approved, "command": "rm -rf ."}
+    )
+    got = hook.decide({"tool_name": "Bash", "tool_use_id": CALL_ID, "tool_input": runs})
+    if given == "the same input":
+        assert got == {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
+        assert (run_dir / hook.ALLOWED).read_text(encoding="utf-8") == CALL_ID
+    else:
+        assert got["permissionDecision"] == "deny"
+        assert got["permissionDecisionReason"] == hook.OTHER_INPUT
+        assert not (run_dir / hook.ALLOWED).exists()
+        assert (run_dir / "denied" / CALL_ID).read_text(encoding="utf-8") == (
+            "other_input"
+        )
+
+
 class Interleaved:
     """``os`` and ``open`` for the hook, where another call's hook claims the paused
     call's slot just before this one tries: the moment two hooks can collide."""

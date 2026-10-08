@@ -44,11 +44,17 @@ class ToolOutcome:
         is_error: Whether the call failed; Claude sees the content as an error.
         blocks: Content blocks (text, images) to hand back exactly as they are,
             instead of ``content``: what a Claude Code tool returned.
+        entry: For an Edit or a Write that ran in a tool step: Claude Code's own
+            transcript entry for the result, without the result itself (that is
+            ``content`` or ``blocks``). The next segment puts it where the call's
+            result belongs, so Claude Code continues from its own record of the call
+            (without it, the segment writes a record of the same shape).
     """
 
     content: Any = None
     is_error: bool = False
     blocks: list[dict[str, Any]] | None = None
+    entry: dict[str, Any] | None = None
 
 
 @dataclass
@@ -162,8 +168,9 @@ class ToolStepRetry:
 class ToolStepInput:
     """Input of a tool step: one Claude Code tool call, run as its own Activity.
 
-    The step resumes the session where it paused at the call, and lets Claude Code run
-    exactly that call.
+    Claude Code resumes a private copy of the session that ends before the call; a
+    stand-in model on the Worker answers with the call, as Claude sent it, and Claude
+    Code runs exactly that call.
 
     Attributes:
         session_id: The Claude session.

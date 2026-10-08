@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import HookMatcher, ToolResultBlock, UserMessage
 
-from temporalio.claude_agent_sdk import ClaudeAgentSdkRunner, ToolOutcome
+from temporalio.claude_agent_sdk import ClaudeAgentSdkRunner, DeferredCall, ToolOutcome
 from temporalio.claude_agent_sdk import _defer_hook as hook
 from temporalio.claude_agent_sdk import _launcher as launcher
 from temporalio.claude_agent_sdk import _runner as runner
@@ -376,8 +376,14 @@ def test_a_tool_steps_model_calls_go_to_the_stand_in_without_a_proxy(
         )
         hook_dir = tmp_path / "step"
         hook_dir.mkdir(exist_ok=True)
-        env = configured._step_env(dict(configured._env), str(hook_dir), "toolu_1")
+        call = DeferredCall("toolu_1", "Bash", {"command": "ls"}, kind="engine")
+        env = configured._step_env(
+            dict(configured._env), str(hook_dir), call, "the step's key"
+        )
         assert env["NO_PROXY"] == env["no_proxy"] == merged
         assert env["ANTHROPIC_BASE_URL"] == configured._stand_in.base_url
-        assert env["ANTHROPIC_API_KEY"] == configured._stand_in.key
+        assert env["ANTHROPIC_API_KEY"] == "the step's key"
         assert env["TCA_ALLOW_ID"] == "toolu_1"
+        assert env["TCA_ALLOW_INPUT"] == hook.input_digest({"command": "ls"})
+        assert env["ENABLE_TOOL_SEARCH"] == "false"  # every tool in the request
+        assert env["DISABLE_AUTO_COMPACT"] == "1"  # no summary asked of the stand-in

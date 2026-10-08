@@ -1039,7 +1039,13 @@ class DurableClaudeAgent:
         for call_id in sorted(sizes, key=lambda c: (-sizes[c], c)):
             if total <= PAYLOAD_LIMIT_BYTES:
                 break
+            # A tool step's record of its call stays (without its metadata), so the
+            # note reaches Claude where Claude Code expects the call's result.
+            entry = state.pending[call_id].entry
             state.pending[call_id] = ToolOutcome(
+                entry=None
+                if entry is None
+                else {k: v for k, v in entry.items() if k != "toolUseResult"},
                 content=(
                     f"This tool call ran, but its result ({sizes[call_id] / 1024 / 1024:.1f}"
                     " MB) was too large to deliver to Claude together with the other "

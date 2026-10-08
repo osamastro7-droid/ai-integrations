@@ -24,6 +24,20 @@ ENGINE_TOOLS = frozenset(
 """Claude Code tools a scripted policy may call by name (MCP tools: ``mcp__...``)."""
 Decide = Callable[[dict[str, Any]], list[dict[str, Any]]]
 
+RESUME_LINE = "Continue from where you left off."
+"""The line Claude Code adds when it continues a turn by itself, as it does after a
+tool step's result (see the runner's ``CONTINUE_ENV``)."""
+
+
+def user_words(texts: list[str]) -> list[str]:
+    """The texts of user messages the user wrote: not the engine's reminders, nor its
+    line for a turn it continues."""
+    return [
+        t
+        for t in texts
+        if not t.lstrip().startswith("<system-reminder>") and t.strip() != RESUME_LINE
+    ]
+
 
 def _blocks(message: dict[str, Any] | None) -> list[dict[str, Any]]:
     if message and isinstance(message.get("content"), list):
@@ -326,7 +340,7 @@ def policy_decider(api_ref: list[FakeMessagesAPI], policy: Policy) -> Decide:
     def decide(body: dict[str, Any]) -> list[dict[str, Any]]:
         _, texts, history = history_of(body)
         # Like ScriptedClaude: the latest user message, not the engine's reminders.
-        said = [t for t in texts if not t.lstrip().startswith("<system-reminder>")]
+        said = user_words(texts)
         action = policy(said[-1] if said else "", history)
         if isinstance(action, Final):
             return [{"type": "text", "text": action.text}]

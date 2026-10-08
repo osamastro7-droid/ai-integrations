@@ -268,6 +268,34 @@ async def test_results_that_do_not_fit_become_notes_largest_first(
     assert got == big and failed is None
 
 
+async def test_a_tool_steps_record_stays_when_its_result_becomes_a_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Edit's or a Write's record of its call (``ToolOutcome.entry``) stays with
+    the note, so the note reaches Claude where Claude Code expects the call's result;
+    its metadata goes, as it can be what was too large."""
+    OutsideWorkflow().install(monkeypatch)
+    monkeypatch.setattr(wf, "PAYLOAD_LIMIT_BYTES", 4000)
+    record = {
+        "type": "user",
+        "uuid": "u1",
+        "message": {"role": "user", "content": []},
+        "toolUseResult": {"originalFile": "o" * 3000},
+    }
+    got, size, failed = await fit(
+        {
+            "toolu_1": ToolOutcome(content="r" * 3000, entry=record),
+            "toolu_2": ToolOutcome(content="small"),
+        }
+    )
+    assert failed is None and size <= 4000
+    assert got["toolu_1"].is_error and "too large" in str(got["toolu_1"].content)
+    assert got["toolu_1"].entry == {
+        k: v for k, v in record.items() if k != "toolUseResult"
+    }
+    assert got["toolu_2"] == ToolOutcome(content="small")
+
+
 def segment_with(pending: dict[str, ToolOutcome]) -> SegmentInput:
     return SegmentInput(
         session_id="s", prompt=None, tools=[], checkpoint="c", injected=pending

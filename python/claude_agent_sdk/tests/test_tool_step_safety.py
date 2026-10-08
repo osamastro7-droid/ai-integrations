@@ -30,6 +30,7 @@ from claude_agent_sdk import HookMatcher
 from temporalio.activity import ActivityCancellationDetails
 from temporalio.claude_agent_sdk import (
     ClaudeAgentSdkRunner,
+    DeferredCall,
     FileSessionStore,
     SegmentInput,
     ToolSpec,
@@ -101,27 +102,39 @@ def lines(path: Path) -> list[str]:
 # ---- a tool step runs once, talks to no model, and keeps the Worker's environment ----
 
 
-async def test_a_tool_step_keeps_its_result_when_the_engine_fails_afterwards(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The model call after the tool fails: the call ran, so the step returns its
-    result instead of failing, which would make Temporal run the command again."""
-    effects = tmp_path / "work" / "effects.log"
-    api = start_with_policy(shell_policy)
-    runner = make_runner(tmp_path, api)
+def fail_after_the_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make a tool step's engine fail after its call ran: the turn goes on after the
+    call, and the stand-in model refuses the request that follows."""
+    served = _stand_in._Handler.do_POST
 
-    def refuse(handler: Any) -> None:
+    def refuse_after_the_call(handler: Any) -> None:
+        call = handler.stand_in.call_for(handler.headers.get("x-api-key", ""))
+        if call is None or not call.served:
+            return served(handler)
         handler.rfile.read(int(handler.headers.get("content-length", 0)))
         error = {"type": "invalid_request_error", "message": "stand-in refuses"}
         handler._send({"type": "error", "error": error}, status=400)
 
+    monkeypatch.setattr(_runner, "STEP_MAX_TURNS", 2)
+    monkeypatch.setattr(_stand_in._Handler, "do_POST", refuse_after_the_call)
+
+
+async def test_a_tool_step_keeps_its_result_when_the_engine_fails_afterwards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model call after the tool fails: the call ran, so the step returns its
+    result instead of failing, which would make Temporal run the command again."""
+    effects = tmp_path / "work" / "effects.log"
+    api = start_with_policy(shell_policy)
+    runner = make_runner(tmp_path, api)
     try:
         out = await pause_at_bash(runner, "echo ran >> effects.log && echo local")
-        monkeypatch.setattr(_stand_in._Handler, "do_POST", refuse)
+        fail_after_the_call(monkeypatch)
         outcome = await runner.run_tool_step(step_for(out), 1)
     finally:
         api.stop()
     assert outcome.content == "local" and not outcome.is_error
+    assert outcome.entry is None  # a command's result goes as a message, as usual
     assert lines(effects) == ["ran"]
 
 
@@ -131,15 +144,9 @@ async def test_in_an_activity_a_kept_result_is_logged_with_the_engines_failure(
     """The same, as the tool step Activity: the Worker's log says what happened."""
     api = start_with_policy(shell_policy)
     runner = make_runner(tmp_path, api)
-
-    def refuse(handler: Any) -> None:
-        handler.rfile.read(int(handler.headers.get("content-length", 0)))
-        error = {"type": "invalid_request_error", "message": "stand-in refuses"}
-        handler._send({"type": "error", "error": error}, status=400)
-
     try:
         out = await pause_at_bash(runner, "echo local")
-        monkeypatch.setattr(_stand_in._Handler, "do_POST", refuse)
+        fail_after_the_call(monkeypatch)
         with caplog.at_level(logging.WARNING):
             outcome = await ActivityEnvironment().run(
                 runner.run_tool_step, step_for(out), 1
@@ -148,10 +155,13 @@ async def test_in_an_activity_a_kept_result_is_logged_with_the_engines_failure(
         api.stop()
     assert outcome.content == "local" and not outcome.is_error
     kept = [
-        r.getMessage() for r in caplog.records if "Its result is kept" in r.getMessage()
+        r.getMessage()
+        for r in caplog.records
+        if "and its result is kept" in r.getMessage()
     ]
     assert len(kept) == 1 and kept[0].startswith(
-        f"Tool call {out.deferred.id} (Bash) ran;"
+        f"Tool call {out.deferred.id} (Bash) ran, and its result is kept, but the "
+        "engine failed after it"
     )
 
 
@@ -581,7 +591,8 @@ def test_the_command_env_file_is_a_posix_shell_script(
     env = runner._step_env(  # type: ignore[reportPrivateUsage]
         {"ANTHROPIC_BASE_URL": "https://example.invalid", "TCA_HOOK_DIR": "x"},
         str(tmp_path),
-        "toolu_1",
+        DeferredCall("toolu_1", "Bash", {}, kind="engine"),
+        "the step's key",
     )
     script = (tmp_path / "command_env.sh").read_bytes()
     assert env["CLAUDE_ENV_FILE"] == str(tmp_path / "command_env.sh")
@@ -596,7 +607,7 @@ def test_the_command_env_file_is_a_posix_shell_script(
         "TCA_KEEP_ANTHROPIC_BASE_URL",
     }
     assert "TCA_NOT-A-SHELL-NAME" not in unset
-    assert env["ANTHROPIC_API_KEY"] == runner._stand_in.key  # type: ignore[reportPrivateUsage]
+    assert env["ANTHROPIC_API_KEY"] == "the step's key"
     shell = shutil.which("sh")
     if shell is not None:  # Git Bash's sh on Windows, when it is on PATH
         ran = subprocess.run(
@@ -609,7 +620,7 @@ def test_the_command_env_file_is_a_posix_shell_script(
         assert ran.returncode == 0 and ran.stderr == "", ran.stderr
         first, *rest = ran.stdout.splitlines()
         assert first == "https://example.invalid"  # the Worker's own value
-        assert runner._stand_in.key not in ran.stdout  # type: ignore[reportPrivateUsage]
+        assert "the step's key" not in ran.stdout
         plugins = [n.split("=", 1)[0] for n in rest if n.startswith("TCA_")]
         assert [n for n in plugins if n.isidentifier()] == []
 
@@ -636,7 +647,8 @@ def test_your_own_env_file_runs_after_the_workers_values_are_back(
             "CLAUDE_ENV_FILE": "user_env.sh",
         },
         str(tmp_path),
-        "toolu_1",
+        DeferredCall("toolu_1", "Bash", {}, kind="engine"),
+        "the step's key",
     )
     ran = subprocess.run(
         [str(shutil.which("sh")), "-c", '. "$CLAUDE_ENV_FILE" && env'],
@@ -682,43 +694,60 @@ def post_to(
         return err.code
 
 
+BASH_CALL = {
+    "type": "tool_use",
+    "id": "toolu_recorded",
+    "name": "Bash",
+    "input": {"command": "echo hi", "description": "run"},
+}
+OFFERS_BASH = json.dumps({"model": "m", "tools": [{"name": "Bash"}]}).encode()
+
+
 def test_the_stand_in_refuses_a_body_that_is_not_json() -> None:
     stand_in = _stand_in.StandInModel()
-    assert post_to(stand_in, b"not json", stand_in.key) == 400
-    assert stand_in.requests == 1
+    call = stand_in.serve(BASH_CALL)
+    assert post_to(stand_in, b"not json", call.key) == 400
+    assert stand_in.requests == 1 and call.served == call.other == 0
 
 
 @pytest.mark.parametrize("key", [None, "sk-ant-guess"], ids=["no-key", "wrong-key"])
 def test_the_stand_in_answers_only_its_own_engines(key: str | None) -> None:
-    """Any program on the machine can reach 127.0.0.1. Without the stand-in's key it
-    gets 401 at once: the stand-in does not wait for the body it says it sends."""
+    """Any program on the machine can reach 127.0.0.1. Without the key of a running
+    tool step it gets 401 at once: the stand-in does not wait for the body it says it
+    sends. A step's key works only while the step runs."""
     stand_in = _stand_in.StandInModel()
+    call = stand_in.serve(BASH_CALL)
     assert post_to(stand_in, b"{}", key, length=1000) == 401
     assert stand_in.requests == 0
-    assert post_to(stand_in, b'{"model": "x", "messages": []}', stand_in.key) == 200
+    assert post_to(stand_in, b'{"model": "x", "messages": []}', call.key) == 200
     assert stand_in.requests == 1
+    stand_in.done(call)
+    assert post_to(stand_in, OFFERS_BASH, call.key, length=1000) == 401
+    assert stand_in.requests == 1 and call.served == 0
 
 
 def test_the_stand_in_reads_no_body_over_its_limit_or_of_a_negative_length() -> None:
     """Both answer at once (before, the stand-in waited for the body that never came)."""
     stand_in = _stand_in.StandInModel()
-    assert post_to(stand_in, b"{}", stand_in.key, _stand_in.MAX_BODY_BYTES + 1) == 413
-    assert post_to(stand_in, b"{}", stand_in.key, -1) == 400
-    assert post_to(stand_in, b"{}", stand_in.key, "two") == 400
+    key = stand_in.serve(BASH_CALL).key
+    assert post_to(stand_in, b"{}", key, _stand_in.MAX_BODY_BYTES + 1) == 413
+    assert post_to(stand_in, b"{}", key, -1) == 400
+    assert post_to(stand_in, b"{}", key, "two") == 400
 
 
 def ask(
     stand_in: _stand_in.StandInModel,
     path: str,
     body: bytes | None,
+    key: str,
     method: str = "POST",
 ) -> tuple[int, Any]:
-    """Send a request with the stand-in's key; its status and JSON answer."""
+    """Send a request with a step's key; its status and JSON answer."""
     request = urllib.request.Request(
         f"{stand_in.base_url}{path}",
         data=body,
         method=method,
-        headers={"x-api-key": stand_in.key},
+        headers={"x-api-key": key},
     )
     try:
         with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
@@ -727,23 +756,63 @@ def ask(
         return err.code, json.loads(err.read())
 
 
-def test_the_stand_in_answers_each_kind_of_request_shortly() -> None:
-    """A model call gets "ok"; token counting, other paths and GET get small answers;
-    a JSON body that is not an object is refused."""
+def test_the_stand_in_answers_with_the_steps_call_once() -> None:
+    """The first model call that offers the call's tool gets the call, exactly as
+    recorded; every other model call gets "ok", and is counted. Token counting,
+    other paths and GET get small answers; a body that is not an object is refused."""
     stand_in = _stand_in.StandInModel()
-    status, answer = ask(stand_in, "/v1/messages", b'{"model": "m"}')
+    call = stand_in.serve(BASH_CALL)
+    status, answer = ask(stand_in, "/v1/messages", b'{"model": "m"}', call.key)
+    assert status == 200 and answer["content"] == [
+        {"type": "text", "text": _stand_in.ANSWER}
+    ]  # it does not offer Bash: a side call of the engine
+    status, answer = ask(stand_in, "/v1/messages", OFFERS_BASH, call.key)
     assert status == 200 and answer["model"] == "m"
+    assert answer["content"] == [BASH_CALL] and answer["stop_reason"] == "tool_use"
+    status, answer = ask(stand_in, "/v1/messages", OFFERS_BASH, call.key)
     assert answer["content"] == [{"type": "text", "text": _stand_in.ANSWER}]
     assert answer["stop_reason"] == "end_turn"
-    assert ask(stand_in, "/v1/messages/count_tokens", b"{}") == (
+    assert (call.served, call.other) == (1, 2)
+    assert ask(stand_in, "/v1/messages/count_tokens", b"{}", call.key) == (
         200,
         {"input_tokens": 1},
     )
-    assert ask(stand_in, "/v1/other", b"{}") == (200, {})
-    assert ask(stand_in, "/", None, method="GET") == (200, {})
-    status, refused = ask(stand_in, "/v1/messages", b"[1, 2]")
+    assert ask(stand_in, "/v1/other", b"{}", call.key) == (200, {})
+    assert ask(stand_in, "/", None, call.key, method="GET") == (200, {})
+    status, refused = ask(stand_in, "/v1/messages", b"[1, 2]", call.key)
     assert status == 400 and refused["error"]["message"] == "not a JSON object"
-    assert stand_in.requests == 4  # the POSTs with its key
+    assert stand_in.requests == 6  # the POSTs with the step's key
+
+
+def test_the_stand_in_streams_the_steps_call_as_the_api_would() -> None:
+    """Claude Code streams its model calls: the call arrives as one tool_use block,
+    its input as JSON, and the message stops for the tool."""
+    stand_in = _stand_in.StandInModel()
+    call = stand_in.serve(BASH_CALL)
+    body = json.dumps({"model": "m", "stream": True, "tools": [{"name": "Bash"}]})
+    request = urllib.request.Request(
+        f"{stand_in.base_url}/v1/messages",
+        data=body.encode(),
+        method="POST",
+        headers={"x-api-key": call.key},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in response.read().decode().splitlines()
+            if line.startswith("data: ")
+        ]
+    assert [e["type"] for e in events] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert events[1]["content_block"] == {**BASH_CALL, "input": {}}
+    assert json.loads(events[2]["delta"]["partial_json"]) == BASH_CALL["input"]
+    assert events[4]["delta"]["stop_reason"] == "tool_use"
 
 
 @pytest.mark.parametrize("credential", ["key helper", "login", "token variables"])

@@ -32,6 +32,7 @@ from tests.helpers.fake_messages_api import (
     engine_env,
     history_of,
     policy_decider,
+    user_words,
 )
 
 TOOLS = [ToolSpec("count", "Count one step.", {"type": "object"})]
@@ -121,8 +122,7 @@ def make_runner(
 def conversation(api: FakeMessagesAPI) -> tuple[list[str], list[str]]:
     """The tool calls and the user's words Claude saw in the last request."""
     _, texts, history = history_of(api.requests[-1])
-    said = [t for t in texts if not t.lstrip().startswith("<system-reminder>")]
-    return [h.id for h in history], said
+    return [h.id for h in history], user_words(texts)
 
 
 def check_clean(api: FakeMessagesAPI, runner: ClaudeAgentSdkRunner) -> None:

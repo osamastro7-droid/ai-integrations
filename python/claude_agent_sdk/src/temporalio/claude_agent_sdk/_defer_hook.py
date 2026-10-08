@@ -7,9 +7,13 @@ name patterns), so the Workflow runs them. It never answers "allow" for them in 
 segment: on a resumed paused call, "allow" sends the engine down its auto-resume
 path, where a later "defer" is ignored.
 
-Tool steps: with ``$TCA_ALLOW_ID`` set, the engine resumed a session that paused at a
-Claude Code tool call, to run exactly that call; the hook allows it and denies
-anything else. Just before it allows the call, it creates ``$TCA_HOOK_DIR/allowed``,
+Tool steps: with ``$TCA_ALLOW_ID`` set, the engine resumed a copy of the session that
+ends before a Claude Code tool call, and a stand-in model sent the call again, to run
+exactly that call; the hook allows it and denies anything else. With
+``$TCA_ALLOW_INPUT`` (``input_digest`` of the input the segment reported, which is what
+an approval saw), it allows the call only with that input, as Claude Code is about to
+run it (Claude Code makes a relative ``file_path`` absolute before hooks see it, in the
+segment and in the step alike). Just before it allows the call, it creates ``$TCA_HOOK_DIR/allowed``,
 so after a failure the runner knows whether the call may have run. The runner creates
 the same file when its step ends; whichever creates it first wins, so a call the
 runner reports as not run can never start afterwards.
@@ -84,6 +88,9 @@ MAIN_AGENT_ONLY = (
 STEP_ONLY = "This step runs one tool call only."
 """The reason for any other call in a tool step (the stand-in model makes none)."""
 
+OTHER_INPUT = "This step runs its tool call only with the input it was given."
+"""The reason in a tool step when the call's input is not the one the step was given."""
+
 
 DURABLE_PREFIX = "mcp__durable__"
 """Names of durable tools as the engine sees them (the runner's ``PREFIX``)."""
@@ -105,6 +112,7 @@ REASON_KEYS = {
     STOPPED: "stopped",
     MAIN_AGENT_ONLY: "main_agent_only",
     STEP_ONLY: "step_only",
+    OTHER_INPUT: "other_input",
 }
 """What the hook writes in ``denied/<tool_use_id>`` for each reason."""
 
@@ -116,6 +124,15 @@ def denial_name(tool_use_id: str) -> str:
     if _SAFE_ID.fullmatch(tool_use_id):
         return tool_use_id
     return hashlib.sha256(tool_use_id.encode("utf-8")).hexdigest()
+
+
+def input_digest(tool_input: Any) -> str:
+    """The SHA-256 of a tool call's input as canonical JSON (``$TCA_ALLOW_INPUT``).
+
+    ASCII JSON, so any string can be hashed (a lone surrogate too).
+    """
+    text = json.dumps(tool_input, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("ascii")).hexdigest()
 
 
 def _deny(reason: str = NOT_RUN) -> dict[str, Any]:
@@ -253,14 +270,19 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
     if run_dir is not None and not os.path.isdir(run_dir):
         output = _deny(STOPPED)  # the run ended, or this hook cannot see its folder
     elif allow_id is not None:  # a tool step: exactly this call, nothing else
+        allow_input = os.environ.get("TCA_ALLOW_INPUT")
         if stopped:
             output = _deny(STOPPED)
-        elif tool_use_id == allow_id and _note_allowed(run_dir, tool_use_id):
-            output = {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
-        elif tool_use_id == allow_id:
-            output = _deny(STOPPED)  # its start could not be recorded: it must not run
-        else:
+        elif tool_use_id != allow_id:
             output = _deny(STEP_ONLY)
+        elif allow_input is not None and allow_input != input_digest(
+            event.get("tool_input")
+        ):
+            output = _deny(OTHER_INPUT)  # not what the segment reported: not approved
+        elif _note_allowed(run_dir, tool_use_id):
+            output = {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
+        else:
+            output = _deny(STOPPED)  # its start could not be recorded: it must not run
     elif tool_use_id in answered and not event.get("agent_id"):
         # On resume the engine re-announces the call whose result was just delivered.
         # It must never run, whatever the tool (the settings may have changed since).

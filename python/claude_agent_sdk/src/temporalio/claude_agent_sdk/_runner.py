@@ -12,10 +12,23 @@ How one segment works:
    again. In a segment, the hook keeps answering "defer" (never "allow") for these
    calls.
 
-A tool step resumes a copy of the session that ends where it paused at a Claude Code
-call, and the hook allows exactly that call, so Claude gets Claude Code's own result.
-The engine's model calls after the tool go to a stand-in on 127.0.0.1
-(``_stand_in``), and the command still sees the Worker's own environment.
+A tool step runs a Claude Code call that paused a segment with Brian Strauch's bounded
+native call replay (from his hybrid prototype in temporalio/ai-integrations): Claude
+Code resumes a private copy of the conversation that ends before the call, a stand-in
+model on 127.0.0.1 (``_stand_in``) answers with the call itself, the exact ``tool_use``
+block Claude sent, the hook allows exactly that call, and ``max_turns=1`` ends the turn
+after it. So Claude Code runs the call in an ordinary turn and writes its own result
+entry, which the step returns for an Edit or a Write (``ToolOutcome.entry``). No real
+model is asked, and the command still sees the Worker's own environment.
+
+For an Edit or a Write (``RECORDED_TOOLS``), the next segment puts that entry, or one
+of the same shape (``_record``), where the call's result belongs, and Claude Code
+continues the turn itself (``CONTINUE_ENV``): Claude sees the result as Claude Code
+recorded it, then Claude Code's own line "Continue from where you left off.". Claude
+Code does not check the call again. (Such a result sent as a new message after the
+pause is checked again: Claude would be told that a file it edited in the step "has
+been modified since read", anthropics/claude-code#99041.) The results of other tools
+go as a message, as in step 3: Claude Code does not check them again.
 
 Checkpoints make retries clean. After a segment, the runner reads the session back
 from the session store and returns where the next segment must continue (the last
@@ -79,6 +92,7 @@ import unicodedata
 import uuid
 import warnings
 from collections.abc import AsyncGenerator, AsyncIterator, Collection
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -92,9 +106,11 @@ from claude_agent_sdk import (
     ResultError,
     ResultMessage,
     SessionStore,
+    StreamEvent,
     SystemMessage,
     TextBlock,
     ToolResultBlock,
+    ToolUseBlock,
     UserMessage,
     create_sdk_mcp_server,
     fork_session_via_store,
@@ -113,6 +129,7 @@ from ._defer_hook import (
     STOPPED,
     WORKER_LOCK,
     denial_name,
+    input_digest,
 )
 from ._defer_hook import NOT_RUN as NOT_RUN_REASON
 from ._events import emit
@@ -128,7 +145,7 @@ from ._models import (
     ToolSpec,
     ToolStepInput,
 )
-from ._stand_in import StandInModel
+from ._stand_in import RecordedCall, StandInModel
 
 ENV_AUTH = (
     "ANTHROPIC_API_KEY",
@@ -181,8 +198,80 @@ STEP_PROVIDER_ENV = {
 }
 """A tool step talks to the local stand-in model only, whatever provider the Worker uses.
 
-``ANTHROPIC_API_KEY`` is the stand-in's own key (``StandInModel.key``).
+``ANTHROPIC_API_KEY`` is the key the stand-in gave the step (``StandInModel.serve``).
 """
+
+RECORDED_TOOLS = ("Edit", "Write")
+"""Claude Code tools whose result goes into the conversation as Claude Code's own record
+of it (see ``_place``), not as a message.
+
+Claude Code checks a paused Edit or Write again when its result arrives as a message,
+finds the file changed since Claude read it (the step changed it), and tells Claude
+"File has been modified since read" (anthropics/claude-code#99041). A command's or an
+MCP tool's result is not checked again, so it goes as a message, as before.
+"""
+
+RESUME = "CLAUDE_CODE_RESUME_INTERRUPTED_TURN"
+"""Claude Code's switch to continue an interrupted turn by itself when it starts."""
+
+STEP_ENV = {
+    # Every tool is in the stand-in's request, so it can answer with the step's call
+    # (Claude Code turns tool search off by itself for a host that is not Anthropic's,
+    # unless the Worker's environment turns it on).
+    "ENABLE_TOOL_SEARCH": "false",
+    # The step's engine never compacts the conversation: it would ask the stand-in
+    # for a summary.
+    "DISABLE_AUTO_COMPACT": "1",
+    # The step's copy of the conversation can end like an interrupted turn: Claude
+    # Code must not start a turn of its own beside the one the step's prompt starts.
+    RESUME: "",
+}
+"""More settings of a tool step's engine (commands see the Worker's own values)."""
+
+CONTINUE_ENV = {
+    RESUME: "1",
+    "CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS": "0",
+    "CLAUDE_CODE_RESUME_PROMPT": "",
+    "CLAUDE_CODE_RESUME_REASON": "",
+}
+"""Set for a segment that continues after a tool step's record (see ``_place``).
+
+The conversation then ends with a tool result, which Claude Code takes for a turn that
+was interrupted. With these, it continues that turn by itself, with no new message
+(tested on Claude Code 2.1.273, 2.1.274 and 2.1.288): Claude sees the result, then
+Claude Code's own line "Continue from where you left off.". Sending a message instead
+(even an empty one) adds two more lines Claude did not write ("No response requested."
+and "(no content)"). ``MAX_AGE_MS=0``: however long the step took, the turn continues
+(the Worker's environment could set a maximum age). ``PROMPT`` and ``REASON`` empty:
+Claude Code's own line and reason, whatever the Worker's environment says. Other
+segments get ``RESUME`` empty, whatever the Worker has. Commands see the Worker's own
+values.
+"""
+
+CONTINUE_START_SECONDS = 120.0
+"""How long a continuing segment waits for Claude Code to start the turn by itself,
+from the engine's start or its last notice before the turn (see ``_StartWatch``).
+
+Claude Code starts it at once (tested). One that does not would wait for a message
+forever: the segment ends its input, so the engine exits, and fails (see
+``CONTINUE_ATTEMPTS``).
+"""
+
+CONTINUE_ATTEMPTS = 3
+"""Attempts of a segment whose Claude Code did not continue the turn by itself.
+
+Temporal runs it again until then (a slow start can pass); after that, the task fails
+with an error that names the Claude Code version, instead of being retried forever."""
+
+STEP_MAX_TURNS = 1
+"""A tool step's turn ends right after its call (a test may let it go on)."""
+
+RESULT_METADATA_LIMIT = 64 * 1024
+"""Largest ``toolUseResult`` a tool step returns with its record (UTF-8 bytes of JSON).
+
+That metadata can hold a whole file (an Edit's ``originalFile``), and Claude Code does
+not need it to continue (tested: two Edits of one file, each record without it).
+Larger metadata is left out, so it does not grow the Workflow's history."""
 
 SAVED_OUTPUT_TAIL = 4096
 """Bytes of the end of an output Claude Code saved to a file, added to the preview."""
@@ -578,18 +667,54 @@ def _deliver(
     paused = _marker_of(entries[marker]) if marker is not None else None
     if marker is None or paused is None:
         return None
-    first = marker  # the paused call's hook entries end at the marker
+    first = _hooks_start(entries, marker, paused)
+    moved, delivered = _denied_after(entries, marker, paused, results)
+    if not moved:
+        return None
+    return [*entries[:first], *moved, *entries[first : marker + 1]], delivered
+
+
+def _hooks_start(entries: list[Any], marker: int, paused: str) -> int:
+    """Where the paused call's hook entries start: they end at its deferral marker."""
+    first = marker
     while first > 0:
         previous = entries[first - 1]
         attachment = previous.get("attachment") if isinstance(previous, dict) else None
         if not (isinstance(attachment, dict) and attachment.get("toolUseID") == paused):
             break
         first -= 1
+    return first
+
+
+def _denied_after(
+    entries: list[Any],
+    marker: int,
+    paused: str,
+    results: dict[str, ToolOutcome],
+    calls: Collection[str] | None = None,
+) -> tuple[list[Any], set[str]]:
+    """The results after a deferral marker, durable ones replaced by their real results.
+
+    Those are the denials of the calls after the paused one (see ``_deliver``).
+
+    Args:
+        entries: The session.
+        marker: The index of the paused call's deferral marker.
+        paused: The paused call's id (its own result is never among them).
+        results: The results the Workflow delivers.
+        calls: When given, only results of these calls: the calls of the paused
+            call's message (entries a later run wrote are not denials).
+
+    Returns:
+        The result entries (copies), and the calls whose results they now hold.
+    """
     moved: list[Any] = []
     delivered: set[str] = set()
     for entry in entries[marker + 1 :]:
         ids = _result_ids(entry)
         if not ids or paused in ids:
+            continue
+        if calls is not None and not set(ids) <= set(calls):
             continue
         entry = copy.deepcopy(entry)
         for block in entry["message"]["content"]:
@@ -604,9 +729,273 @@ def _deliver(
             entry["toolUseResult"] = block["content"]
             delivered.add(str(block["tool_use_id"]))
         moved.append(entry)
-    if not moved:
+    return moved, delivered
+
+
+def _hook_span(entries: list[Any], checkpoint: str) -> tuple[int, int, str] | None:
+    """Where a pause's hook entries are: (the first, the deferral marker, the call's id).
+
+    The checkpoint is the marker, or a later entry when no user entry followed the
+    marker (see ``_resume_point``): then only attachments come between them.
+
+    Returns:
+        None if the checkpoint is not in ``entries``, or is not right after a pause.
+    """
+    end = next(
+        (
+            i
+            for i in range(len(entries) - 1, -1, -1)
+            if isinstance(entries[i], dict) and entries[i].get("uuid") == checkpoint
+        ),
+        None,
+    )
+    if end is None:
         return None
-    return [*entries[:first], *moved, *entries[first : marker + 1]], delivered
+    marker = end
+    while marker >= 0 and _marker_of(entries[marker]) is None:
+        entry = entries[marker]
+        if isinstance(entry, dict) and entry.get("type") in ("user", "assistant"):
+            return None  # the checkpoint is not right after a pause
+        marker -= 1
+    if marker < 0:
+        return None
+    paused = cast("str", _marker_of(entries[marker]))
+    return _hooks_start(entries, marker, paused), marker, paused
+
+
+def _calls_of(
+    entries: list[Any], call_id: str
+) -> tuple[dict[str, Any], list[str]] | None:
+    """The assistant entry with a call, and the ids of every call of its message.
+
+    Claude Code writes each block of a message as an entry of its own, with the
+    message's id.
+    """
+    owner = None
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list) and any(
+            isinstance(b, dict)
+            and b.get("type") == "tool_use"
+            and b.get("id") == call_id
+            for b in content
+        ):
+            owner = entry
+    if owner is None or not isinstance(owner.get("uuid"), str):
+        return None
+    message_id = owner["message"].get("id")
+    ids: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        if entry is not owner and (
+            message_id is None or message.get("id") != message_id
+        ):
+            continue
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                ids.append(str(block.get("id")))
+    return owner, ids
+
+
+def _recorded_call(entries: list[Any], call_id: str) -> dict[str, Any] | None:
+    """The ``tool_use`` block of a call, as the conversation recorded it."""
+    found = _calls_of(entries, call_id)
+    if found is None:
+        return None
+    for block in found[0]["message"]["content"]:
+        if isinstance(block, dict) and block.get("id") == call_id:
+            return copy.deepcopy(block)
+    return None
+
+
+def _step_context(entries: list[Any], first: int) -> list[Any]:
+    """The private copy of the conversation that a tool step runs its call in.
+
+    As in Brian Strauch's ``context()`` (hybrid prototype): the conversation before
+    the paused call's hook entries, without the calls that have no result there (the
+    paused call, and the calls of its message after it), and without entries left
+    empty. Calls that ran before keep Claude Code's own results (an Edit needs the
+    Read before it). An entry whose parent was left out is linked to that entry's
+    own parent; the other links stay (a compaction's start keeps having none). The
+    stand-in model then answers with the paused call, so Claude Code runs it as the
+    next call of the turn.
+    """
+    part = entries[:first]
+    answered = {tid for entry in part for tid in _result_ids(entry)}
+    context: list[Any] = []
+    left_out: dict[str, Any] = {}  # uuid -> its parent
+    for original in _without_cost_state(part):
+        entry = copy.deepcopy(original)
+        message = entry.get("message")
+        if entry.get("type") == "assistant" and isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, list):
+                kept = [
+                    b
+                    for b in content
+                    if not (
+                        isinstance(b, dict)
+                        and b.get("type") == "tool_use"
+                        and b.get("id") not in answered
+                    )
+                ]
+                if not kept:
+                    if isinstance(entry.get("uuid"), str):
+                        left_out[entry["uuid"]] = entry.get("parentUuid")
+                    continue
+                message["content"] = kept
+        parent = entry.get("parentUuid")
+        seen: set[Any] = set()
+        while parent in left_out and parent not in seen:
+            seen.add(parent)
+            parent = left_out[parent]
+        if parent != entry.get("parentUuid"):
+            entry["parentUuid"] = parent
+        context.append(entry)
+    return context
+
+
+def _result_record(entry: dict[str, Any]) -> dict[str, Any]:
+    """A tool step's record of its result as the step returns it (``ToolOutcome.entry``).
+
+    Without the result itself (the outcome carries it), and without metadata larger
+    than ``RESULT_METADATA_LIMIT``.
+    """
+    record = copy.deepcopy(entry)
+    message = record.get("message")
+    record["message"] = {
+        **(message if isinstance(message, dict) else {}),
+        "content": [],
+    }
+    metadata = record.get("toolUseResult")
+    if metadata is not None and _size(metadata) > RESULT_METADATA_LIMIT:
+        del record["toolUseResult"]
+    return record
+
+
+def _size(value: Any) -> int:
+    """UTF-8 bytes of ``value`` as JSON."""
+    return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+
+
+def _result_block(call_id: str, outcome: ToolOutcome) -> dict[str, Any]:
+    """The ``tool_result`` block that hands a call's result to Claude."""
+    return {
+        "type": "tool_result",
+        "tool_use_id": call_id,
+        "content": _result_content(outcome),
+        "is_error": outcome.is_error,
+    }
+
+
+_RECORD_FIELDS = (
+    "isSidechain",
+    "userType",
+    "entrypoint",
+    "cwd",
+    "sessionId",
+    "version",
+    "gitBranch",
+)
+"""Fields a record without the step's own entry takes from the call's assistant entry:
+those Claude Code writes in every entry of a session (2.1.273, 2.1.274 and 2.1.288,
+checked)."""
+
+_RECORD_NAMESPACE = uuid.UUID("5c4f2d0e-8f8e-4c2e-9d55-7a1e0d6b9f21")
+"""Names the uuid of such a record after its call, so every attempt makes the same."""
+
+
+def _record(
+    owner: dict[str, Any],
+    call_id: str,
+    outcome: ToolOutcome,
+    before: list[Any],
+) -> dict[str, Any]:
+    """Claude Code's record of a call's result, with the outcome's result in it.
+
+    The tool step's own record when it returned one (``ToolOutcome.entry``). When it
+    did not (the step failed, the call was rejected, or the task stopped first), one
+    with the fields Claude Code writes, from the call's own assistant entry (tested:
+    Claude Code goes on from such a record as from its own). Either way it is linked
+    to the call's assistant entry, as Claude Code links each call's result.
+    """
+    taken = {e.get("uuid") for e in before if isinstance(e, dict)}
+    given = outcome.entry
+    if (
+        isinstance(given, dict)
+        and given.get("type") == "user"
+        and isinstance(given.get("uuid"), str)
+        and given["uuid"] not in taken
+    ):
+        record = copy.deepcopy(given)
+    else:
+        record = {k: owner[k] for k in _RECORD_FIELDS if k in owner}
+        record["type"] = "user"
+        record["uuid"] = str(uuid.uuid5(_RECORD_NAMESPACE, call_id))
+        record["timestamp"] = (
+            datetime.now(timezone.utc).isoformat(timespec="milliseconds")[:-6] + "Z"
+        )
+    message = record.get("message")
+    record["message"] = {
+        **(message if isinstance(message, dict) else {}),
+        "role": "user",
+        "content": [_result_block(call_id, outcome)],
+    }
+    record["parentUuid"] = owner["uuid"]
+    record["sourceToolAssistantUUID"] = owner["uuid"]
+    return record
+
+
+def _place(
+    entries: list[Any], checkpoint: str, results: dict[str, ToolOutcome]
+) -> tuple[list[Any], set[str]] | None:
+    """The conversation with Claude Code's record of a paused call's result in it.
+
+    For a call of ``RECORDED_TOOLS``: the call's hook entries (and everything after
+    them) give way to the record (see ``_record``). Then come the denials of the
+    calls after the paused one, durable ones with their real results (as in
+    ``_deliver``). Claude Code then holds the call as answered, and does not check it
+    again; with no new message, it continues the turn by itself (``CONTINUE_ENV``).
+    Tested on Claude Code 2.1.273, 2.1.274 and 2.1.288: Edit after Read, Write over a
+    file Claude read, an Edit with a durable call in one message.
+
+    Returns:
+        The entries to resume from, and the calls whose results they now hold; or
+        None if the checkpoint is not right after a pause at such a call, or a result
+        would not go into the conversation.
+    """
+    span = _hook_span(entries, checkpoint)
+    if span is None:
+        return None
+    first, marker, paused = span
+    outcome = results.get(paused)
+    found = _calls_of(entries[:first], paused)
+    if outcome is None or found is None:
+        return None
+    owner, calls = found
+    tool = next(
+        (
+            b.get("name")
+            for b in owner["message"]["content"]
+            if isinstance(b, dict) and b.get("id") == paused
+        ),
+        None,
+    )
+    if tool not in RECORDED_TOOLS:
+        return None
+    record = _record(owner, paused, outcome, entries[:first])
+    moved, delivered = _denied_after(entries, marker, paused, results, calls)
+    delivered.add(paused)
+    if set(results) - delivered:
+        return None  # a result would go as a message too: as before, all of them
+    return [*entries[:first], record, *moved], delivered
 
 
 def _seed(committed: list[Any], checkpoint: str) -> list[Any] | None:
@@ -850,12 +1239,95 @@ class _Feed:
             yield message
 
 
+class _StartWatch:
+    """Ends an engine's input when it does not start its turn in time.
+
+    For an engine that must start its turn by itself (see ``CONTINUE_ENV``): one that
+    does not would wait for a message forever. With its input ended, it exits. Each
+    notice the engine gives before its turn (a SessionStart hook's events, for
+    example) starts the time again: the engine is still getting ready.
+    """
+
+    def __init__(self, feed: _Feed, seconds: float) -> None:
+        self.fired = False
+        """Whether the time ran out, so the input was ended."""
+        self._feed = feed
+        self._seconds = seconds
+        self._timer = asyncio.get_running_loop().call_later(seconds, self._fire)
+
+    def _fire(self) -> None:
+        self.fired = True
+        self._feed.close()
+
+    def waiting(self) -> None:
+        """The engine gave a notice before its turn: the time starts again."""
+        if not self.fired and not self._timer.cancelled():
+            self._timer.cancel()
+            self._timer = asyncio.get_running_loop().call_later(
+                self._seconds, self._fire
+            )
+
+    def heard(self) -> None:
+        """The engine started its turn (or ended): no more time is needed."""
+        self._timer.cancel()
+
+
+def _turn_began(message: Any) -> bool:
+    """Whether an engine's message shows that it started a turn (for ``_StartWatch``).
+
+    Claude Code says ``init`` when it starts one. Other notices can come before it,
+    while the engine waits for a message: a SessionStart hook's events, for example.
+    """
+    if isinstance(message, SystemMessage):
+        return message.subtype == "init"
+    return isinstance(
+        message, (AssistantMessage, UserMessage, ResultMessage, StreamEvent)
+    )
+
+
+class _NotContinued(RuntimeError):
+    """Claude Code did not continue the turn by itself (see ``CONTINUE_ENV``)."""
+
+
+def _not_continued(version: str) -> _NotContinued:
+    return _NotContinued(
+        f"Claude Code {version} did not continue the turn after the result of an Edit "
+        f"or a Write: it said nothing within {CONTINUE_START_SECONDS:.0f} seconds of "
+        f"starting. This plugin asks it to with {RESUME} (tested on Claude Code "
+        "2.1.273, 2.1.274 and 2.1.288)."
+    )
+
+
+def _not_continued_output(
+    session_id: str, err: _NotContinued, attempt: int
+) -> SegmentOutput:
+    """Run the segment again (raise) until ``CONTINUE_ATTEMPTS``, then stop the task.
+
+    Raises:
+        RuntimeError: Before the last attempt (Temporal runs the segment again).
+    """
+    if attempt < CONTINUE_ATTEMPTS:
+        raise RuntimeError(f"{err} Retrying.") from err
+    return SegmentOutput(
+        session_id=session_id,
+        is_error=True,
+        error=(
+            f"{err} It did not in {attempt} attempts, so the task stops here. Use a "
+            "Claude Code version this plugin was tested with, or leave Edit and Write "
+            "out of tool_activities."
+        ),
+    )
+
+
 async def _as_messages(prompt: Any) -> list[dict[str, Any]]:
     """An engine run's input as user messages.
 
     A text prompt becomes the message the one-shot query writes for it; the runner's
-    own message stream is read as it is.
+    own message stream is read as it is. None is no message: Claude Code continues
+    the turn by itself (see ``CONTINUE_ENV``).
     """
+    if prompt is None:
+        return []
     if isinstance(prompt, str):
         return [
             {
@@ -978,13 +1450,13 @@ def _stop_now(process: Any, resumed: Any) -> None:
 
 
 async def _engine_messages(
-    options: dict[str, Any], messages: list[dict[str, Any]], resumed: bool
+    options: dict[str, Any], feed: _Feed, resumed: bool
 ) -> AsyncGenerator[Any, None]:
-    """Start an engine, send it ``messages``, and yield what it says until it exits.
+    """Start an engine, send it the messages of ``feed``, and yield what it says until
+    it exits.
 
     See ``_turn_messages`` for when its input ends.
     """
-    feed = _Feed(messages)
     client = ClaudeSDKClient(ClaudeAgentOptions(**options))
     try:
         await client.connect(feed.stream())
@@ -1690,6 +2162,17 @@ def _hook_said_stopped(message: UserMessage) -> bool:
     )
 
 
+def _refused_ids(denials: Any) -> set[str]:
+    """The ids of the calls in a result's ``permission_denials``."""
+    if not isinstance(denials, list):
+        return set()
+    return {
+        str(d["tool_use_id"])
+        for d in cast("list[Any]", denials)
+        if isinstance(d, dict) and d.get("tool_use_id")
+    }
+
+
 def _runs_as_activity(name: str, patterns: list[str]) -> bool:
     """Whether a Claude Code tool runs as an Activity: it matches ``tool_activities``.
 
@@ -1760,8 +2243,13 @@ def _hook_violation(violations: list[str]) -> str | None:
 def _as_outcome(value: Any) -> ToolOutcome:
     if isinstance(value, ToolOutcome):
         return value
+    blocks = value.get("blocks")
+    entry = value.get("entry")
     return ToolOutcome(
-        content=value.get("content"), is_error=bool(value.get("is_error"))
+        content=value.get("content"),
+        is_error=bool(value.get("is_error")),
+        blocks=list(blocks) if isinstance(blocks, list) else None,
+        entry=dict(entry) if isinstance(entry, dict) else None,
     )
 
 
@@ -2046,33 +2534,55 @@ class ClaudeAgentSdkRunner:
 
     async def _start(
         self, inp: SegmentInput, attempt: int, injected: dict[str, ToolOutcome]
-    ) -> tuple[str, bool, set[str]]:
+    ) -> tuple[str, bool, set[str], str | None, bool]:
         """Where a segment starts in the session store.
 
         A segment that runs again continues in a copy of the session that ends at
         the checkpoint, because an unfinished attempt may have written after it.
 
         Returns:
-            The session, whether to resume it, and the calls whose results are
-            already in it (see ``_copy``).
+            The session, whether to resume it, the calls whose results are already
+            in it (see ``_copy`` and ``_place_here``), the entry it must still end at
+            when the engine resumes it in place (None for a copy), and whether it
+            ends with Claude Code's record of a paused call's result (see ``_place``).
         """
         if inp.checkpoint is None:  # nothing committed yet: a new session
-            return _attempt_session_id(inp.session_id, attempt), False, set()
+            return (
+                _attempt_session_id(inp.session_id, attempt),
+                False,
+                set(),
+                None,
+                False,
+            )
         if attempt == 1 and not inp.fork:
-            return inp.session_id, True, set()
-        session_id, delivered = await self._copy(inp, injected)
-        return session_id, True, delivered
+            # Only a tool step's result (``entry``), or an error (a step that failed,
+            # a rejected call), can be an Edit's or a Write's: others go as before,
+            # with no read of the session here.
+            if any(o.entry is not None or o.is_error for o in injected.values()):
+                placed = await self._place_here(inp, injected)
+                if placed is not None:
+                    return inp.session_id, True, placed[1], placed[0], True
+            return inp.session_id, True, set(), inp.checkpoint, False
+        session_id, delivered, recorded = await self._copy(inp, injected)
+        return session_id, True, delivered, None, recorded
 
-    async def _copy(
+    async def _place_here(
         self, inp: SegmentInput, injected: dict[str, ToolOutcome]
-    ) -> tuple[str, set[str]]:
-        """A copy of the session that ends at the checkpoint.
+    ) -> tuple[str, set[str]] | None:
+        """Add Claude Code's record of the paused call's result to the session itself.
 
-        After a pause in a message with several calls, the copy also holds the
-        results of the calls denied after the pause (see ``_deliver``).
+        Only when the call is one of ``RECORDED_TOOLS``, the session still ends at
+        the checkpoint, and nothing was denied after the pause: then the record is
+        all the session needs (see ``_place``). It comes after the pause's hook
+        entries, linked to the call's assistant entry, so the engine resumes from it
+        and leaves the hook entries aside (tested on Claude Code 2.1.273, 2.1.274 and
+        2.1.288).
 
         Returns:
-            The copy's id, and the calls whose results it holds.
+            The record's uuid (where the session now ends), and the calls whose
+            results it holds; or None when the session goes on as before: in place
+            with the results in a message, or in a copy once the engine finds that it
+            no longer ends at the checkpoint (``_SessionMoved``, then ``_copy``).
         """
         assert inp.checkpoint is not None
         key = {
@@ -2080,7 +2590,38 @@ class ClaudeAgentSdkRunner:
             "session_id": inp.session_id,
         }
         entries = cast("list[dict[str, Any]]", await self._store.load(key) or [])
-        moved = _deliver(entries, inp.checkpoint, injected)
+        if _last_entry(entries) != inp.checkpoint:
+            return None
+        placed = _place(entries, inp.checkpoint, injected)
+        span = _hook_span(entries, inp.checkpoint)
+        if placed is None or span is None or len(placed[0]) != span[0] + 1:
+            return None
+        record = placed[0][-1]
+        await self._store.append(key, [record])
+        return record["uuid"], placed[1]
+
+    async def _copy(
+        self, inp: SegmentInput, injected: dict[str, ToolOutcome]
+    ) -> tuple[str, set[str], bool]:
+        """A copy of the session that ends at the checkpoint.
+
+        After a pause in a message with several calls, the copy also holds the
+        results of the calls denied after the pause (see ``_deliver``), and after a
+        pause at an Edit or a Write, Claude Code's record of its result (see
+        ``_place``).
+
+        Returns:
+            The copy's id, the calls whose results it holds, and whether it ends
+            with such a record.
+        """
+        assert inp.checkpoint is not None
+        key = {
+            "project_key": project_key_for_directory(self._cwd),
+            "session_id": inp.session_id,
+        }
+        entries = cast("list[dict[str, Any]]", await self._store.load(key) or [])
+        placed = _place(entries, inp.checkpoint, injected)
+        moved = placed or _deliver(entries, inp.checkpoint, injected)
         if moved is None:
             forked = await fork_session_via_store(
                 self._store,
@@ -2088,14 +2629,14 @@ class ClaudeAgentSdkRunner:
                 directory=self._cwd,
                 up_to_message_id=inp.checkpoint,
             )
-            return forked.session_id, set()
+            return forked.session_id, set(), False
         seed, delivered = moved
         copy_id = str(uuid.uuid4())
         await self._store.append(
             {**key, "session_id": copy_id},
             [{**e, "sessionId": copy_id} if "sessionId" in e else e for e in seed],
         )
-        return copy_id, delivered
+        return copy_id, delivered, placed is not None
 
     async def _checkpoint(
         self,
@@ -2194,6 +2735,7 @@ class ClaudeAgentSdkRunner:
             and not inp.fork
             and self._may_park(inp)
             and set(injected) == {warm.paused}
+            and all(o.entry is None for o in injected.values())  # no tool step's
             and warm.shape == self._shape(inp)
             and 8 * payload <= warm.buffer
             and _engine_alive(warm.client)
@@ -2322,32 +2864,48 @@ class ClaudeAgentSdkRunner:
                 delivered=set(),
                 warm=warm,
             )
-        session_id, resume, delivered = await self._start(inp, attempt, injected)
-        if resume and len(injected) == len(delivered) and inp.prompt is None:
+        session_id, resume, delivered, guard, continuing = await self._start(
+            inp, attempt, injected
+        )
+        if (
+            resume
+            and len(injected) == len(delivered)
+            and inp.prompt is None
+            and not continuing
+        ):
             return SegmentOutput(
                 session_id=session_id,
                 is_error=True,
                 error="Nothing to send: no tool result and no prompt",
             )
-        in_place = resume and session_id == inp.session_id
         try:
-            return await self._run_engine(
-                inp,
-                injected,
-                session_id,
-                resume,
-                self._store,
-                guard=inp.checkpoint if in_place else None,
-                delivered=delivered,
-            )
-        except _SessionMoved:
-            # The session went on after the checkpoint (after a pause in a message
-            # with several calls, or a Workflow reset to an earlier point): continue
-            # in a copy that ends there.
-            session_id, delivered = await self._copy(inp, injected)
-            return await self._run_engine(
-                inp, injected, session_id, True, self._store, delivered=delivered
-            )
+            try:
+                return await self._run_engine(
+                    inp,
+                    injected,
+                    session_id,
+                    resume,
+                    self._store,
+                    guard=guard,
+                    delivered=delivered,
+                    continuing=continuing,
+                )
+            except _SessionMoved:
+                # The session went on after the checkpoint (after a pause in a
+                # message with several calls, or a Workflow reset to an earlier
+                # point): continue in a copy that ends there.
+                session_id, delivered, continuing = await self._copy(inp, injected)
+                return await self._run_engine(
+                    inp,
+                    injected,
+                    session_id,
+                    True,
+                    self._store,
+                    delivered=delivered,
+                    continuing=continuing,
+                )
+        except _NotContinued as err:
+            return _not_continued_output(session_id, err, attempt)
 
     async def _run_held(
         self, inp: SegmentInput, injected: dict[str, ToolOutcome], attempt: int
@@ -2386,6 +2944,7 @@ class ClaudeAgentSdkRunner:
                 )
             self._end_warm(warm)
         delivered: set[str] = set()  # results the seed already holds
+        placed = None  # the seed ends with Claude Code's record of a result
         if inp.checkpoint is None:
             if committed:
                 return SegmentOutput(
@@ -2410,7 +2969,8 @@ class ClaudeAgentSdkRunner:
                     "this run. Give this Worker's runner the session store the "
                     "conversation started with. Retrying."
                 )
-            moved = _deliver(committed, inp.checkpoint, injected)
+            placed = _place(committed, inp.checkpoint, injected)
+            moved = placed or _deliver(committed, inp.checkpoint, injected)
             found = moved[0] if moved is not None else _seed(committed, inp.checkpoint)
             if found is None:
                 return SegmentOutput(
@@ -2424,7 +2984,13 @@ class ClaudeAgentSdkRunner:
             if moved is not None:
                 delivered = moved[1]
             session_id, seed, resume = inp.session_id, _without_cost_state(found), True
-        if resume and len(injected) == len(delivered) and inp.prompt is None:
+        continuing = resume and placed is not None
+        if (
+            resume
+            and len(injected) == len(delivered)
+            and inp.prompt is None
+            and not continuing
+        ):
             return SegmentOutput(
                 session_id=session_id,
                 is_error=True,
@@ -2441,25 +3007,43 @@ class ClaudeAgentSdkRunner:
         # session id), so it stays.
         local = self._local_copy(session_id)
         ours = not resume and not any(p.exists() for p in local)
-        return await self._run_engine(
-            inp,
-            injected,
-            session_id,
-            resume,
-            store,
-            committed=committed,
-            delivered=delivered,
-            local_copy=local if ours else (),
-        )
+        try:
+            return await self._run_engine(
+                inp,
+                injected,
+                session_id,
+                resume,
+                store,
+                committed=committed,
+                delivered=delivered,
+                local_copy=local if ours else (),
+                continuing=continuing,
+                resumed_at=_last_entry(seed) if continuing else None,
+            )
+        except _NotContinued as err:
+            return _not_continued_output(session_id, err, attempt)
 
     async def run_tool_step(self, step: ToolStepInput, attempt: int) -> ToolOutcome:
         """Run one Claude Code tool call that paused a segment, as its own Activity.
 
-        Claude Code resumes a copy of the session that ends where it paused at the
-        call (in memory: a session store is not written), and the hook lets it run
-        exactly that call. Afterwards the engine asks the model to go on; a local
-        stand-in answers, so no real model call is made. Tested on Claude Code
-        2.1.273 and 2.1.287: the tool runs once, with the engine's own result.
+        Brian Strauch's bounded native call replay (hybrid prototype): Claude Code
+        resumes a private copy of the conversation that ends before the call (in
+        memory: a session store is not written, see ``_step_context``). A local
+        stand-in model answers with the call itself, the exact ``tool_use`` block
+        Claude sent, so no real model is asked; the hook lets exactly that call run;
+        and ``max_turns=1`` ends the turn after it. Claude Code runs the call in an
+        ordinary turn, as it would have in the segment, and writes its own result
+        entry. For an Edit or a Write, the step returns it with the result
+        (``ToolOutcome.entry``; one of the same shape if Claude Code wrote none), and
+        the next segment continues from it (see ``_place``). Tested on Claude Code
+        2.1.273, 2.1.274 and 2.1.288 with Bash, Edit and Write: the tool runs once,
+        with the engine's own result, and one model answer.
+
+        No rule, permission mode or callback approves a tool in the step: only the
+        hook's "allow" lets the call run, and only with the input the segment
+        reported (which is what an approval saw), as Claude Code is about to run it.
+        If the hook gives no answer, Claude Code refuses the call, and the step fails
+        as one whose call did not run.
 
         The command still sees the Worker's own environment (see ``_step_env``), and
         a result the step already has is kept even if the engine fails afterwards,
@@ -2482,7 +3066,8 @@ class ClaudeAgentSdkRunner:
                 Claude Code could run the call (it did not run), or
                 ``ToolCallInterrupted`` if it failed after the hook let the call run
                 (it may have run). Not retryable where retrying cannot help: the
-                session did not pause at this call, the hook refused it, or a hook in
+                session did not pause at this call, the hook refused it (also for
+                other input than the segment reported), or a hook in
                 ``extra_options`` tried to decide on it.
         """
         del attempt
@@ -2534,14 +3119,24 @@ class ClaudeAgentSdkRunner:
         else:
             entries = cast("list[Any]", await self._store.load(key) or [])
         seed = _seed(entries, step.checkpoint)
-        if seed is None or not any(_marker_of(e) == call.id for e in seed):
+        span = _hook_span(seed, step.checkpoint) if seed is not None else None
+        found = _calls_of(seed[: span[0]], call.id) if seed and span else None
+        block = _recorded_call(seed[: span[0]], call.id) if seed and span else None
+        if (
+            seed is None
+            or span is None
+            or found is None
+            or span[2] != call.id
+            or block is None
+            or block.get("name") != call.name
+        ):
             raise ApplicationError(
                 f"Session {step.session_id} did not pause at tool call {call.id} "
                 f"({call.name}), so the call cannot run.",
                 non_retryable=True,
             )
         store = InMemorySessionStore()
-        await store.append(key, seed)  # type: ignore[arg-type]
+        await store.append(key, _step_context(seed, span[0]))  # type: ignore[arg-type]
         hook_dir = _hook_folder()
         inp = SegmentInput(
             session_id=step.session_id,
@@ -2551,7 +3146,9 @@ class ClaudeAgentSdkRunner:
             checkpoint=step.checkpoint,
         )
         violations: list[str] = []
+        recorded: RecordedCall | None = None
         try:
+            recorded = self._stand_in.serve(block)
             options = self._engine_options(
                 inp,
                 {},
@@ -2563,8 +3160,21 @@ class ClaudeAgentSdkRunner:
                 self._durable_server(step.tools, []),
                 violations,
             )
-            options["env"] = self._step_env(options["env"], hook_dir, call.id)
+            options["max_turns"] = STEP_MAX_TURNS  # the turn ends after the call
+            # No rule or callback approves a tool here: only the hook's "allow" lets
+            # the call run. If the hook gave no answer (it could not start, or
+            # failed), Claude Code refuses the call, so it never runs without the
+            # step knowing.
+            options["allowed_tools"] = []
+            options["permission_mode"] = DEFAULT_PERMISSION_MODE
+            options.pop("can_use_tool", None)
+            options.pop("permission_prompt_tool_name", None)
+            options["env"] = self._step_env(
+                options["env"], hook_dir, call, recorded.key
+            )
         except BaseException:
+            if recorded is not None:
+                self._stand_in.done(recorded)
             _remove_hook_folder(hook_dir)
             raise
         result: ToolResultBlock | None = None
@@ -2572,6 +3182,9 @@ class ClaudeAgentSdkRunner:
         failure: BaseException | None = None
         denials: dict[str, str] = {}
         lock: int | None = None
+        others: list[str] = []  # calls the engine made besides the step's (denied)
+        refused: set[str] = set()  # calls Claude Code's own permission check refused
+        bounded = False  # the turn ended at max_turns=1, right after the call
         stopper = (
             asyncio.ensure_future(_stop_hooks_when_cancelled(hook_dir))
             if activity.in_activity()
@@ -2590,20 +3203,31 @@ class ClaudeAgentSdkRunner:
                     if not joined:
                         joined = True
                         job.joined()
+                    if isinstance(message, AssistantMessage):
+                        others += [
+                            b.id
+                            for b in message.content
+                            if isinstance(b, ToolUseBlock) and b.id != call.id
+                        ]
+                        continue
+                    if isinstance(message, ResultMessage):
+                        bounded = message.subtype == "error_max_turns"
+                        refused |= _refused_ids(message.permission_denials)
+                        continue
                     if not isinstance(message, UserMessage) or isinstance(
                         message.content, str
                     ):
                         continue
-                    for block in message.content:
+                    for content in message.content:
                         if (
-                            isinstance(block, ToolResultBlock)
-                            and block.tool_use_id == call.id
+                            isinstance(content, ToolResultBlock)
+                            and content.tool_use_id == call.id
                         ):
-                            result = block
+                            result = content
                             # The engine's temporary folder still exists: read the
                             # end of an output it saved to a file before it goes.
                             saved = _saved_output_tail(
-                                block.content, key["project_key"], step.session_id
+                                content.content, key["project_key"], step.session_id
                             )
             if not joined:
                 joined = True
@@ -2613,18 +3237,22 @@ class ClaudeAgentSdkRunner:
                 raise
             failure = err  # the call ran, then the Worker began to shut down
         except Exception as err:
-            if result is None:
+            if isinstance(err, ResultError) and err.subtype == "error_max_turns":
+                bounded = True  # how the turn ends: right after the call
+            elif result is None:
                 if not joined:
                     joined = True
                     job.joined()  # the engine ended before its first message: why
                 raise
-            # The call ran; the engine failed afterwards (for example the model call
-            # that follows the tool). Running the step again would run it again.
-            failure = err
+            else:
+                # The call ran; the engine failed afterwards. Running the step again
+                # would run it again.
+                failure = err
         finally:
             if stopper is not None:
                 stopper.cancel()
             job.stop()
+            self._stand_in.done(recorded)
             denials = _hook_denials(hook_dir)
             allowed[0] = _close_call(hook_dir)
             _release_worker_lock(lock)
@@ -2648,33 +3276,74 @@ class ClaudeAgentSdkRunner:
                 f"step: {text or 'no result'}",
                 non_retryable=True,
             )
-        if failure is not None and activity.in_activity():
+        if call.id in refused and not allowed[0]:
+            # The hook neither allowed nor denied it (it could not start, or failed),
+            # so Claude Code's own permission check refused it: it did not run, and a
+            # new attempt may run it.
+            raise ApplicationError(
+                f"Claude Code did not run tool call {call.id} ({call.name}) in its "
+                f"step: its hook gave no answer, so its permission check refused it "
+                f"({text or 'no result'})."
+            )
+        # Claude Code's own result entry, from the step's private copy.
+        records = [
+            e
+            for e in cast("list[Any]", await store.load(cast("Any", key)) or [])
+            if call.id in _result_ids(e)
+        ]
+        with recorded.lock:  # a request still in flight could count one more
+            asked = recorded.other
+        problems = [
+            *([f"the engine failed after it ({failure!r})"] if failure else []),
+            *([f"it also asked for {', '.join(others)}"] if others else []),
+            *([] if bounded else ["its turn did not end right after the call"]),
+            *([f"the stand-in model was asked {asked} more time(s)"] if asked else []),
+            *(
+                []
+                if len(records) == 1 or call.name not in RECORDED_TOOLS
+                else [f"it wrote {len(records)} result entries for it (not 1)"]
+            ),
+        ]
+        if problems and activity.in_activity():
             activity.logger.warning(
-                "Tool call %s (%s) ran; the engine failed after it (%s). Its result "
-                "is kept.",
+                "Tool call %s (%s) ran, and its result is kept, but %s.",
                 call.id,
                 call.name,
-                failure if str(failure) else type(failure).__name__,
+                "; ".join(problems),
             )
         is_error = bool(result.is_error)
+        entry: dict[str, Any] | None = None
+        if call.name in RECORDED_TOOLS:
+            # Claude Code's own record, or one of the same shape (see ``_record``),
+            # so the next segment never sends an Edit's result as a message.
+            own = records[0] if len(records) == 1 else None
+            entry = _result_record(
+                own
+                if own is not None
+                else _record(found[0], call.id, ToolOutcome(), seed[: span[0]])
+            )
         if isinstance(result.content, list):
-            return ToolOutcome(blocks=list(result.content), is_error=is_error)
+            return ToolOutcome(
+                blocks=list(result.content), is_error=is_error, entry=entry
+            )
         if saved is not None:
             text += (
                 "\n\nThe file named above was removed when the step that ran this "
                 f"call ended. The output ends with:\n{saved}"
             )
-        return ToolOutcome(content=text, is_error=is_error)
+        return ToolOutcome(content=text, is_error=is_error, entry=entry)
 
     def _step_env(
-        self, env: dict[str, str], hook_dir: str, call_id: str
+        self, env: dict[str, str], hook_dir: str, call: DeferredCall, key: str
     ) -> dict[str, str]:
         """The engine's environment in a tool step, and the command's.
 
         The engine talks to the local stand-in model (``STEP_PROVIDER_ENV``,
-        ``ANTHROPIC_BASE_URL``, and the stand-in's own key). The command gets the
-        Worker's own environment back (see ``_command_env``), so a command that calls
-        the Anthropic API reaches the Worker's provider as it would in a segment.
+        ``ANTHROPIC_BASE_URL``, and ``key``, which the stand-in gave this step), with
+        every tool in its request (``STEP_ENV``). Its hook lets only ``call`` run,
+        with the input the segment reported. The command gets the Worker's own
+        environment back (see ``_command_env``), so a command that calls the
+        Anthropic API reaches the Worker's provider as it would in a segment.
         """
         before = {**os.environ, **env}
         hosts: list[str] = []
@@ -2686,13 +3355,18 @@ class ClaudeAgentSdkRunner:
             hosts.append("127.0.0.1")
         overrides = {
             **STEP_PROVIDER_ENV,
-            "ANTHROPIC_API_KEY": self._stand_in.key,
+            **STEP_ENV,
+            "ANTHROPIC_API_KEY": key,
             "ANTHROPIC_BASE_URL": self._stand_in.base_url,
             "NO_PROXY": ",".join(hosts),
             "no_proxy": ",".join(hosts),
         }
         return _command_env(
-            env, hook_dir, self._cwd, overrides, {"TCA_ALLOW_ID": call_id}
+            env,
+            hook_dir,
+            self._cwd,
+            overrides,
+            {"TCA_ALLOW_ID": call.id, "TCA_ALLOW_INPUT": input_digest(call.input)},
         )
 
     def _durable_server(self, tools: list[ToolSpec], ran_inside: list[str]) -> Any:
@@ -2751,6 +3425,8 @@ class ClaudeAgentSdkRunner:
         delivered: set[str] | None = None,
         warm: _WarmEngine | None = None,
         local_copy: tuple[Path, ...] = (),
+        continuing: bool = False,
+        resumed_at: str | None = None,
     ) -> SegmentOutput:
         """Run the engine once, on the session in ``store``.
 
@@ -2764,16 +3440,32 @@ class ClaudeAgentSdkRunner:
             committed: The conversation the Workflow holds, when it holds one: the
                 output then says what changed in it.
             delivered: Calls whose results the session already holds (see
-                ``_deliver``); the others go in the message that resumes it.
+                ``_deliver`` and ``_place``); the others go in the message that
+                resumes it.
             warm: An engine still running since it paused at the call whose result
                 is in ``injected`` (see ``warm_engines``): the results go to it as
                 its next message, instead of a new engine resuming the session.
             local_copy: The engine's own copy of the new session it starts, to
                 remove once the engine ended (see ``_forget_local_copy``).
+            continuing: The session ends with a tool step's result entry (see
+                ``_place``). With no prompt, Claude Code continues the turn by
+                itself (``CONTINUE_ENV``), and no message is sent.
+            resumed_at: The session's last entry before this run, when it is not
+                the checkpoint (a run that added nothing after it did not reach the
+                store).
 
         Raises:
             _SessionMoved: If the session does not end at ``guard``.
+            RuntimeError: If Claude Code did not continue the turn by itself
+                (``CONTINUE_START_SECONDS``); Temporal runs the segment again.
         """
+        # No message at all: Claude Code starts the turn by itself (see ``_place``).
+        waits = (
+            continuing
+            and inp.prompt is None
+            and warm is None
+            and all(k in (delivered or ()) for k in injected)
+        )
         options: dict[str, Any] = {}
         hook_dir = warm.hook_dir if warm is not None else _hook_folder()
         # Durable tools the engine ran itself (must stay empty), and decisions hooks
@@ -2796,6 +3488,7 @@ class ClaudeAgentSdkRunner:
         stopper: asyncio.Future[None] | None = None
         job: _JobWatch | None = None  # a new engine joins the Worker's job (Windows)
         joined = False
+        watch: _StartWatch | None = None  # the engine must start the turn (``waits``)
         try:
             if warm is None:
                 options = self._engine_options(
@@ -2811,7 +3504,11 @@ class ClaudeAgentSdkRunner:
                 )
                 # A command run inside the segment sees none of the plugin's variables.
                 options["env"] = _command_env(
-                    options["env"], hook_dir, self._cwd, {}, {}
+                    options["env"],
+                    hook_dir,
+                    self._cwd,
+                    CONTINUE_ENV if waits else {RESUME: ""},
+                    {},
                 )
             else:
                 ran_inside.clear()
@@ -2843,14 +3540,23 @@ class ClaudeAgentSdkRunner:
                     job = _JobWatch(hook_dir, required=self._cleanup_required)
                     lock = _hold_worker_lock(hook_dir, required=self._cleanup_required)
                     first = await _as_messages(prompt)
+                    opened: _Feed
                     if self._may_park(inp) and not local_copy:
-                        feed = _Feed(first)
+                        feed = opened = _Feed(first)
                         client = ClaudeSDKClient(ClaudeAgentOptions(**options))
                         messages = _connected(client, feed, resume, set(injected))
                     else:
-                        messages = _engine_messages(options, first, resume)
+                        opened = _Feed(first)
+                        messages = _engine_messages(options, opened, resume)
+                    if waits:
+                        watch = _StartWatch(opened, CONTINUE_START_SECONDS)
                 async with contextlib.aclosing(messages):
                     async for message in messages:
+                        if watch is not None:
+                            if _turn_began(message):
+                                watch.heard()
+                            else:
+                                watch.waiting()
                         if job is not None and not joined:
                             joined = True
                             job.joined()
@@ -2884,6 +3590,9 @@ class ClaudeAgentSdkRunner:
                     paused_by_hook = marker.read_text(encoding="utf-8").strip() or None
                 denials = _hook_denials(hook_dir)
             except ResultError as err:
+                if watch is not None and watch.fired:
+                    version = await self._engine_version() or engine_version
+                    raise _not_continued(version) from err
                 final = err.subtype in FINAL_RESULT_ERRORS or _final_api_error(err)
                 if not final:
                     raise  # other engine errors: let Temporal retry the segment
@@ -2896,16 +3605,32 @@ class ClaudeAgentSdkRunner:
                     raise _SessionMoved(str(err)) from err
                 if job is not None and not joined:
                     job.joined()  # the engine ended before its first message: why
+                if watch is not None and watch.fired:
+                    version = await self._engine_version() or engine_version
+                    raise _not_continued(version) from err
                 raise
-            except Exception:
+            except Exception as err:
                 if job is not None and not joined:
                     job.joined()
+                if (
+                    watch is not None
+                    and watch.fired
+                    and not _moved(err)  # a copy can still continue
+                ):
+                    version = await self._engine_version() or engine_version
+                    raise _not_continued(version) from err
                 raise
             finally:
+                if watch is not None:
+                    watch.heard()  # no later timer
                 if stopper is not None:
                     stopper.cancel()
                 if job is not None:
                     job.stop()
+            if watch is not None and watch.fired:
+                # Even with a result: its input had ended, so neither hooks nor
+                # in-process tools could answer during the turn.
+                raise _not_continued(await self._engine_version() or engine_version)
             if warm is not None and result is None:
                 # The engine ended after it was taken (it was alive then): a new
                 # engine can do the step.
@@ -2931,6 +3656,7 @@ class ClaudeAgentSdkRunner:
                 store_error,
                 stopped_by_hook,
                 denials,
+                resumed_at,
             )
             if feed is not None and self._parks(
                 out, hook_dir, client, local_copy, denials
@@ -2982,10 +3708,10 @@ class ClaudeAgentSdkRunner:
         """Whether an engine that just ran stays warm: it paused at one durable call,
         cleanly.
 
-        Not at a Claude Code tool that runs as its own Activity (a tool step): a new
-        engine checks such a call again when its result arrives, and a running one
-        does not (tested: an Edit run apart is refused on resume, and taken by a
-        running engine). So that result always goes to a new engine.
+        Not at a Claude Code tool that runs as its own Activity (a tool step): the
+        result of an Edit or a Write goes into the conversation as Claude Code's own
+        record of the call (see ``_place``), which only a new engine reads. So every
+        tool step's result goes to a new engine, whatever the tool.
 
         Not an engine that started a conversation the Workflow holds: it writes the
         conversation to its own config folder (``_forget_local_copy``), and a Worker
@@ -3027,8 +3753,12 @@ class ClaudeAgentSdkRunner:
         store_error: str | None,
         stopped_by_hook: bool,
         denials: dict[str, str],
+        ended_at: str | None = None,
     ) -> SegmentOutput:
         """What one engine run committed: the pause or the answer, or why it failed.
+
+        ``ended_at`` is the session's last entry before the run, when that is not the
+        checkpoint (see ``_run_engine``'s ``resumed_at``).
 
         Raises:
             RuntimeError: If the turn did not reach the session store (retried).
@@ -3090,7 +3820,7 @@ class ClaudeAgentSdkRunner:
                 cost_usd=cost,
             )
         # A run with nothing new after where it resumed did not reach the store.
-        resumed_at = (
+        resumed_at = ended_at or (
             guard if committed is None else (inp.checkpoint if resume else None)
         )
         checkpoint, entries = await self._checkpoint(
@@ -3279,15 +4009,7 @@ class ClaudeAgentSdkRunner:
         session_id: str, injected: dict[str, ToolOutcome], prompt: str | None
     ) -> AsyncIterator[dict[str, Any]]:
         """One user message: the tool results first, then the prompt of a new task."""
-        blocks: list[dict[str, Any]] = [
-            {
-                "type": "tool_result",
-                "tool_use_id": tid,
-                "content": _result_content(o),
-                "is_error": o.is_error,
-            }
-            for tid, o in injected.items()
-        ]
+        blocks = [_result_block(tid, o) for tid, o in injected.items()]
         if prompt:
             blocks.append({"type": "text", "text": prompt})
         yield {

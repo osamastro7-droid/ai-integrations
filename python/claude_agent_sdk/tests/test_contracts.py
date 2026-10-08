@@ -161,6 +161,7 @@ def test_the_hooks_records_name_each_reason() -> None:
         hook.STOPPED: "stopped",
         hook.MAIN_AGENT_ONLY: "main_agent_only",
         hook.STEP_ONLY: "step_only",
+        hook.OTHER_INPUT: "other_input",
     }
     assert hook.WORKER_LOCK == "worker.lock"
 

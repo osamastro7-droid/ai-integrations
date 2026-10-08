@@ -2,9 +2,9 @@
 
 With ``tool_activities`` (by default ``Bash`` and MCP tools), Claude Code's own tool
 calls pause the segment like durable tools. Each runs in its own Activity: Claude Code
-resumes the session at the call and runs exactly that call, while a local stand-in
-answers the engine's model calls. A segment that runs again never runs the command
-again, a call can wait for approval, and Temporal records each call.
+resumes a copy of the conversation before the call, a local stand-in model answers
+with the call, and Claude Code runs exactly that call. A segment that runs again never
+runs the command again, a call can wait for approval, and Temporal records each call.
 """
 
 from __future__ import annotations
@@ -103,7 +103,8 @@ async def test_real_engine_bash_runs_as_its_own_activity(
     assert names == ["run_claude_segment", "run_claude_tool_step", "run_claude_segment"]
     assert kinds[1][1].startswith("tool-toolu_engine")
     assert len(api.requests) == 2  # the real model saw two requests; the step none
-    assert runner._stand_in.requests == 2  # type: ignore[reportPrivateUsage]
+    # The step's engine asked the stand-in once: for the call, which it then ran.
+    assert runner._stand_in.requests == 1  # type: ignore[reportPrivateUsage]
     assert api.errors == [] and runner.stub_calls == 0
 
 
@@ -607,15 +608,21 @@ def denial_text(seen: str) -> str:
     return rest if sep and head.startswith("PreToolUse:") else seen
 
 
-async def test_real_engine_an_edit_cannot_run_apart_from_its_segment(
-    tmp_path: Path,
+async def test_real_engine_a_file_tools_result_sent_as_a_message_is_checked_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Why file tools stay in the segment (tool_activities refuses them). Run an Edit
-    in a tool step anyway, by driving the runner directly: the edit happens, but when
-    the next segment delivers its result, Claude Code checks the call again, finds the
-    file changed since Claude read it, and tells Claude the edit failed. If a newer
-    engine delivers the result, file tools could run as their own Activities."""
-    from temporalio.claude_agent_sdk import SegmentInput, ToolSpec, ToolStepInput
+    """Why an Edit's result goes into the conversation as Claude Code's own record
+    (``RECORDED_TOOLS``), and not as a new message after the pause, as a durable
+    tool's result does. Without the record, Claude Code checks the call again when
+    the result arrives, finds the file changed since Claude read it, and tells Claude
+    the edit failed, though it ran (anthropics/claude-code#99041). If a newer engine
+    takes the result as it is, this test fails: the record would no longer be needed."""
+    from temporalio.claude_agent_sdk import (
+        SegmentInput,
+        ToolSpec,
+        ToolStepInput,
+        _runner,
+    )
     from tests.helpers.fake_messages_api import FakeMessagesAPI, history_of
 
     notes = tmp_path / "work" / "notes.txt"
@@ -664,6 +671,8 @@ async def test_real_engine_an_edit_cannot_run_apart_from_its_segment(
             1,
         )
         assert not outcome.is_error and notes.read_text() == "bye\n"  # it ran
+        assert outcome.entry is not None
+        monkeypatch.setattr(_runner, "RECORDED_TOOLS", ())  # as a new message
         final = await runner.run(
             SegmentInput(
                 session_id=out.session_id,
@@ -682,8 +691,8 @@ async def test_real_engine_an_edit_cannot_run_apart_from_its_segment(
         api.stop()
     assert final.result == "FINAL"
     assert "modified since read" in seen[call.id], (
-        f"Claude Code delivered the result of an Edit run apart ({seen[call.id]!r}): "
-        "file tools may now be able to run as their own Activities."
+        f"Claude Code took the result of an Edit run apart as it is ({seen[call.id]!r}): "
+        "the tool step's own record may no longer be needed."
     )
 
 
@@ -1450,11 +1459,13 @@ async def test_real_engine_a_tool_step_that_could_not_start_did_not_run(
     broken = [2]
 
     class FlakyRunner(ClaudeAgentSdkRunner):
-        def _step_env(self, env: dict[str, str], hook_dir: str, call_id: str) -> Any:
+        def _step_env(
+            self, env: dict[str, str], hook_dir: str, call: Any, key: str
+        ) -> Any:
             if broken[0]:
                 broken[0] -= 1
                 raise ConnectionError("the engine could not start")
-            return super()._step_env(env, hook_dir, call_id)
+            return super()._step_env(env, hook_dir, call, key)
 
     (tmp_path / "work").mkdir()
     runner = FlakyRunner(
