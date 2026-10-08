@@ -313,12 +313,13 @@ async def test_real_engine_a_commands_result_goes_as_a_message(
 
 
 @pytest.mark.parametrize("together", [False, True], ids=["alone", "with count"])
-async def test_real_engine_with_a_session_store_the_record_goes_into_the_session(
+async def test_real_engine_with_a_session_store_the_record_goes_into_a_copy(
     tmp_path: Path, together: bool
 ) -> None:
-    """With a session store the record goes into the session itself when nothing
-    else waits (the session goes on in place), and into a copy when calls of the
-    same message were denied after the pause (as their results always did)."""
+    """With a session store the record goes into a copy of the session, in place of
+    the pause's hook entries (as in the conversation the Workflow holds), also when
+    calls of the same message were denied after the pause. The session itself stays
+    as it was."""
     out = tmp_path / "work" / "out.txt"
     calls: list[tuple[str, dict[str, Any]]] = [
         ("Write", {"file_path": str(out), "content": "x\n"})
@@ -339,10 +340,14 @@ async def test_real_engine_with_a_session_store_the_record_goes_into_the_session
             injected[paused.siblings[0].id] = ToolOutcome(content={"n": 1})
         final = await session.segment(injected=injected)
         entries = await stored(runner, final.session_id)
+        original = await stored(runner, paused.session_id)
     finally:
         model.api.stop()
-    assert (final.session_id == paused.session_id) is not together  # a copy: new id
+    assert final.session_id != paused.session_id  # a copy: a new id
     assert [e.get("uuid") for e in entries].count(outcome.entry["uuid"]) == 1
+    markers = [_runner._marker_of(e) for e in entries]  # type: ignore[reportPrivateUsage]
+    assert call.id not in markers  # the record took the pause's place
+    assert outcome.entry["uuid"] not in [e.get("uuid") for e in original]
     assert final.result is not None and final.result.startswith("FINAL Write:")
     assert ("| count:{" in final.result) is together
     assert seen_after(model.api.requests[-1], call.id)[-1] == ("text", RESUME_LINE)
@@ -575,8 +580,8 @@ async def test_real_engine_a_new_task_after_a_tool_steps_result(
     """A task stopped right after its tool steps: the next task's prompt comes with
     the step's record. Claude sees the call's result, and the new task last, in one
     turn (also when the Worker's environment asks Claude Code to go on with an
-    interrupted turn by itself). In a session store, attempt 1 puts the record into
-    the session, a retry into a copy."""
+    interrupted turn by itself). In a session store, every attempt puts the record
+    into a copy."""
     store = where.startswith("store")
     out = tmp_path / "work" / "out.txt"
     model = Turns([[("Write", {"file_path": str(out), "content": "x\n"})]])
@@ -604,15 +609,53 @@ async def test_real_engine_a_new_task_after_a_tool_steps_result(
     assert [(h.name, h.is_error) for h in history] == [("Write", False)]
     assert user_words(texts)[-1] == NEXT_TASK
     if store:
-        assert (final.session_id == paused.session_id) is (where == "store")
+        assert final.session_id != paused.session_id  # a copy with the record
+    assert model.api.errors == []
+
+
+@pytest.mark.parametrize("store", [False, True], ids=["held", "store"])
+async def test_real_engine_a_pause_with_a_denied_call_after_records(
+    tmp_path: Path, store: bool
+) -> None:
+    """Two Writes as tool steps, then a message whose Bash pauses and whose second
+    Write is denied, so the next segment goes on in a copy that puts that denial
+    before the pause. Before, with a session store, the records stayed in the
+    session beside their pauses' deferral markers, and in that copy Claude Code
+    took the paused Bash for interrupted ("[Tool result missing due to internal
+    error]") and ran the turn on past the next pause."""
+    work = tmp_path / "work"
+    effects = (work / "effects.log").as_posix()
+
+    def write(name: str) -> tuple[str, dict[str, Any]]:
+        return ("Write", {"file_path": str(work / name), "content": f"{name}\n"})
+
+    bash = ("Bash", {"command": f"echo ran >> {effects}", "description": "run"})
+    model = Turns([[write("a.txt")], [write("b.txt")], [bash, write("c.txt")]])
+    runner = make_runner(tmp_path, model.api, store=store)
+    session = Session(runner, ["Bash", "Write"], ["Bash", "Write"], store=store)
+    ran: list[str] = []
+    try:
+        out = await session.segment("Go.")
+        while out.deferred is not None:
+            call = out.deferred
+            ran.append(call.name)
+            outcome = await session.step(out)
+            out = await session.segment(injected={call.id: outcome})
+    finally:
+        model.api.stop()
+    assert ran == ["Write", "Write", "Bash"]
+    assert out.result is not None and out.result.startswith("FINAL ")
+    assert "Tool result missing" not in json.dumps(model.api.requests)
+    assert Path(effects).read_text() == "ran\n"
     assert model.api.errors == []
 
 
 async def test_real_engine_a_store_segment_that_runs_again_after_its_record_went_in(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Attempt 1 put the record into the session itself, then failed. The retry goes
-    on in a copy that ends with the record, once."""
+    """Attempt 1 went on in a copy with the record, then failed. The retry makes a
+    new copy from the session, which never holds the record, so the record is there
+    once."""
     out = tmp_path / "work" / "out.txt"
     model = Turns([[("Write", {"file_path": str(out), "content": "x\n"})]])
     runner = make_runner(tmp_path, model.api, store=True)
@@ -635,7 +678,7 @@ async def test_real_engine_a_store_segment_that_runs_again_after_its_record_went
     finally:
         model.api.stop()
     record = outcome.entry["uuid"]
-    assert [e.get("uuid") for e in first].count(record) == 1  # in place
+    assert [e.get("uuid") for e in first].count(record) == 0  # never in place
     assert not final.is_error and final.session_id != paused.session_id
     assert [e.get("uuid") for e in copy_entries].count(record) == 1
     assert final.result is not None and final.result.startswith("FINAL Write:")

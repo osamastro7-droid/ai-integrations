@@ -2542,7 +2542,7 @@ class ClaudeAgentSdkRunner:
 
         Returns:
             The session, whether to resume it, the calls whose results are already
-            in it (see ``_copy`` and ``_place_here``), the entry it must still end at
+            in it (see ``_copy`` and ``_record_copy``), the entry it must still end at
             when the engine resumes it in place (None for a copy), and whether it
             ends with Claude Code's record of a paused call's result (see ``_place``).
         """
@@ -2559,30 +2559,29 @@ class ClaudeAgentSdkRunner:
             # a rejected call), can be an Edit's or a Write's: others go as before,
             # with no read of the session here.
             if any(o.entry is not None or o.is_error for o in injected.values()):
-                placed = await self._place_here(inp, injected)
-                if placed is not None:
-                    return inp.session_id, True, placed[1], placed[0], True
+                copied = await self._record_copy(inp, injected)
+                if copied is not None:
+                    return copied[0], True, copied[1], None, True
             return inp.session_id, True, set(), inp.checkpoint, False
         session_id, delivered, recorded = await self._copy(inp, injected)
         return session_id, True, delivered, None, recorded
 
-    async def _place_here(
+    async def _record_copy(
         self, inp: SegmentInput, injected: dict[str, ToolOutcome]
     ) -> tuple[str, set[str]] | None:
-        """Add Claude Code's record of the paused call's result to the session itself.
+        """A copy of the session with Claude Code's record of the paused call's result.
 
-        Only when the call is one of ``RECORDED_TOOLS``, the session still ends at
-        the checkpoint, and nothing was denied after the pause: then the record is
-        all the session needs (see ``_place``). It comes after the pause's hook
-        entries, linked to the call's assistant entry, so the engine resumes from it
-        and leaves the hook entries aside (tested on Claude Code 2.1.273, 2.1.274 and
-        2.1.288).
+        Only when the call is one of ``RECORDED_TOOLS`` (see ``_place``). The record
+        takes the place of the pause's hook entries, as in the conversation the
+        Workflow holds. (Added to the session itself, after the hook entries, the
+        record would leave the pause's deferral marker in the session: a later copy
+        of it, after a retry or a pause in a message with several calls, then makes
+        Claude Code take the paused call of that copy for interrupted, tested on
+        Claude Code 2.1.273.)
 
         Returns:
-            The record's uuid (where the session now ends), and the calls whose
-            results it holds; or None when the session goes on as before: in place
-            with the results in a message, or in a copy once the engine finds that it
-            no longer ends at the checkpoint (``_SessionMoved``, then ``_copy``).
+            The copy's id, and the calls whose results it holds; or None when the
+            session goes on as before: in place, with the results in a message.
         """
         assert inp.checkpoint is not None
         key = {
@@ -2590,15 +2589,19 @@ class ClaudeAgentSdkRunner:
             "session_id": inp.session_id,
         }
         entries = cast("list[dict[str, Any]]", await self._store.load(key) or [])
-        if _last_entry(entries) != inp.checkpoint:
-            return None
         placed = _place(entries, inp.checkpoint, injected)
-        span = _hook_span(entries, inp.checkpoint)
-        if placed is None or span is None or len(placed[0]) != span[0] + 1:
+        if placed is None:
             return None
-        record = placed[0][-1]
-        await self._store.append(key, [record])
-        return record["uuid"], placed[1]
+        return await self._write_copy(key, placed[0]), placed[1]
+
+    async def _write_copy(self, key: dict[str, Any], seed: list[Any]) -> str:
+        """Write ``seed`` to the store as a new session; return its id."""
+        copy_id = str(uuid.uuid4())
+        await self._store.append(
+            {**key, "session_id": copy_id},
+            [{**e, "sessionId": copy_id} if "sessionId" in e else e for e in seed],
+        )
+        return copy_id
 
     async def _copy(
         self, inp: SegmentInput, injected: dict[str, ToolOutcome]
@@ -2631,12 +2634,7 @@ class ClaudeAgentSdkRunner:
             )
             return forked.session_id, set(), False
         seed, delivered = moved
-        copy_id = str(uuid.uuid4())
-        await self._store.append(
-            {**key, "session_id": copy_id},
-            [{**e, "sessionId": copy_id} if "sessionId" in e else e for e in seed],
-        )
-        return copy_id, delivered, placed is not None
+        return await self._write_copy(key, seed), delivered, placed is not None
 
     async def _checkpoint(
         self,

@@ -1,10 +1,11 @@
 """Claude Code tools that run as their own Activities (tool steps).
 
-With ``tool_activities`` (by default ``Bash`` and MCP tools), Claude Code's own tool
-calls pause the segment like durable tools. Each runs in its own Activity: Claude Code
-resumes a copy of the conversation before the call, a local stand-in model answers
-with the call, and Claude Code runs exactly that call. A segment that runs again never
-runs the command again, a call can wait for approval, and Temporal records each call.
+With ``tool_activities`` (Bash, PowerShell, Edit, Write and MCP tools), Claude Code's
+own tool calls pause the segment like durable tools. Each runs in its own Activity:
+Claude Code resumes a copy of the conversation before the call, a local stand-in model
+answers with the call, and Claude Code runs exactly that call; the next segment
+continues from Claude Code's own record of it. A segment that runs again never runs the
+command again, a call can wait for approval, and Temporal records each call.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.exceptions import ApplicationError
 from temporalio.worker import Worker
 from tests.endless.activities import ALL as COUNTING
-from tests.engine_tools.policy import shell_policy
+from tests.engine_tools.policy import file_policy, shell_policy
 from tests.engine_tools.workflows import ShellOptions, ShellWorkflow
 from tests.helpers.fake_messages_api import engine_env, start_with_policy
 from tests.helpers.workers import FAIL_FAST
@@ -608,6 +609,51 @@ def denial_text(seen: str) -> str:
     return rest if sep and head.startswith("PreToolUse:") else seen
 
 
+@pytest.mark.parametrize("mode", ["held", "store"])
+async def test_real_engine_file_tools_run_as_their_own_activities(
+    client: Client, tmp_path: Path, mode: str
+) -> None:
+    """Edit and Write run as their own Activities (anthropics/claude-code#99041):
+    Claude reads a file, edits it together with a durable call, edits it again,
+    writes over it and edits what it wrote. Each tool step runs its call once, and
+    Claude sees Claude Code's own result each time. Before, the next segment checked
+    a file tool's call again and told Claude the file "has been modified since read"
+    (see ``test_real_engine_a_file_tools_result_sent_as_a_message_is_checked_again``)."""
+    notes = tmp_path / "work" / "notes.txt"
+    api = start_with_policy(file_policy)
+    runner = make_runner(tmp_path, api, mode)
+    notes.write_text("alpha\nbeta\n")
+    queue = f"files-{uuid.uuid4().hex[:8]}"
+    options = ShellOptions(
+        builtin_tools=["Read", "Edit", "Write"], tool_activities=["Edit", "Write"]
+    )
+    try:
+        async with worker(client, queue, runner):
+            result = await client.execute_workflow(
+                ShellWorkflow.run,
+                args=[f"files: {notes}", options],
+                id=queue,
+                task_queue=queue,
+            )
+            handle = client.get_workflow_handle(queue)
+            steps = [n for n, _ in await activity_types(handle) if n.endswith("step")]
+            calls = await handle.query(ShellWorkflow.tool_calls)
+    finally:
+        api.stop()
+    assert result == "Read:ok Edit:ok count:ok Edit:ok Write:ok Edit:ok"
+    assert notes.read_text() == "rewritten\n"
+    assert len(steps) == 4  # Edit, Edit, Write, Edit: one attempt each
+    assert [(c["name"], c["status"]) for c in calls] == [
+        ("Edit", "done"),
+        ("count", "done"),
+        ("Edit", "done"),
+        ("Write", "done"),
+        ("Edit", "done"),
+    ]
+    assert "modified since read" not in json.dumps(api.requests)
+    assert api.errors == []
+
+
 async def test_real_engine_a_file_tools_result_sent_as_a_message_is_checked_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1013,7 +1059,7 @@ def test_repeatable_tools_must_run_as_activities() -> None:
 @pytest.mark.parametrize(
     ("activities", "approvals", "problem"),
     [
-        (["Edit"], [], "cannot run as its own Activity"),
+        (["Read"], [], "cannot run as its own Activity"),
         (["WebFetch"], [], "cannot run as its own Activity"),
         (["*"], [], "cannot run as its own Activity"),
         ([], ["Bash"], "does not run as its own Activity"),
@@ -1032,7 +1078,9 @@ def test_tools_that_cannot_run_as_activities_are_refused(
 def test_tools_that_can_run_as_activities_are_accepted() -> None:
     from temporalio.claude_agent_sdk import DurableClaudeAgent
 
-    DurableClaudeAgent(tool_activities=["Bash", "PowerShell", "mcp__github__*"])
+    DurableClaudeAgent(
+        tool_activities=["Bash", "PowerShell", "Edit", "Write", "mcp__github__*"]
+    )
     DurableClaudeAgent(
         tool_activities=["mcp__*"], tool_approvals=["mcp__github__create_issue"]
     )

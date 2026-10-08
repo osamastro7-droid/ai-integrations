@@ -1,4 +1,4 @@
-"""An agent that uses Claude Code's Bash, and an MCP server's tool."""
+"""An agent that uses Claude Code's tools (Bash by default), and an MCP server's tool."""
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ class ShellOptions:
         tool_retry_max_interval: Its maximum interval in seconds (0: Temporal's
             default, 100 times the first).
         tool_retry_attempts: Its maximum attempts (0: unlimited).
+        builtin_tools: The agent's Claude Code tools.
     """
 
     tool_activities: list[str] = field(default_factory=lambda: ["Bash", "mcp__*"])
@@ -42,11 +43,12 @@ class ShellOptions:
     tool_retry_backoff: float = 2.0
     tool_retry_max_interval: float = 0
     tool_retry_attempts: int = 5
+    builtin_tools: list[str] = field(default_factory=lambda: ["Bash"])
 
 
 @workflow.defn
 class ShellWorkflow:
-    """Runs one task with Bash (and a durable ``count``)."""
+    """Runs one task with Claude Code's tools (and a durable ``count``)."""
 
     @workflow.init
     def __init__(self, prompt: str, options: ShellOptions) -> None:
@@ -59,7 +61,7 @@ class ShellWorkflow:
                     retry_policy=FAST,
                 )
             ],
-            builtin_tools=["Bash"],
+            builtin_tools=options.builtin_tools,
             tool_activities=options.tool_activities,
             tool_approvals=options.tool_approvals,
             repeatable_tools=options.repeatable_tools,

@@ -39,3 +39,31 @@ def together_policy(prompt: str, history: list[HistoryItem]) -> list[ToolCall] |
     if not counted:
         calls.append(ToolCall("count", {"n": 1}))
     return calls if prompt.startswith("bash first") else calls[::-1]
+
+
+def file_policy(prompt: str, history: list[HistoryItem]) -> list[ToolCall] | Final:
+    """'files: <path>' reads the file, edits it together with a ``count``, edits it
+    again, writes over it, and edits what it wrote. The answer says how each call
+    went, in order."""
+    path = prompt.split(": ", 1)[1]
+
+    def edit(old: str, new: str) -> ToolCall:
+        return ToolCall(
+            "Edit", {"file_path": path, "old_string": old, "new_string": new}
+        )
+
+    plan = {
+        0: [ToolCall("Read", {"file_path": path})],
+        1: [edit("beta", "gamma"), ToolCall("count", {"n": 1})],
+        3: [edit("gamma", "delta")],
+        4: [ToolCall("Write", {"file_path": path, "content": "written\n"})],
+        5: [edit("written", "rewritten")],
+    }
+    if len(history) in plan and not any(h.is_error for h in history):
+        return plan[len(history)]
+    return Final(
+        " ".join(
+            f"{h.name}:" + (f"error {str(h.content)[:120]}" if h.is_error else "ok")
+            for h in history
+        )
+    )

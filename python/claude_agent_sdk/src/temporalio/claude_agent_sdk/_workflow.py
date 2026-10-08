@@ -86,7 +86,7 @@ def _event_bytes(item: Any) -> int:
     return len(item.data) + len(item.topic) + _STREAM_ITEM_BYTES
 
 
-_ENGINE_ACTIVITY_TOOLS = ("Bash", "PowerShell")
+_ENGINE_ACTIVITY_TOOLS = ("Bash", "PowerShell", "Edit", "Write")
 """Claude Code built-in tools that can run as their own Activities (and MCP tools)."""
 
 
@@ -95,18 +95,19 @@ def _check_tool_activities(
 ) -> None:
     """Refuse Claude Code tools that cannot run as their own Activities.
 
-    A tool step answers the engine's model calls with a stand-in, and Claude Code
-    checks a file tool call again when the next segment delivers its result: an Edit
-    run in a tool step happens, but Claude is told it failed, because the file changed
-    since Claude read it (tested). So file tools, tools that call the model themselves
-    (such as WebFetch) and subagents stay in the segment.
+    A tool step runs the call in Claude Code with a stand-in model, and the next
+    segment continues from Claude Code's own record of the call, so an Edit or a
+    Write is not checked again (tested). Tools that call the model themselves (such
+    as WebFetch), subagents, and the tools not tested in steps (such as Read, which
+    changes nothing) stay in the segment.
     """
     for pattern in patterns:
         if pattern not in _ENGINE_ACTIVITY_TOOLS and not pattern.startswith("mcp__"):
             raise ValueError(
                 f"tool_activities: {pattern!r} cannot run as its own Activity. Use "
-                "'Bash', 'PowerShell', or MCP tool names ('mcp__<server>__<tool>', "
-                "patterns allowed); other Claude Code tools stay in the segment."
+                "'Bash', 'PowerShell', 'Edit', 'Write', or MCP tool names "
+                "('mcp__<server>__<tool>', patterns allowed); other Claude Code tools "
+                "stay in the segment."
             )
     for pattern in approvals:
         if not any(fnmatch.fnmatchcase(pattern, p) for p in patterns):
