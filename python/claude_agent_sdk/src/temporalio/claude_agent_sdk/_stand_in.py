@@ -18,7 +18,9 @@ from __future__ import annotations
 import hmac
 import json
 import secrets
+import socket
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
@@ -28,6 +30,9 @@ ANSWER = "ok"
 
 MAX_BODY_BYTES = 1024**3
 """Largest request body read (the engine sends the whole conversation)."""
+
+LINGER_SECONDS = 2.0
+"""How long a refused connection still takes, and drops, what the client sends."""
 
 
 @dataclass
@@ -59,6 +64,24 @@ def _offers(body: dict[str, Any], name: str) -> bool:
     )
 
 
+def _end_without_reset(sock: socket.socket) -> None:
+    """End this side of a connection, then drop what the client still sends until it
+    closes (for at most ``LINGER_SECONDS``).
+
+    A socket closed with data it did not read is reset, and on Windows a reset can
+    make the client lose the answer before it reads it.
+    """
+    deadline = time.monotonic() + LINGER_SECONDS
+    try:
+        sock.shutdown(socket.SHUT_WR)
+        while (left := deadline - time.monotonic()) > 0:
+            sock.settimeout(left)
+            if not sock.recv(65536):
+                return  # the client closed: nothing is left unread
+    except OSError:
+        pass  # timed out, or the client is gone: the answer went out first
+
+
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     stand_in: ClassVar[StandInModel]  # set by the server's own subclass
@@ -66,11 +89,15 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         del format, args
 
-    def _send(self, payload: dict[str, Any], status: int = 200) -> None:
+    def _send(
+        self, payload: dict[str, Any], status: int = 200, close: bool = False
+    ) -> None:
         data = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data)))
+        if close:
+            self.send_header("connection", "close")  # also sets close_connection
         self.end_headers()
         self.wfile.write(data)
 
@@ -78,11 +105,10 @@ class _Handler(BaseHTTPRequestHandler):
         self._send({})
 
     def _refuse(self, status: int, kind: str, message: str) -> None:
-        """Answer without reading the body, and close the connection."""
-        self.close_connection = True
-        self._send(
-            {"type": "error", "error": {"type": kind, "message": message}}, status
-        )
+        """Answer without reading the body, then end the connection without a reset."""
+        error = {"type": kind, "message": message}
+        self._send({"type": "error", "error": error}, status, close=True)
+        _end_without_reset(self.connection)
 
     def do_POST(self) -> None:
         call = self.stand_in.call_for(self.headers.get("x-api-key", ""))

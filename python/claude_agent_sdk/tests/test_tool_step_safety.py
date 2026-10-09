@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -724,6 +725,30 @@ def test_the_stand_in_answers_only_its_own_engines(key: str | None) -> None:
     stand_in.done(call)
     assert post_to(stand_in, OFFERS_BASH, call.key, length=1000) == 401
     assert stand_in.requests == 1 and call.served == 0
+
+
+def test_the_stand_in_ends_a_refused_connection_without_a_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused request gets its answer, then the stand-in ends its side and drops
+    the rest of the body. A socket closed with unread data is reset instead, and on
+    Windows the client can then lose the answer before it reads it (it did)."""
+    # The stand-in waits for the client to close; a slow machine must not outlast it.
+    monkeypatch.setattr(_stand_in, "LINGER_SECONDS", 30.0, raising=False)
+    stand_in = _stand_in.StandInModel()
+    stand_in.serve(BASH_CALL)
+    port = int(stand_in.base_url.rsplit(":", 1)[1])
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+        sock.sendall(b"POST /v1/messages HTTP/1.1\r\ncontent-length: 1000\r\n\r\n")
+        answer = b""
+        while chunk := sock.recv(65536):  # ends only when the stand-in ends its side
+            answer += chunk
+        assert answer.startswith(b"HTTP/1.1 401 ")
+        for _ in range(5):  # the rest of the body: dropped, not answered with a reset
+            sock.sendall(b"x" * 200)
+            time.sleep(0.05)
+    assert b"\r\nconnection: close\r\n" in answer.lower()
+    assert stand_in.requests == 0
 
 
 def test_the_stand_in_reads_no_body_over_its_limit_or_of_a_negative_length() -> None:
