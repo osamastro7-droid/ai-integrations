@@ -440,29 +440,62 @@ def hook_env(run_dir: Path, **more: str) -> dict[str, str]:
     return {**env, "TCA_HOOK_DIR": str(run_dir), **more}
 
 
+IN_A_THREAD = """\
+import runpy, sys, threading
+threading.stack_size(2**24)
+thread = threading.Thread(
+    target=runpy.run_path, args=(sys.argv[1],), kwargs={"run_name": "__main__"}
+)
+thread.start()
+thread.join()
+"""
+"""Runs the script ``sys.argv[1]`` in a thread with a stack of 16 MiB.
+
+From Python 3.14, how deep ``json`` reads depends on the stack size (in the main
+thread of GitHub's Linux and macOS runners it read 100,000 levels), and 1,000,000
+levels do not fit in 16 MiB. Before 3.14 the limit is a fixed count, far below that.
+"""
+
+
 @pytest.mark.parametrize("stdin", ["nested too deep", "not JSON"])
 def test_a_hook_that_cannot_read_its_event_denies_the_call(
     tmp_path: Path, stdin: str
 ) -> None:
     """With no answer, Claude Code's own permission check would decide, and a rule
     from a settings file could let the call run. So a hook that fails denies. Here it
-    cannot even read the event (as the runner starts it: isolated, no ``site``)."""
+    cannot even read the event (as the runner starts it: isolated, no ``site``; the
+    deep event in a thread of a known stack size, see ``IN_A_THREAD``)."""
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     approved = {"command": "ls"}
     env = hook_env(
         run_dir, TCA_ALLOW_ID=CALL_ID, TCA_ALLOW_INPUT=hook.input_digest(approved)
     )
+    command = [sys.executable, "-I", "-S", str(HOOK)]
     if stdin == "nested too deep":
-        deep = "[" * 100_000 + "]" * 100_000
+        deep = "[" * 1_000_000 + "]" * 1_000_000
         data = (
             '{"tool_name": "Bash", "tool_use_id": "%s", "tool_input": '
             '{"command": "ls", "x": %s}}' % (CALL_ID, deep)
         )
+        command = [sys.executable, "-I", "-S", "-c", IN_A_THREAD, str(HOOK)]
+        read = tmp_path / "read.py"
+        read.write_text("import json, sys\njson.load(sys.stdin)\n", encoding="utf-8")
+        probe = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", IN_A_THREAD, str(read)],
+            input=data.encode(),
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        assert b"RecursionError" in probe.stderr, (
+            f"json did not fail with RecursionError here (exit {probe.returncode}): "
+            f"{probe.stderr[-300:]!r}"
+        )
     else:
         data = "{not json"
     done = subprocess.run(
-        [sys.executable, "-I", "-S", str(HOOK)],
+        command,
         input=data.encode("utf-8"),
         capture_output=True,
         env=env,

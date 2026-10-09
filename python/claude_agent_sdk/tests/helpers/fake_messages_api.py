@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import sys
 import threading
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +28,15 @@ Decide = Callable[[dict[str, Any]], list[dict[str, Any]]]
 RESUME_LINE = "Continue from where you left off."
 """The line Claude Code adds when it continues a turn by itself, as it does after a
 tool step's result (see the runner's ``CONTINUE_ENV``)."""
+
+
+class _Server(ThreadingHTTPServer):
+    """Quiet when an engine goes away during an answer: tests end engines on purpose."""
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return  # a broken pipe, or a reset or aborted connection
+        super().handle_error(request, client_address)
 
 
 def user_words(texts: list[str]) -> list[str]:
@@ -217,7 +227,7 @@ class FakeMessagesAPI:
                 )
                 api.write(self, body, blocks)
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server = _Server(("127.0.0.1", 0), Handler)
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
         return self
 
