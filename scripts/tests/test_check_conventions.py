@@ -61,6 +61,20 @@ def test_relative_readme_links_are_forbidden(plugin_repo: Path) -> None:
     assert any("relative link" in x for x in run(plugin_repo))
 
 
+@pytest.mark.parametrize("readme", ['"README.pypi.md"', '{file = "README.pypi.md", content-type = "text/markdown"}'])
+def test_published_readme_is_checked_instead_of_imported_readme(plugin_repo: Path, readme: str) -> None:
+    plugin = plugin_repo / "python/fakeplug"
+    (plugin / "README.md").write_text("Imported [SDK docs](../opentelemetry)\n")
+    manifest = plugin / "pyproject.toml"
+    manifest.write_text(manifest.read_text().replace('readme = "README.md"', f"readme = {readme}"))
+    published = plugin / "README.pypi.md"
+    assert any("published README README.pypi.md is missing" in x for x in run(plugin_repo))
+    published.write_text("Published [SDK docs](https://github.com/temporalio/sdk-python)\n")
+    assert run(plugin_repo) == []
+    published.write_text("Published [SDK docs](../opentelemetry)\n")
+    assert any("README.pypi.md:1: relative link" in x for x in run(plugin_repo))
+
+
 def test_plugin_folder_suffix_and_language_lockfile(plugin_repo: Path) -> None:
     (plugin_repo / "python/uv.lock").write_text("")
     (plugin_repo / "python/foo_plugin").mkdir()
@@ -80,7 +94,8 @@ def test_python_code_is_forbidden_in_shared(plugin_repo: Path) -> None:
     assert any("Python code must be duplicated" in x for x in run(plugin_repo))
 
 
-def test_standard_test_support_matches_templates(plugin_repo: Path) -> None:
+@pytest.mark.parametrize("support_file", sorted(check_conventions.STANDARD_TEST_SUPPORT))
+def test_standard_test_support_matches_templates(plugin_repo: Path, support_file: str) -> None:
     template = plugin_repo / "python/_template"
     plugin = plugin_repo / "python/fakeplug"
     for plugin_rel, template_rel in check_conventions.STANDARD_TEST_SUPPORT.items():
@@ -91,8 +106,8 @@ def test_standard_test_support_matches_templates(plugin_repo: Path) -> None:
         rendered.parent.mkdir(parents=True, exist_ok=True)
         rendered.write_bytes(canonical.read_bytes())
     assert run(plugin_repo) == []
-    (plugin / "tests/helpers/provenance.py").write_text("# drifted\n")
-    assert any("differs from canonical" in x for x in run(plugin_repo))
+    (plugin / support_file).write_text("# drifted\n")
+    assert any(support_file in x and "differs from canonical" in x for x in run(plugin_repo))
 
 
 def test_plugin_toml_agreement(plugin_repo: Path) -> None:
@@ -159,8 +174,15 @@ def test_unrelated_root_api_is_rejected(plugin_repo: Path) -> None:
 
 def test_maturity_classifier_must_agree(plugin_repo: Path) -> None:
     meta = plugin_repo / "python/fakeplug/plugin.toml"
-    meta.write_text(meta.read_text().replace('maturity = "experimental"', 'maturity = "ga"'))
+    meta.write_text(meta.read_text().replace('maturity = "pre-release"', 'maturity = "generally-available"'))
     assert any("Development Status :: 5 - Production/Stable" in x for x in run(plugin_repo))
+
+
+@pytest.mark.parametrize("maturity", ["experimental", "preview", "ga"])
+def test_legacy_maturity_values_are_rejected(plugin_repo: Path, maturity: str) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(meta.read_text().replace('maturity = "pre-release"', f'maturity = "{maturity}"'))
+    assert any("plugin.toml maturity must be one of" in x for x in run(plugin_repo))
 
 
 def test_no_secrets_or_owners_in_plugin_toml(plugin_repo: Path) -> None:
