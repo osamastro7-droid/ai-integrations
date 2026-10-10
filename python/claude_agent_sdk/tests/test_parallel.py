@@ -29,7 +29,11 @@ from temporalio.worker import Worker
 from tests.endless.activities import ALL as COUNTING
 from tests.endless.activities import publish
 from tests.endless.workflows import LongTaskWorkflow, TaskOptions
-from tests.helpers.fake_messages_api import engine_env, start_with_policy
+from tests.helpers.fake_messages_api import (
+    SLOW_MODEL_SECONDS,
+    engine_env,
+    start_with_policy,
+)
 from tests.helpers.workers import FAIL_FAST
 from tests.parallel.policy import parallel_policy
 from tests.parallel.workflows import ParallelWorkflow, SurviveCancelWorkflow
@@ -247,13 +251,18 @@ async def test_continue_as_new_right_after_calls_in_one_message(client: Client) 
 
 @pytest.mark.timeout(300)
 @pytest.mark.usefixtures("shop_dir")
+@pytest.mark.parametrize("model", ["quick", "slow"])
 @pytest.mark.parametrize("mode", ["held", "store"])
 async def test_real_engine_runs_calls_in_one_message_at_once(
-    client: Client, tmp_path: Path, mode: str
+    client: Client, tmp_path: Path, mode: str, model: str
 ) -> None:
     """Three calls in one message on the real engine, and Continue-As-New while their
-    results wait: each runs once, and Claude reads all three."""
+    results wait: each runs once, and Claude reads all three. Also with a model that
+    takes its time after each call: Claude Code pauses at the first before the others
+    arrive, and they still run beside it."""
     api = start_with_policy(parallel_policy)
+    if model == "slow":
+        api.pause_after_call = SLOW_MODEL_SECONDS
     (tmp_path / "work").mkdir()
     runner = ClaudeAgentSdkRunner(
         session_store=(

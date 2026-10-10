@@ -67,7 +67,10 @@ call of a message that runs as an Activity and denies the calls after it. The se
 reports the denied durable calls (``siblings``); the Workflow runs them with the
 paused one, and the next segment puts their results where the engine resumes (see
 ``_deliver``), so Claude sees every call of the message with its result. A denied
-Claude Code call keeps its denial, and Claude calls it again.
+Claude Code call keeps its denial, and Claude calls it again. The engine starts a call
+as soon as its block arrives, so with a model that takes its time between the calls
+of a message, the calls after the paused one come after its pause in the session:
+they move back first (see ``_blocks_first``).
 """
 
 from __future__ import annotations
@@ -582,7 +585,8 @@ def _resume_point(entries: list[Any], paused_call: str | None) -> str | None:
     deferral marker, and a session that ends there no longer resumes the paused
     call (tested: its delivered result is replaced with "[Tool result missing due
     to internal error]"). Then the checkpoint is the marker, so the next segment
-    continues in a copy that ends at it.
+    continues in a copy that ends at it. So too when a later block of the paused
+    call's message comes after the marker (a slow model, see ``_blocks_first``).
     """
     leaf: str | None = None
     marker: str | None = None
@@ -599,7 +603,7 @@ def _resume_point(entries: list[Any], paused_call: str | None) -> str | None:
             and attachment.get("toolUseID") == paused_call
         ):
             marker, user_after_marker = leaf, False
-        elif marker is not None and entry["type"] == "user":
+        elif marker is not None and entry["type"] in ("user", "assistant"):
             user_after_marker = True
     return marker if marker is not None and user_after_marker else leaf
 
@@ -635,14 +639,14 @@ def _siblings(
 
     Their denials come after the paused call's deferral marker, and the hook recorded
     each one as "not run" (``denials``): a call denied for any other reason, or by
-    anything else, is never run.
+    anything else, is never run. With a slow model, the calls themselves can come
+    after the marker too (see ``_blocks_first``).
     """
-    marker = None
-    for index, entry in enumerate(entries):
-        if _marker_of(entry) == paused_call:
-            marker = index
+    marker = _marker_index(entries, paused_call)
     if marker is None:
         return []
+    entries = _blocks_first(entries, marker)
+    marker = cast("int", _marker_index(entries, paused_call))
     not_run = REASON_KEYS[NOT_RUN_REASON]
     denied = {
         tid
@@ -683,29 +687,29 @@ def _deliver(
     calls: the engine strips tool calls whose results come after where it resumes.
     So the denials move before the paused call's hook entries, and the denials of
     durable calls get their real results. The engine's own links between entries
-    stay as they are. Tested on Claude Code 2.1.273 and 2.1.287, with built-in and
-    durable calls mixed in one message: Claude sees each call of the message with
-    its result (a built-in call denied after the pause keeps the denial, and Claude
-    calls it again).
+    stay as they are (calls that came after the marker, with a slow model, move back
+    first: see ``_blocks_first``). Tested on Claude Code 2.1.273 and 2.1.287, with
+    built-in and durable calls mixed in one message: Claude sees each call of the
+    message with its result (a built-in call denied after the pause keeps the
+    denial, and Claude calls it again).
 
     Returns:
         The entries to resume from, and the calls whose results they now hold; or
-        None if the checkpoint is not a deferral marker followed by denials.
+        None if the checkpoint is not a deferral marker followed by denials (or by
+        later blocks of its message).
     """
-    marker = next(
-        (
-            i
-            for i, e in enumerate(entries)
-            if isinstance(e, dict) and e.get("uuid") == checkpoint
-        ),
-        None,
-    )
+    marker = _index_of(entries, checkpoint)
     paused = _marker_of(entries[marker]) if marker is not None else None
     if marker is None or paused is None:
         return None
+    ordered = _blocks_first(entries, marker)
+    reordered = ordered is not entries
+    if reordered:  # a slow model's blocks after the pause, now before it
+        entries = ordered
+        marker = cast("int", _index_of(entries, checkpoint))
     first = _hooks_start(entries, marker, paused)
     moved, delivered = _denied_after(entries, marker, paused, results)
-    if not moved:
+    if not moved and not reordered:
         return None
     return [*entries[:first], *moved, *entries[first : marker + 1]], delivered
 
@@ -720,6 +724,85 @@ def _hooks_start(entries: list[Any], marker: int, paused: str) -> int:
             break
         first -= 1
     return first
+
+
+def _index_of(entries: list[Any], uuid_: str) -> int | None:
+    """The index of the (first) entry with this uuid, or None."""
+    return next(
+        (
+            i
+            for i, e in enumerate(entries)
+            if isinstance(e, dict) and e.get("uuid") == uuid_
+        ),
+        None,
+    )
+
+
+def _marker_index(entries: list[Any], paused: str) -> int | None:
+    """The index of a paused call's deferral marker (the last one), or None."""
+    for index in range(len(entries) - 1, -1, -1):
+        if _marker_of(entries[index]) == paused:
+            return index
+    return None
+
+
+def _blocks_first(entries: list[Any], marker: int) -> list[Any]:
+    """The session with every block of the paused call's message before its hook entries.
+
+    Claude Code writes each block of a message as an entry of its own, and starts a
+    call as soon as its block arrives. So when the model takes its time between the
+    calls of one message, the paused call's hook entries and deferral marker come
+    before the entries of the message's later calls, the first of them linked to the
+    marker. The next segment resumes in a copy that ends at the marker: those calls
+    and their results would be lost, and a durable one would not run with the paused
+    call. So their entries move back to where Claude Code writes them when the model
+    is quick: right after the message's other blocks, each linked to the block before
+    it, with the paused call's first hook entry linked to the last block. Then the
+    session is as Claude Code has it then (tested with a model that waits 1.5 s after
+    each call, on Claude Code 2.1.273, 2.1.274, 2.1.288 and 2.1.295).
+
+    Returns:
+        ``entries`` itself when no block of the message comes after its hook entries,
+        else a new list (with copies of the entries moved or linked anew).
+    """
+    paused = _marker_of(entries[marker])
+    if paused is None:
+        return entries
+    first = _hooks_start(entries, marker, paused)
+    anchor = entries[first - 1] if first > 0 else None
+    message = anchor.get("message") if isinstance(anchor, dict) else None
+    found = _calls_of(entries[:first], paused)
+    if (
+        not isinstance(anchor, dict)
+        or anchor.get("type") != "assistant"
+        or not isinstance(message, dict)
+        or message.get("id") is None
+        or found is None
+        or found[0]["message"].get("id") != message["id"]
+    ):
+        return entries  # not a shape this knows: as it is
+    late = [
+        index
+        for index in range(marker + 1, len(entries))
+        if isinstance(entries[index], dict)
+        and entries[index].get("type") == "assistant"
+        and isinstance(entries[index].get("message"), dict)
+        and entries[index]["message"].get("id") == message["id"]
+    ]
+    if not late:
+        return entries
+    blocks: list[Any] = []
+    parent = anchor.get("uuid")
+    for index in late:
+        block = _json_copy(entries[index])
+        block["parentUuid"] = parent
+        parent = block.get("uuid")
+        blocks.append(block)
+    hook = _json_copy(entries[first])
+    hook["parentUuid"] = parent
+    moved = set(late)
+    rest = [e for i, e in enumerate(entries) if i > first and i not in moved]
+    return [*entries[:first], *blocks, hook, *rest]
 
 
 def _denied_after(
@@ -1005,6 +1088,10 @@ def _place(
     span = _hook_span(entries, checkpoint)
     if span is None:
         return None
+    ordered = _blocks_first(entries, span[1])  # a slow model's calls after the pause
+    if ordered is not entries:
+        entries = ordered
+        span = cast("tuple[int, int, str]", _hook_span(entries, checkpoint))
     first, marker, paused = span
     outcome = results.get(paused)
     found = _calls_of(entries[:first], paused)

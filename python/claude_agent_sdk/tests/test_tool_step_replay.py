@@ -44,9 +44,11 @@ from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError
 from tests.helpers.fake_messages_api import (
     RESUME_LINE,
+    SLOW_MODEL_SECONDS,
     FakeMessagesAPI,
     engine_env,
     history_of,
+    late_blocks,
     user_words,
 )
 
@@ -533,6 +535,104 @@ async def test_real_engine_a_read_and_an_edit_in_one_message(
     assert "| Edit:The file" in final.result
     assert "modified since read" not in json.dumps(model.api.requests)
     assert model.api.errors == []
+
+
+@pytest.mark.parametrize("first", ["Edit", "Bash"])
+@pytest.mark.parametrize("store", [False, True], ids=["held", "store"])
+async def test_real_engine_a_slow_model_keeps_every_call_of_its_message(
+    tmp_path: Path, store: bool, first: str
+) -> None:
+    """The model takes its time after each call of a message, so Claude Code runs the
+    first call's hooks and pauses there before the second call arrives: the second
+    call's entries come after the pause's deferral marker. The next segment still has
+    both calls, the paused one with its result (an Edit's as Claude Code's record) and
+    the other with its denial. Before, the copy that ends at the pause lost the second
+    call, and Claude never saw it."""
+    work = tmp_path / "work"
+    notes, effects = work / "notes.txt", work / "effects.log"
+    edit: tuple[str, dict[str, Any]] = (
+        "Edit",
+        {"file_path": str(notes), "old_string": "old", "new_string": "new"},
+    )
+    bash: tuple[str, dict[str, Any]] = (
+        "Bash",
+        {"command": f"echo ran >> {effects.as_posix()}", "description": "x"},
+    )
+    pair: list[tuple[str, dict[str, Any]]] = (
+        [edit, bash] if first == "Edit" else [bash, edit]
+    )
+    model = Turns([[("Read", {"file_path": str(notes)})], pair])
+    model.api.pause_after_call = SLOW_MODEL_SECONDS
+    runner = make_runner(tmp_path, model.api, store=store)
+    notes.write_text("old\n")
+    session = Session(runner, ["Read", "Edit", "Bash"], ["Edit", "Bash"], store=store)
+    try:
+        paused = await session.segment("Go.")
+        call = paused.deferred
+        assert call is not None and call.name == first
+        entries = (
+            await stored(runner, paused.session_id) if store else session.conversation
+        )
+        assert late_blocks(entries)  # the second call came after the pause
+        outcome = await session.step(paused)
+        final = await session.segment(injected={call.id: outcome})
+    finally:
+        model.api.stop()
+    assert final.result is not None and final.result.startswith("FINAL ")
+    seen = final.result.removeprefix("FINAL ").split(" | ")
+    assert sorted(s.split(":")[0] for s in seen) == ["Bash", "Edit", "Read"]
+    denied = [s.split(":")[0] for s in seen if s.split(":", 1)[1].startswith("error")]
+    assert denied == ["Bash" if first == "Edit" else "Edit"]
+    assert notes.read_text() == ("new\n" if first == "Edit" else "old\n")
+    assert effects.exists() == (first == "Bash")
+    assert "modified since read" not in json.dumps(model.api.requests)
+    assert model.api.errors == []
+
+
+@pytest.mark.parametrize("store", [False, True], ids=["held", "store"])
+async def test_real_engine_a_slow_model_with_text_after_its_call(
+    tmp_path: Path, store: bool
+) -> None:
+    """A slow model writes a line after its call, in the same message: the line comes
+    after the pause. The step runs the call, and Claude sees its whole message and the
+    result (before, the line was the checkpoint, and the step failed: the session did
+    not pause at the call)."""
+    effects = tmp_path / "work" / "effects.log"
+    ref: list[FakeMessagesAPI] = []
+
+    def decide(body: dict[str, Any]) -> list[dict[str, Any]]:
+        _, _, history = history_of(body)
+        if history:
+            said = "Running it now." in json.dumps(
+                [m for m in body.get("messages", []) if m.get("role") == "assistant"]
+            )
+            return [{"type": "text", "text": f"FINAL {len(history)} {said}"}]
+        command = {"command": f"echo ran >> {effects.as_posix()}", "description": "x"}
+        return [
+            ref[0].call("Bash", command),
+            {"type": "text", "text": "Running it now."},
+        ]
+
+    api = FakeMessagesAPI(decide).start()
+    ref.append(api)
+    api.pause_after_call = SLOW_MODEL_SECONDS
+    runner = make_runner(tmp_path, api, store=store)
+    session = Session(runner, ["Bash"], ["Bash"], store=store)
+    try:
+        paused = await session.segment("Go.")
+        call = paused.deferred
+        assert call is not None and call.name == "Bash"
+        entries = (
+            await stored(runner, paused.session_id) if store else session.conversation
+        )
+        assert late_blocks(entries)  # the line came after the pause
+        outcome = await session.step(paused)
+        final = await session.segment(injected={call.id: outcome})
+    finally:
+        api.stop()
+    assert effects.read_text() == "ran\n" and not outcome.is_error
+    assert final.result == "FINAL 1 True"
+    assert api.errors == []
 
 
 @pytest.mark.parametrize("attempt", [1, 3])

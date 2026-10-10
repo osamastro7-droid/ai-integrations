@@ -12,6 +12,7 @@ import itertools
 import json
 import sys
 import threading
+import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -24,6 +25,35 @@ ENGINE_TOOLS = frozenset(
 )
 """Claude Code tools a scripted policy may call by name (MCP tools: ``mcp__...``)."""
 Decide = Callable[[dict[str, Any]], list[dict[str, Any]]]
+
+SLOW_MODEL_SECONDS = 1.5
+"""How long a slow model takes after each call of its answer (``pause_after_call``):
+long enough for Claude Code to run the call's hooks before the next call arrives."""
+
+
+def late_blocks(entries: list[dict[str, Any]]) -> bool:
+    """Whether a session has a block of a message after a deferral marker of one of its
+    calls: Claude Code paused at that call before the rest of the message arrived."""
+    message_of: dict[str, Any] = {}  # call id -> its message's id
+    paused: set[Any] = set()  # messages with a deferral marker so far
+    for entry in entries:
+        message = entry.get("message")
+        if entry.get("type") == "assistant" and isinstance(message, dict):
+            if message.get("id") in paused:
+                return True
+            for block in message.get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    message_of[str(block.get("id"))] = message.get("id")
+        attachment = entry.get("attachment")
+        if (
+            entry.get("type") == "attachment"
+            and isinstance(attachment, dict)
+            and attachment.get("type") == "hook_deferred_tool"
+            and str(attachment.get("toolUseID")) in message_of
+        ):
+            paused.add(message_of[str(attachment.get("toolUseID"))])
+    return False
+
 
 RESUME_LINE = "Continue from where you left off."
 """The line Claude Code adds when it continues a turn by itself, as it does after a
@@ -163,6 +193,9 @@ class FakeMessagesAPI:
         """When set, requests that offer durable tools get this HTTP error."""
         self.fail_message = "rejected"
         """The error message sent with ``fail_status``."""
+        self.pause_after_call = 0.0
+        """Seconds to wait after each tool_use block of a streamed answer, before the
+        rest of it (Claude Code starts a call as soon as its block ends)."""
         self.errors: list[str] = []
         self.requests: list[dict[str, Any]] = []
         self._ids = itertools.count(1)
@@ -320,6 +353,12 @@ class FakeMessagesAPI:
                 f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
             )
             handler.wfile.flush()
+            if (
+                self.pause_after_call
+                and event["type"] == "content_block_stop"
+                and blocks[event["index"]]["type"] == "tool_use"
+            ):
+                time.sleep(self.pause_after_call)
         handler.close_connection = True
 
     def tool_use(self, name: str, args: dict[str, Any]) -> dict[str, Any]:

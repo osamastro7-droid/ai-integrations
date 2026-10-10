@@ -33,7 +33,12 @@ from temporalio.worker import Worker
 from tests.endless.activities import ALL as COUNTING
 from tests.engine_tools.policy import edit_once_policy, file_policy, shell_policy
 from tests.engine_tools.workflows import ShellOptions, ShellWorkflow
-from tests.helpers.fake_messages_api import engine_env, start_with_policy
+from tests.helpers.fake_messages_api import (
+    SLOW_MODEL_SECONDS,
+    engine_env,
+    history_of,
+    start_with_policy,
+)
 from tests.helpers.workers import FAIL_FAST
 from tests.test_crash import wait_until
 from tests.test_workflow_engine import hang_on_request
@@ -457,16 +462,21 @@ async def test_real_engine_an_mcp_server_gets_the_calls_own_id_in_every_attempt(
     assert api.errors == []
 
 
+@pytest.mark.parametrize("model", ["quick", "slow"])
 @pytest.mark.parametrize("order", ["bash first", "count first"])
 async def test_real_engine_bash_and_a_durable_tool_in_one_message(
-    client: Client, tmp_path: Path, order: str
+    client: Client, tmp_path: Path, order: str, model: str
 ) -> None:
     """Bash first: it pauses the segment and ``count`` runs beside it. Count first:
-    Bash after the pause is denied, and Claude calls it again in its next turn."""
+    Bash after the pause is denied, and Claude calls it again in its next turn. Also
+    with a model that takes its time after each call, so the engine pauses at the
+    first call before the second arrives."""
     from tests.engine_tools.policy import together_policy
 
     effects = tmp_path / "effects.log"
     api = start_with_policy(together_policy)
+    if model == "slow":
+        api.pause_after_call = SLOW_MODEL_SECONDS
     runner = make_runner(tmp_path, api)
     queue = f"together-{uuid.uuid4().hex[:8]}"
     try:
@@ -490,6 +500,14 @@ async def test_real_engine_bash_and_a_durable_tool_in_one_message(
     assert kinds.count("run_claude_tool_step") == 1 and kinds.count("count") == 1
     segments = kinds.count("run_claude_segment")
     assert segments == (2 if order == "bash first" else 3)
+    # Count first: Claude saw the Bash call it made with count, with its denial.
+    denied = {
+        h.id
+        for body in api.requests
+        for h in history_of(body)[2]
+        if h.name == "Bash" and h.is_error
+    }
+    assert len(denied) == (0 if order == "bash first" else 1)
     assert api.errors == []
 
 

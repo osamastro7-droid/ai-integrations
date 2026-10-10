@@ -33,6 +33,7 @@ from temporalio.claude_agent_sdk import (
     _runner,
 )
 from tests.helpers.fake_messages_api import (
+    SLOW_MODEL_SECONDS,
     FakeMessagesAPI,
     engine_env,
     history_of,
@@ -272,12 +273,14 @@ async def test_the_store_loads_sessions_without_saved_cost_totals() -> None:
     assert _runner._without_cost_state([]) == []  # type: ignore[reportPrivateUsage]
 
 
+@pytest.mark.parametrize("model", ["quick", "slow"])
 @pytest.mark.parametrize("mode", ["held", "store"])
 async def test_parallel_calls_all_run_and_every_result_reaches_claude(
-    tmp_path: Path, mode: str
+    tmp_path: Path, mode: str, model: str
 ) -> None:
     """Claude calls three tools in one message: all three run, and the next step shows
-    Claude every call with its own result."""
+    Claude every call with its own result. Also when the model takes its time after
+    each call, so the engine pauses at the first before the others arrive."""
     ref: list[FakeMessagesAPI] = []
 
     def all_at_once(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -298,6 +301,8 @@ async def test_parallel_calls_all_run_and_every_result_reaches_claude(
     api = FakeMessagesAPI(all_at_once)
     ref.append(api)
     api.start()
+    if model == "slow":
+        api.pause_after_call = SLOW_MODEL_SECONDS
     try:
         runner = _make_runner(api, tmp_path, mode)
         paused, final = await _drive(
@@ -316,12 +321,14 @@ async def test_parallel_calls_all_run_and_every_result_reaches_claude(
     assert runner.stub_calls == 0
 
 
+@pytest.mark.parametrize("model", ["quick", "slow"])
 @pytest.mark.parametrize("mode", ["held", "store"])
 async def test_builtin_and_durable_calls_mixed_in_one_message(
-    tmp_path: Path, mode: str
+    tmp_path: Path, mode: str, model: str
 ) -> None:
     """[Glob, durable, durable, Glob]: the first Glob runs in the engine, both durable
-    calls run, and the Glob after them is denied, so Claude calls it again."""
+    calls run, and the Glob after them is denied, so Claude calls it again. Also with
+    a model that takes its time after each call."""
     (tmp_path / "found.txt").write_text("here")
     ref: list[FakeMessagesAPI] = []
 
@@ -358,6 +365,8 @@ async def test_builtin_and_durable_calls_mixed_in_one_message(
     api = FakeMessagesAPI(mixed)
     ref.append(api)
     api.start()
+    if model == "slow":
+        api.pause_after_call = SLOW_MODEL_SECONDS
     try:
         runner = _make_runner(api, tmp_path, mode)
         paused, final = await _drive(

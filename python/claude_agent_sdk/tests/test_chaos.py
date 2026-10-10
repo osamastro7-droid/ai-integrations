@@ -18,8 +18,10 @@ end:
 
 Each run takes minutes, so the test runs only when ``CHAOS_RUNS`` sets the number of
 seeds per conversation mode (``CHAOS_SEED`` is the first one), for example:
-``CHAOS_RUNS=50 make test PYTEST_ARGS=tests/test_chaos.py``. With ``CHAOS_LOG`` set to
-a file, each passed run adds a line to it: its seed, mode, kills and outcome.
+``CHAOS_RUNS=50 make test PYTEST_ARGS=tests/test_chaos.py``. With ``CHAOS_SLOW=1`` the
+model takes its time after each call in some runs (0.5 or 1.5 s), so Claude Code
+pauses at a call before the rest of its message arrives. With ``CHAOS_LOG`` set to a
+file, each passed run adds a line to it: its seed, mode, kills and outcome.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from tests.engine_tools.workflows import ShellOptions, ShellWorkflow
 from tests.helpers.fake_messages_api import FakeMessagesAPI, engine_env
 
 RUNS = int(os.environ.get("CHAOS_RUNS", "0"))
+SLOW = os.environ.get("CHAOS_SLOW") == "1"
 FIRST = int(os.environ.get("CHAOS_SEED", "0"))
 MAX_KILLS = 3
 KINDS = ["run_claude_segment", "run_claude_tool_step"]
@@ -185,6 +188,10 @@ async def test_chaos(
     live: dict[str, Any] = {}  # the Workflow's handle and result, once it started
     api = FakeMessagesAPI(agent.decide).start()
     agent.api = api
+    if SLOW:  # its own draw: the kills of a seed stay as they were
+        api.pause_after_call = random.Random(f"slow-{mode}-{seed}").choice(
+            [0.0, 0.5, 1.5]
+        )
 
     async def new_worker() -> None:
         n = len(workers)
@@ -318,6 +325,7 @@ async def test_chaos(
         line = {
             "seed": seed,
             "mode": mode,
+            "pause": api.pause_after_call,
             "kills": kills,
             "calls": sum(len(m) for m in agent.plan),
             "interrupted": seen.interrupted,
