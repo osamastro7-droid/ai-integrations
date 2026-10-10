@@ -3,9 +3,10 @@
 The engine runs this file as a plain script (standard library only, so it starts in
 tens of milliseconds) for every tool call. It answers "defer" for durable tools and
 for the Claude Code tools that run as their own Activities (``$TCA_TOOL_ACTIVITIES``,
-name patterns), so the Workflow runs them. It never answers "allow" for them in a
-segment: on a resumed paused call, "allow" sends the engine down its auto-resume
-path, where a later "defer" is ignored.
+name patterns), so the Workflow runs them. In a segment it answers "allow" for them
+only for a call that waits for its own tool step (warm tool calls, below), never for
+a resumed paused call: there "allow" sends the engine down its auto-resume path,
+where a later "defer" is ignored.
 
 Tool steps: with ``$TCA_ALLOW_ID`` set, the engine resumed a copy of the session that
 ends before a Claude Code tool call, and a stand-in model sent the call again, to run
@@ -52,6 +53,20 @@ results as its next message (the runner's ``warm_engines``). Its environment is 
 when it starts, so the calls answered since then are in ``$TCA_HOOK_DIR/answered``
 (one id per line), and the runner clears ``paused_call`` and ``denied`` before each
 of its turns.
+
+Warm tool calls: in an engine that may stay warm (``$TCA_WAIT_SECONDS`` set), the call
+of a Claude Code tool that runs as an Activity can wait in the engine for its tool
+step instead of ending the turn. The hook writes ``waiting`` (the call's id, and its
+input as the hook sees it, with its digest) and waits for the runner's decision
+(``decision-<id>``): ``defer`` (the segment pauses as above), or ``allow`` with that
+digest, which only the call's own tool step on this Worker writes (the call then
+runs here, as it would in a step of its own).
+Anything else denies the call, and it never runs: the run stopped (``stop``), its
+folder or its Worker is gone, or the wait reached ``$TCA_WAIT_SECONDS`` (the runner
+ends the engine sooner, after ``warm_seconds``). After a call that ran in its step,
+the ``PostToolBatch`` hook (``after_calls``) holds the turn until the next segment
+takes the engine (``turn_go``), so Claude is asked nothing in between; if the run
+ends first, it stops the turn.
 """
 
 from __future__ import annotations
@@ -111,6 +126,34 @@ step's call run (with the call's id in it): from then on, the call may have run.
 runner creates it (empty) when the step ends, if the hook has not: then the call
 never runs."""
 
+WAITING = "waiting"
+"""The file in ``$TCA_HOOK_DIR`` where the hook names the call that waits for its tool
+step (warm tool calls), one line each: the call's id, ``input_digest`` of its input,
+and the input itself as the hook saw it, as canonical JSON (Claude Code has made a
+relative ``file_path`` absolute by then)."""
+
+DECISION = "decision-"
+"""Where the runner puts its decision on the waiting call: the file ``decision-`` plus
+``denial_name`` of the call's id in ``$TCA_HOOK_DIR``, written whole and renamed into
+place (a new name each time, so no open file is ever replaced, which Windows refuses):
+``defer``, or ``allow <input digest>``."""
+
+TURN_GATE = "turn_gate"
+"""Created by the runner just before it lets a waiting call run: the ``PostToolBatch``
+hook then holds the turn after the call, until the next segment takes the engine."""
+
+TURN_WAITS = "turn_waits"
+"""Created by the ``PostToolBatch`` hook while it holds the turn."""
+
+TURN_GO = "turn_go"
+"""Created by the runner when the next segment took the engine: the turn goes on."""
+
+WAIT_FAST_SECONDS = 0.25
+"""For this long, a waiting hook looks for news every millisecond; then less often."""
+
+WAIT_SLOW_POLL_SECONDS = 0.025
+"""The longest time between two looks of a waiting hook."""
+
 REASON_KEYS = {
     NOT_RUN: "not_run",
     STOPPED: "stopped",
@@ -131,13 +174,17 @@ def denial_name(tool_use_id: str) -> str:
     return hashlib.sha256(tool_use_id.encode("utf-8")).hexdigest()
 
 
+def canonical_input(tool_input: Any) -> str:
+    """A tool call's input as canonical JSON: ASCII, one line, keys sorted."""
+    return json.dumps(tool_input, sort_keys=True, separators=(",", ":"))
+
+
 def input_digest(tool_input: Any) -> str:
     """The SHA-256 of a tool call's input as canonical JSON (``$TCA_ALLOW_INPUT``).
 
     ASCII JSON, so any string can be hashed (a lone surrogate too).
     """
-    text = json.dumps(tool_input, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(text.encode("ascii")).hexdigest()
+    return hashlib.sha256(canonical_input(tool_input).encode("ascii")).hexdigest()
 
 
 def _deny(reason: str = NOT_RUN) -> dict[str, Any]:
@@ -244,6 +291,117 @@ def _runs_as_activity(name: str) -> bool:
     return any(p and fnmatch.fnmatchcase(name, p) for p in patterns)
 
 
+def _ended(run_dir: str) -> bool:
+    """Whether the run a waiting hook belongs to is over: stopped, folder gone, Worker gone."""
+    return (
+        not os.path.isdir(run_dir)
+        or os.path.exists(os.path.join(run_dir, "stop"))
+        or _worker_gone(run_dir)
+    )
+
+
+def _wait_seconds() -> float:
+    """How long a hook may wait (``$TCA_WAIT_SECONDS``; 0: calls never wait)."""
+    try:
+        seconds = float(os.environ.get("TCA_WAIT_SECONDS") or 0)
+    except ValueError:
+        return 0.0
+    return seconds if seconds > 0 and seconds != float("inf") else 0.0
+
+
+def _pause(started: float) -> None:
+    """Sleep between two looks: 1 ms at first, then up to ``WAIT_SLOW_POLL_SECONDS``."""
+    import time
+
+    waited = time.monotonic() - started
+    if waited < WAIT_FAST_SECONDS:
+        time.sleep(0.001)
+    else:
+        time.sleep(min(WAIT_SLOW_POLL_SECONDS, 0.001 + waited / 100))
+
+
+def _wait_for_step(
+    run_dir: str, tool_use_id: str, tool_input: Any, seconds: float
+) -> dict[str, Any]:
+    """Let a call wait for its tool step; return the hook's answer for it.
+
+    Writes ``waiting`` first (only one call per run can: the one that paused it).
+    ``allow`` lets the call run only with the digest of the input it has, and only if
+    its start can be recorded (``_note_allowed``). ``defer`` defers it, as without
+    waiting. Anything else denies it: the run ended, or no decision came in time.
+    """
+    import time
+
+    text = canonical_input(tool_input)
+    digest = hashlib.sha256(text.encode("ascii")).hexdigest()
+    path = os.path.join(run_dir, WAITING)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        # Another call's wait was not cleared: do not wait, pause as without waiting.
+        return {"hookEventName": "PreToolUse", "permissionDecision": "defer"}
+    except OSError:
+        return _deny(STOPPED)  # the folder is gone: the run ended
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"{tool_use_id}\n{digest}\n{text}")
+        started = time.monotonic()
+        decision = os.path.join(run_dir, DECISION + denial_name(tool_use_id))
+        while time.monotonic() - started < seconds:
+            try:
+                with open(decision, encoding="utf-8") as handle:
+                    words = handle.read().split()
+            except OSError:
+                words = []
+            if words[:1] == ["defer"]:
+                return {"hookEventName": "PreToolUse", "permissionDecision": "defer"}
+            if words[:1] == ["allow"]:
+                if words[1:] != [digest]:
+                    return _deny(OTHER_INPUT)  # not the input the step was given
+                if not _note_allowed(run_dir, tool_use_id):
+                    return _deny(STOPPED)  # the step is over: the call must not run
+                return {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
+            if _ended(run_dir):
+                break
+            _pause(started)
+        return _deny(STOPPED)
+    finally:
+        try:
+            os.remove(path)  # a later call of this engine may wait in its turn
+        except OSError:
+            pass
+
+
+def after_calls() -> dict[str, Any]:
+    """The ``PostToolBatch`` hook: after a call that ran in its tool step, hold the turn.
+
+    Only while the runner's ``turn_gate`` is there: other batches go on at once. It
+    returns once the next segment took the engine (``turn_go``). If the run ends first
+    (stopped, folder or Worker gone, or ``$TCA_WAIT_SECONDS`` passed), it stops the
+    turn, so no model request goes out.
+    """
+    import time
+
+    run_dir = os.environ.get("TCA_HOOK_DIR")
+    if run_dir is None or not os.path.exists(os.path.join(run_dir, TURN_GATE)):
+        return {}
+    stop = {"continue": False, "stopReason": STOPPED}
+    try:
+        with open(os.path.join(run_dir, TURN_WAITS), "w", encoding="utf-8"):
+            pass
+    except OSError:
+        return stop  # the folder is gone: the run ended
+    started = time.monotonic()
+    seconds = _wait_seconds()
+    while time.monotonic() - started < seconds:
+        if _ended(run_dir):
+            break  # also with a go: the segment that gave it is gone
+        if os.path.exists(os.path.join(run_dir, TURN_GO)):
+            return {}
+        _pause(started)
+    return stop
+
+
 def decide(event: dict[str, Any]) -> dict[str, Any]:
     """Return the ``hookSpecificOutput`` for one PreToolUse event.
 
@@ -319,6 +477,18 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
                         output = _deny()
             except OSError:
                 output = _deny(STOPPED)  # the folder went meanwhile: the run ended
+        seconds = _wait_seconds()
+        if (
+            seconds > 0
+            and run_dir is not None
+            and output.get("permissionDecision") == "defer"
+            and not name.startswith(DURABLE_PREFIX)
+            and not stopped
+        ):
+            # Warm tool calls: wait here for the call's own tool step, or a "defer".
+            output = _wait_for_step(
+                run_dir, tool_use_id, event.get("tool_input"), seconds
+            )
     if run_dir is not None and os.path.isdir(run_dir):
         _record(run_dir, tool_use_id, output)
     log = os.environ.get("TCA_HOOK_LOG")
@@ -345,6 +515,18 @@ def main() -> None:
     the answer cannot be written, exit code 2 denies the call.
     """
     event: Any = None
+    if sys.argv[1:2] == ["after-calls"]:  # the PostToolBatch hook (warm tool calls)
+        try:
+            sys.stdin.buffer.read()  # the event: nothing in it is needed
+            answer = after_calls()
+        except BaseException:  # stop the turn rather than let it go on unheld
+            answer = {"continue": False, "stopReason": FAILED}
+        try:
+            sys.stdout.write(json.dumps(answer) + "\n")
+            sys.stdout.flush()
+        except BaseException:
+            os._exit(2)
+        return
     try:
         event = json.loads(sys.stdin.buffer.read().decode("utf-8"))
         output = decide(event)

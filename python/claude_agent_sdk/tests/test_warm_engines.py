@@ -500,8 +500,8 @@ async def test_a_taken_warm_engine_never_leaks(
     async def nothing(self: Any) -> None:
         del self
 
-    async def check(self: Any, inp: Any) -> bool:
-        del self, inp
+    async def check(self: Any, inp: Any, warm: Any) -> bool:
+        del self, inp, warm
         if failure == "store-down":
             raise OSError("the store is down")
         return True

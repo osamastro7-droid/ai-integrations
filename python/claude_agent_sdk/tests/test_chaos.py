@@ -18,10 +18,12 @@ end:
 
 Each run takes minutes, so the test runs only when ``CHAOS_RUNS`` sets the number of
 seeds per conversation mode (``CHAOS_SEED`` is the first one), for example:
-``CHAOS_RUNS=50 make test PYTEST_ARGS=tests/test_chaos.py``. With ``CHAOS_SLOW=1`` the
-model takes its time after each call in some runs (0.5 or 1.5 s), so Claude Code
-pauses at a call before the rest of its message arrives. With ``CHAOS_LOG`` set to a
-file, each passed run adds a line to it: its seed, mode, kills and outcome.
+``CHAOS_RUNS=50 make test PYTEST_ARGS=tests/test_chaos.py``. With ``CHAOS_WARM=1`` the
+Workers keep warm engines, so calls wait in them for their tool steps and kills land
+there too. With ``CHAOS_SLOW=1`` the model takes its time after each call in some runs
+(0.5 or 1.5 s), so Claude Code pauses at a call before the rest of its message
+arrives. With ``CHAOS_LOG`` set to a file, each passed run adds a line to it: its
+seed, mode, kills and outcome.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ from tests.engine_tools.workflows import ShellOptions, ShellWorkflow
 from tests.helpers.fake_messages_api import FakeMessagesAPI, engine_env
 
 RUNS = int(os.environ.get("CHAOS_RUNS", "0"))
+WARM = os.environ.get("CHAOS_WARM") == "1"
 SLOW = os.environ.get("CHAOS_SLOW") == "1"
 FIRST = int(os.environ.get("CHAOS_SEED", "0"))
 MAX_KILLS = 3
@@ -201,6 +204,7 @@ async def test_chaos(
             "RUNNER_MODE": mode,
             "SESSION_DIR": str(tmp_path / "sessions"),
             "SHOP_DIR": str(tmp_path / "shop"),
+            "WARM_ENGINES": "4" if WARM else "0",
         }
         workers.append(await start_worker(address, queue, env, tmp_path / f"w{n}"))
 
@@ -325,6 +329,7 @@ async def test_chaos(
         line = {
             "seed": seed,
             "mode": mode,
+            "warm": WARM,
             "pause": api.pause_after_call,
             "kills": kills,
             "calls": sum(len(m) for m in agent.plan),

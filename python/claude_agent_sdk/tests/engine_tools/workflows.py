@@ -105,3 +105,8 @@ class ShellWorkflow:
     def tool_calls(self) -> list[dict[str, Any]]:
         """Every tool call of this run, with its status."""
         return self.agent.tool_calls
+
+    @workflow.query
+    def total_cost_usd(self) -> float:
+        """The model cost the segments reported, in USD."""
+        return self.agent.total_cost_usd

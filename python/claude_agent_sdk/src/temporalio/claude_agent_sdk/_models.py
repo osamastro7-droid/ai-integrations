@@ -44,11 +44,13 @@ class ToolOutcome:
         is_error: Whether the call failed; Claude sees the content as an error.
         blocks: Content blocks (text, images) to hand back exactly as they are,
             instead of ``content``: what a Claude Code tool returned.
-        entry: For an Edit or a Write that ran in a tool step: Claude Code's own
-            transcript entry for the result, without the result itself (that is
-            ``content`` or ``blocks``). The next segment puts it where the call's
-            result belongs, so Claude Code continues from its own record of the call
-            (without it, the segment writes a record of the same shape).
+        entry: For an Edit or a Write that ran in a tool step, and for any call that
+            waited for its tool step in a warm engine (``warm_engines``): Claude
+            Code's own transcript entry for the result, without the result itself
+            (that is ``content`` or ``blocks``), or one of the same shape. The next
+            segment puts it where the call's result belongs, so Claude Code continues
+            from its own record of the call (without it, the segment writes a record
+            of the same shape).
     """
 
     content: Any = None

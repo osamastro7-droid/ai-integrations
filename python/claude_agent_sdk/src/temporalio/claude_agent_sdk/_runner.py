@@ -77,11 +77,13 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import collections
 import contextlib
 import dataclasses
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -90,6 +92,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 import uuid
 import warnings
@@ -127,8 +130,13 @@ from ._conversation import external_storage_on, read_conversation, too_large
 from ._defer_hook import (
     ALLOWED,
     ANSWERED,
+    DECISION,
     REASON_KEYS,
     STOPPED,
+    TURN_GATE,
+    TURN_GO,
+    TURN_WAITS,
+    WAITING,
     WORKER_LOCK,
     denial_name,
     input_digest,
@@ -851,11 +859,30 @@ def _denied_after(
     return moved, delivered
 
 
+def _waiting_call_of(entry: Any) -> str | None:
+    """The call of an assistant entry that holds exactly one call and nothing else: the
+    checkpoint of a pause at a call that waited for its tool step (warm tool calls).
+
+    Any other pause ends at its deferral marker or after it (``_resume_point``).
+    """
+    if not isinstance(entry, dict) or entry.get("type") != "assistant":
+        return None
+    content = (entry.get("message") or {}).get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        return None
+    block = content[0]
+    if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id"):
+        return str(block["id"])
+    return None
+
+
 def _hook_span(entries: list[Any], checkpoint: str) -> tuple[int, int, str] | None:
     """Where a pause's hook entries are: (the first, the deferral marker, the call's id).
 
     The checkpoint is the marker, or a later entry when no user entry followed the
-    marker (see ``_resume_point``): then only attachments come between them.
+    marker (see ``_resume_point``): then only attachments come between them. After a
+    call that waited for its tool step, the checkpoint is the call's own entry, and
+    no hook entry follows it: (the entry after it, the call's entry, the call's id).
 
     Returns:
         None if the checkpoint is not in ``entries``, or is not right after a pause.
@@ -870,6 +897,9 @@ def _hook_span(entries: list[Any], checkpoint: str) -> tuple[int, int, str] | No
     )
     if end is None:
         return None
+    waiting = _waiting_call_of(entries[end])
+    if waiting is not None:  # the call waited for its step: no hook entries follow
+        return end + 1, end, waiting
     marker = end
     while marker >= 0 and _marker_of(entries[marker]) is None:
         entry = entries[marker]
@@ -1072,8 +1102,9 @@ def _place(
 ) -> tuple[list[Any], set[str]] | None:
     """The conversation with Claude Code's record of a paused call's result in it.
 
-    For a call of ``RECORDED_TOOLS``: the call's hook entries (and everything after
-    them) give way to the record (see ``_record``). Then come the denials of the
+    For a call of ``RECORDED_TOOLS``, and for any call that waited for its tool step
+    (it has no deferral marker to resume at): the call's hook entries (and everything
+    after them) give way to the record (see ``_record``). Then come the denials of the
     calls after the paused one, durable ones with their real results (as in
     ``_deliver``). Claude Code then holds the call as answered, and does not check it
     again; with no new message, it continues the turn by itself (``CONTINUE_ENV``).
@@ -1106,7 +1137,7 @@ def _place(
         ),
         None,
     )
-    if tool not in RECORDED_TOOLS:
+    if tool not in RECORDED_TOOLS and _waiting_call_of(entries[marker]) is None:
         return None
     record = _record(owner, paused, outcome, entries[:first])
     moved, delivered = _denied_after(entries, marker, paused, results, calls)
@@ -1198,9 +1229,46 @@ class _GuardedStore:
         self._inner = inner
         self._session_id = session_id
         self._checkpoint = checkpoint
+        self.written: set[str] = set()
+        """The transcript entries the engine wrote to its session (their uuids)."""
+        self.last: dict[str, Any] | None = None
+        """The last transcript entry the engine wrote to its session."""
+        self.calls: dict[str, list[str]] = {}
+        """The tool calls of each assistant message the engine wrote (by message id)."""
+        self.ran_here: set[str] = set()
+        """Calls that waited for their tool step and ran in this engine."""
+        self.results: dict[str, dict[str, Any]] = {}
+        """The engine's own result entries of calls in ``ran_here`` (a tool step takes
+        its call's, and drops the rest)."""
 
     async def append(self, key: Any, entries: Any) -> None:
+        mine = key.get("session_id") == self._session_id and not key.get("subpath")
+        if mine and self.ran_here:
+            # A call that ran here in its tool step: its result entry goes in as a
+            # tool step's record does, without Claude Code's metadata of the call (an
+            # Edit's holds the whole file as it was).
+            entries = [
+                {k: v for k, v in e.items() if k != "toolUseResult"}
+                if isinstance(e, dict) and self.ran_here.intersection(_result_ids(e))
+                else e
+                for e in entries
+            ]
         await self._inner.append(key, entries)
+        if not mine:
+            return
+        for entry in entries:
+            if not _is_transcript(entry):
+                continue
+            self.written.add(entry["uuid"])
+            self.last = entry
+            message = entry.get("message")
+            if entry.get("type") == "assistant" and isinstance(message, dict):
+                calls = self.calls.setdefault(str(message.get("id")), [])
+                for block in message.get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        calls.append(str(block.get("id")))
+            for call in self.ran_here.intersection(_result_ids(entry)):
+                self.results[call] = entry
 
     async def load(self, key: Any) -> Any:
         entries = await self._inner.load(key)
@@ -1291,17 +1359,57 @@ def _remove_hook_folder(hook_dir: str, tries: int = _REMOVE_TRIES) -> None:
     shutil.rmtree(gone, ignore_errors=True)
 
 
-def _hook_folder() -> str:
-    """A new folder with the settings file that registers the hook for every tool."""
+WAIT_MARGIN_SECONDS = 30.0
+"""How much longer than ``warm_seconds`` the hook of a waiting call may wait. The runner
+ends the engine at ``warm_seconds``; the hook's own limit only backs that up, and
+Claude Code's time limit for the hook is longer again, so the hook always answers."""
+
+ENTRY_SECONDS = 5.0
+"""How long a waiting call's entry may take to reach the session store. Claude Code
+writes its transcript every 100 ms in the middle of a turn (``FLUSH_INTERVAL_MS`` in
+2.1.274 and 2.1.295); if it takes longer, the call is deferred as without waiting."""
+
+ENTRY_POLL_SECONDS = 0.001
+"""How often the runner looks for a waiting call's entry."""
+
+WAITING_POLL_SECONDS = 0.005
+"""How often a segment looks for a call that waits in its engine's hook (``waiting``).
+The call's entry reaches the session store tens of milliseconds later anyway."""
+
+WAIT_MODES = frozenset({"default", "plan"})
+"""Permission modes in which a call may wait for its tool step in its segment's engine.
+In these, Claude Code's own permission check refuses the call if the hook ever gives
+no answer (a hook that waits long could be killed); in others (``acceptEdits``,
+``bypassPermissions``, auto mode) it could let the call run in the segment."""
+
+COST_SECONDS = 5.0
+"""How long the runner waits for an engine's running cost (``_engine_cost``)."""
+
+
+def _hook_folder(wait_seconds: float | None = None) -> str:
+    """A new folder with the settings file that registers the hook for every tool.
+
+    With ``wait_seconds`` (warm tool calls): a call may wait in the hook that long for
+    its tool step, and the turn after it as long (the ``PostToolBatch`` hook). Claude
+    Code's own time limit for these hooks is ``WAIT_MARGIN_SECONDS`` longer, so the
+    hook always answers first (a hook that times out gives no answer).
+    """
     hook_dir = tempfile.mkdtemp(prefix="tca-hook-")
-    settings = {
-        "hooks": {
-            "PreToolUse": [
-                # Every tool: built-in calls after a pause are denied too.
-                {"matcher": ".*", "hooks": [_hook_entry()]}
-            ]
-        }
+    pre = _hook_entry()
+    hooks: dict[str, Any] = {
+        "PreToolUse": [
+            # Every tool: built-in calls after a pause are denied too.
+            {"matcher": ".*", "hooks": [pre]}
+        ]
     }
+    if wait_seconds:
+        limit = math.ceil(wait_seconds + WAIT_MARGIN_SECONDS)
+        pre["timeout"] = limit
+        after = _hook_entry()
+        after["args"] = [*after["args"], "after-calls"]
+        after["timeout"] = limit
+        hooks["PostToolBatch"] = [{"matcher": "", "hooks": [after]}]
+    settings = {"hooks": hooks}
     Path(hook_dir, "settings.json").write_text(json.dumps(settings), encoding="utf-8")
     return hook_dir
 
@@ -1470,8 +1578,13 @@ async def _turn_messages(
     *,
     stay: bool = False,
     answered: Collection[str] = (),
+    source: AsyncIterator[Any] | None = None,
 ) -> AsyncGenerator[Any, None]:
     """An engine's messages until it exits. Its input ends once its own turn is over.
+
+    ``source``: where the messages come from, when not straight from the client (an
+    engine with an ``_Inbox``; a call that waits for its tool step comes through it
+    as a ``_WaitingCall``).
 
     The one-shot query ends the input at the first result that comes while no
     delegated agent runs. A resumed engine first repeats the result its session
@@ -1494,7 +1607,7 @@ async def _turn_messages(
     repeated = False
     tasks = False
     ending = False
-    async for message in client.receive_messages():
+    async for message in source if source is not None else client.receive_messages():
         yield message
         if ending:
             continue
@@ -1599,6 +1712,177 @@ async def _connected(
 
 
 @dataclasses.dataclass
+class _WaitingCall:
+    """A call that waits in its engine's hook for its tool step (warm tool calls)."""
+
+    id: str
+    digest: str
+    """``input_digest`` of the call's input, as the hook saw it."""
+    input: dict[str, Any]
+    """The call's input as the hook saw it: Claude Code has made a relative
+    ``file_path`` absolute by then, as in the input a paused call reports."""
+
+
+_END = object()
+"""The end of an engine's messages, in its ``_Inbox``."""
+
+
+class _ReaderFailed:
+    """The engine's message stream failed (in its ``_Inbox``)."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+
+class _Inbox:
+    """An engine's messages, read by a task of their own, kept until a step takes them.
+
+    An engine whose calls may wait for their tool steps serves a segment, then a tool
+    step, then the next segment, each its own Activity: none of them reads the
+    engine's stream to its end, so a reader does, and each takes what it needs.
+    """
+
+    def __init__(self) -> None:
+        self.items: collections.deque[Any] = collections.deque()
+        self.event = asyncio.Event()
+        self.reader: asyncio.Task[None] | None = None
+
+    def put(self, item: Any) -> None:
+        self.items.append(item)
+        self.event.set()
+
+    async def wait(self, timeout: float | None) -> None:
+        """Wait until something comes, or ``timeout`` passes."""
+        self.event.clear()
+        if self.items:
+            return
+        wake = (
+            None
+            if timeout is None
+            else asyncio.get_running_loop().call_later(timeout, self.event.set)
+        )
+        try:
+            await self.event.wait()
+        finally:
+            if wake is not None:
+                wake.cancel()
+
+    def stop(self) -> None:
+        if self.reader is not None:
+            self.reader.cancel()
+
+
+async def _read_engine(client: Any, feed: _Feed, inbox: _Inbox) -> None:
+    """Connect the engine and keep its messages in ``inbox`` until it exits."""
+    try:
+        await client.connect(feed.stream())
+        async for message in client.receive_messages():
+            inbox.put(message)
+    except BaseException as err:  # handed to whoever reads the inbox
+        inbox.put(_ReaderFailed(err))
+        if isinstance(err, asyncio.CancelledError):
+            raise
+    finally:
+        inbox.put(_END)
+
+
+def _read_waiting(hook_dir: str, seen: str | None = None) -> _WaitingCall | None:
+    """The call that waits in the engine's hook (``waiting``), if one does.
+
+    None while its record is being written, and for ``seen`` (already reported).
+    """
+    try:
+        with open(os.path.join(hook_dir, WAITING), encoding="utf-8") as handle:
+            call_id = handle.readline().rstrip("\n")
+            if not call_id or call_id == seen:
+                return None
+            digest = handle.readline().rstrip("\n")
+            text = handle.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        tool_input = json.loads(text)
+    except ValueError:
+        return None  # still being written
+    if not isinstance(tool_input, dict) or input_digest(tool_input) != digest:
+        return None  # still being written
+    return _WaitingCall(call_id, digest, tool_input)
+
+
+async def _inbox_messages(
+    inbox: _Inbox, hook_dir: str | None
+) -> AsyncGenerator[Any, None]:
+    """An engine's messages from its inbox.
+
+    With ``hook_dir``, also a ``_WaitingCall`` when a call starts to wait in the hook
+    (once per call).
+    """
+    seen: str | None = None
+    while True:
+        if inbox.items:
+            item = inbox.items.popleft()
+            if item is _END:
+                inbox.items.appendleft(item)  # every later reader sees the end too
+                return
+            if isinstance(item, _ReaderFailed):
+                raise item.error
+            yield item
+            continue
+        if hook_dir is not None:
+            waiting = _read_waiting(hook_dir, seen)
+            if waiting is not None:
+                seen = waiting.id
+                yield waiting
+                continue
+        await inbox.wait(WAITING_POLL_SECONDS if hook_dir is not None else None)
+
+
+def _decide(hook_dir: str, call_id: str, decision: str) -> None:
+    """Give the waiting call's hook the runner's decision (written whole, then renamed)."""
+    path = os.path.join(hook_dir, DECISION + denial_name(call_id))
+    partial = f"{path}.{uuid.uuid4().hex}.partial"
+    with open(partial, "w", encoding="utf-8") as handle:
+        handle.write(decision)
+    os.replace(partial, path)
+
+
+async def _mirror_flush(client: Any) -> None:
+    """Send what the engine wrote so far to the session store (the SDK batches it)."""
+    batcher = getattr(
+        getattr(client, "_query", None), "_transcript_mirror_batcher", None
+    )
+    if batcher is not None:
+        await batcher.flush()
+
+
+async def _engine_cost(client: Any) -> float | None:
+    """The engine's running cost in USD: what its next result would report.
+
+    Claude Code reports cost only when a turn ends; a call that waits for its tool step
+    is in the middle of one. Its ``get_usage`` control request answers mid-turn too,
+    with the same total (tested on Claude Code 2.1.273, 2.1.274, 2.1.288 and 2.1.295);
+    ``skip_behaviors`` leaves out its scan of recent sessions. Ask it only once the
+    call's entry is in the session store: Claude Code records a model request's cost
+    at the end of its stream, and may start a call before that. None if it cannot be
+    read.
+    """
+    send = getattr(getattr(client, "_query", None), "_send_control_request", None)
+    if send is None:
+        return None
+    try:
+        reply = await send(
+            {"subtype": "get_usage", "skip_behaviors": True}, timeout=COST_SECONDS
+        )
+    except Exception:
+        return None
+    session = reply.get("session") if isinstance(reply, dict) else None
+    total = session.get("total_cost_usd") if isinstance(session, dict) else None
+    if isinstance(total, bool) or not isinstance(total, (int, float)):
+        return None
+    return float(total) if math.isfinite(total) and total >= 0 else None
+
+
+@dataclasses.dataclass
 class _WarmEngine:
     """An engine that paused and stays running for the session's next segment.
 
@@ -1623,13 +1907,41 @@ class _WarmEngine:
     store: Any
     """The session store the engine mirrors into."""
     cost: float
-    """The engine's running cost total, to report each segment's own cost."""
+    """The engine's running cost total when its last segment ended, to report each
+    segment's own cost."""
     version: str
     ran_inside: list[str]
     violations: list[str]
     buffer: int
     """The engine's ``max_buffer_size``: a bigger result needs a new engine."""
     timer: asyncio.TimerHandle | None = None
+    inbox: _Inbox | None = None
+    """The engine's messages, when a reader of their own reads them (an engine whose
+    calls may wait for their tool steps)."""
+    state: str = "paused"
+    """``paused``: its turn ended at the durable call ``paused`` (the next segment
+    brings its result). ``call_waits``: the call ``paused`` waits in its hook for its
+    tool step (which can run it here). ``turn_waits``: that call ran here in its tool
+    step, and the turn waits right after it for the next segment."""
+    call_name: str = ""
+    """The waiting call's tool (``call_waits``)."""
+    digest: str = ""
+    """``input_digest`` of the waiting call's input, as its hook saw it."""
+    outcome: ToolOutcome | None = None
+    """What the call returned in its tool step (``turn_waits``): the next segment must
+    bring exactly this."""
+    view: _GuardedStore | None = None
+    """The engine's session store, as the engine sees it: what it wrote there."""
+    owner: dict[str, Any] | None = None
+    """The waiting call's own entry (``call_waits``): a record of its result is made
+    from it."""
+
+
+def _same_outcome(a: ToolOutcome, b: ToolOutcome) -> bool:
+    """Whether two outcomes of a call carry the same result (what Claude sees)."""
+    return bool(a.is_error) == bool(b.is_error) and _result_content(
+        a
+    ) == _result_content(b)
 
 
 def _forget_local_copy(paths: tuple[Path, ...]) -> None:
@@ -1657,10 +1969,18 @@ def _next_hook_turn(hook_dir: str, injected: dict[str, Any]) -> None:
 
     The hook allows one paused call per segment and records its denials per segment;
     the calls answered since the engine started are in ``answered`` (its environment
-    is fixed when it starts).
+    is fixed when it starts). After a warm tool call (``turn_waits``), the runner lets
+    the turn go on right after this.
     """
     with contextlib.suppress(OSError):
         os.remove(os.path.join(hook_dir, "paused_call"))
+    # A call that ran in its tool step (warm tool calls): its records go too.
+    for name in (WAITING, TURN_GATE, TURN_WAITS, TURN_GO, ALLOWED):
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(hook_dir, name))
+    for decision in Path(hook_dir).glob(DECISION + "*"):
+        with contextlib.suppress(OSError):
+            decision.unlink()
     shutil.rmtree(os.path.join(hook_dir, "denied"), ignore_errors=True)
     path = os.path.join(hook_dir, ANSWERED)
     with open(path, "a", encoding="utf-8") as handle:
@@ -2470,18 +2790,28 @@ class ClaudeAgentSdkRunner:
                 and with only the result of the paused call, the result goes to the
                 running engine as its next message: no new engine starts and
                 resumes the session (with a local fake model, a tool round was
-                about 7 times faster: 100 ms instead of 740 ms). In any other case
-                (another Worker, a retry, a reset, a longer wait) the warm engine
-                ends and the segment resumes from the checkpoint as usual. Each
-                warm engine keeps its process and memory (a few hundred MB);
-                ``ClaudeAgentPlugin`` ends them when its Worker stops. No engine
-                stays warm for segments with ``max_turns`` or ``max_budget_usd``,
-                calls answered in one message, Claude Code tools run as their own
-                Activities, or a runner whose ``extra_options`` has hooks, a
-                permission or ``stderr`` callback, or in-process MCP servers; with
-                the conversation in the Workflow, neither does the engine that
+                about 7 times faster: 100 ms instead of 740 ms). A call of a Claude
+                Code tool in ``tool_activities`` waits in the engine for its tool
+                step instead of ending the turn: the step, still its own Activity,
+                lets it run there when it comes to this Worker, and the turn then
+                waits right after the call for the next segment (a round with an
+                ``Edit``, a ``Write`` or Bash took about 0.14 to 0.24 s instead of
+                1.35 to 1.97 s). Calls wait only in the permission modes ``default``
+                and ``plan``, with a finite ``warm_seconds``, and one call per
+                message. In any other case (another Worker, a retry, a reset, a
+                longer wait) the warm engine ends, a call that waits there never
+                runs there, and the step or the segment runs from the checkpoint as
+                usual. Each warm engine keeps its process and memory (a few hundred
+                MB); ``ClaudeAgentPlugin`` ends them when its Worker stops. No
+                engine stays warm for segments with ``max_turns`` or
+                ``max_budget_usd``, calls answered in one message (calls in one
+                message never wait), or a runner whose ``extra_options`` has hooks,
+                a permission or ``stderr`` callback, or in-process MCP servers;
+                with the conversation in the Workflow, neither does the engine that
                 starts it. A resumed engine runs ``PreToolUse`` hooks again for the
-                call whose result it gets; a warm one does not.
+                call whose result it gets; a warm one does not. A warm engine keeps
+                Claude Code's own notes between calls, as one Claude Code run does
+                (for example, that a file changed on disk since Claude read it).
             warm_seconds: How long a paused engine stays warm.
             engine_cleanup: Whether each engine must end with this Worker process.
                 ``"required"`` (the default): if the engine cannot start through its
@@ -2503,7 +2833,7 @@ class ClaudeAgentSdkRunner:
                 ``engine_cleanup`` is not ``"required"`` or ``"best_effort"``.
         """
         _check_extra_options(extra_options or {})
-        if warm_engines < 0 or warm_seconds <= 0:
+        if warm_engines < 0 or not warm_seconds > 0:  # NaN too
             raise ValueError("warm_engines must be 0 or more, warm_seconds above 0")
         cleanup = cast("str", engine_cleanup)  # a caller may pass anything
         if cleanup not in ("required", "best_effort"):
@@ -2676,8 +3006,10 @@ class ClaudeAgentSdkRunner:
             )
         if attempt == 1 and not inp.fork:
             # Only a tool step's result (``entry``), or an error (a step that failed,
-            # a rejected call), can be an Edit's or a Write's: others go as before,
-            # with no read of the session here.
+            # a rejected call), can be an Edit's or a Write's, or the result of a call
+            # that waited for its step in a warm engine (its step returns a record for
+            # any tool: the session has no deferral marker to resume at). Others go as
+            # before, with no read of the session here.
             if any(o.entry is not None or o.is_error for o in injected.values()):
                 copied = await self._record_copy(inp, injected)
                 if copied is not None:
@@ -2816,6 +3148,22 @@ class ClaudeAgentSdkRunner:
             )
         )
 
+    def _may_wait(self, inp: SegmentInput) -> bool:
+        """Whether a call of a Claude Code tool in ``tool_activities`` may wait for its
+        tool step in this segment's engine (warm tool calls).
+
+        Only in an engine that may stay warm, with a finite ``warm_seconds``, and in a
+        permission mode where Claude Code refuses the call if its hook ever gives no
+        answer (``WAIT_MODES``): a hook that waits long could be killed.
+        """
+        mode = self._extra.get("permission_mode", DEFAULT_PERMISSION_MODE)
+        return (
+            bool(inp.tool_activities)
+            and self._may_park(inp)
+            and math.isfinite(self._warm_seconds)
+            and mode in WAIT_MODES
+        )
+
     @staticmethod
     def _shape(inp: SegmentInput) -> str:
         """What an engine is started with that the next segment must share."""
@@ -2838,6 +3186,8 @@ class ClaudeAgentSdkRunner:
 
         Never for a retry: an earlier attempt may still run somewhere and go on from
         the same checkpoint; a retry starts a new engine, as without warm engines.
+        An engine whose call still waits for its tool step (``call_waits``) is never
+        taken: its step did not come to this Worker, so the call ran elsewhere.
         """
         if inp.checkpoint is None:
             return None
@@ -2846,19 +3196,38 @@ class ClaudeAgentSdkRunner:
             return None
         if warm.timer is not None:
             warm.timer.cancel()
-        payload = sum(len(_text(_result_content(o))) for o in injected.values())
-        if (
+        shared = (
             attempt == 1
             and inp.prompt is None
             and not inp.fork
             and self._may_park(inp)
             and set(injected) == {warm.paused}
-            and all(o.entry is None for o in injected.values())  # no tool step's
             and warm.shape == self._shape(inp)
-            and 8 * payload <= warm.buffer
             and _engine_alive(warm.client)
-        ):
-            return warm
+        )
+        if warm.state == "turn_waits":
+            # The call ran here in its tool step: the segment must bring exactly what
+            # the step returned, and the turn must still wait (had its after-calls
+            # hook died, it would have gone on without a segment).
+            assert warm.outcome is not None and warm.inbox is not None
+            went_on = any(
+                isinstance(m, (AssistantMessage, ResultMessage))
+                for m in warm.inbox.items
+            )
+            if (
+                shared
+                and not went_on
+                and _same_outcome(injected[warm.paused], warm.outcome)
+            ):
+                return warm
+        elif warm.state == "paused":
+            payload = sum(len(_text(_result_content(o))) for o in injected.values())
+            if (
+                shared
+                and all(o.entry is None for o in injected.values())  # no tool step's
+                and 8 * payload <= warm.buffer
+            ):
+                return warm
         self._end_warm(warm)
         return None
 
@@ -2890,6 +3259,13 @@ class ClaudeAgentSdkRunner:
         """
         if warm.timer is not None:
             warm.timer.cancel()
+        if warm.state != "paused":
+            # A call or a turn waits in a hook: the hook sees ``stop`` and denies the
+            # call (it never runs) or stops the turn (no model request follows).
+            # ``turn_gate`` first, so a call denied now does not let the turn go on.
+            for name in (TURN_GATE, "stop"):
+                with contextlib.suppress(OSError):
+                    Path(warm.hook_dir, name).touch()
         process = getattr(getattr(warm.client, "_transport", None), "_process", None)
         resumed = getattr(warm.client, "_materialized", None)
         task = asyncio.ensure_future(_disconnect(warm.client))
@@ -2900,22 +3276,33 @@ class ClaudeAgentSdkRunner:
             _stop_now(process, resumed)
             _release_worker_lock(warm.lock)
             _remove_hook_folder(warm.hook_dir)
+            if warm.inbox is not None:
+                warm.inbox.stop()
 
         task.add_done_callback(ended)
 
-    async def _ends_at_checkpoint(self, inp: SegmentInput) -> bool:
-        """Whether the shared session still ends at the segment's checkpoint.
+    async def _ends_at_checkpoint(self, inp: SegmentInput, warm: _WarmEngine) -> bool:
+        """Whether the shared session is still where the warm engine left it.
 
         A warm engine knows the session as it left it. When a segment from the same
         checkpoint ran on another Worker (a retry, or a reset), the session went on
         there, and only a new engine continues it right (in a copy, ``_SessionMoved``).
+        After a call that ran here in its tool step, the session also holds what the
+        engine wrote since the checkpoint (the call's result): every entry after the
+        checkpoint must be the engine's own.
         """
         key = {
             "project_key": project_key_for_directory(self._cwd),
             "session_id": inp.session_id,
         }
         entries = cast("list[Any]", await self._store.load(key) or [])
-        return _last_entry(entries) == inp.checkpoint
+        if warm.state != "turn_waits":
+            return _last_entry(entries) == inp.checkpoint
+        uuids = [e["uuid"] for e in entries if _is_transcript(e)]
+        if inp.checkpoint not in uuids or warm.view is None:
+            return False
+        after = uuids[uuids.index(inp.checkpoint) + 1 :]
+        return all(u in warm.view.written for u in after)
 
     def _end_all_warm(self) -> None:
         """End every warm engine, each in a task of its own (the Worker stopped).
@@ -2964,7 +3351,7 @@ class ClaudeAgentSdkRunner:
         warm = self._take_warm(inp, injected, attempt)
         if warm is not None:
             try:
-                fresh = await self._ends_at_checkpoint(inp)
+                fresh = await self._ends_at_checkpoint(inp, warm)
             except BaseException:
                 self._end_warm(warm)
                 raise
@@ -2979,7 +3366,8 @@ class ClaudeAgentSdkRunner:
                 True,
                 warm.store,
                 guard=inp.checkpoint,
-                delivered=set(),
+                # A call that ran in this engine has its result in it already.
+                delivered={warm.paused} if warm.state == "turn_waits" else set(),
                 warm=warm,
             )
         session_id, resume, delivered, guard, continuing = await self._start(
@@ -3057,7 +3445,8 @@ class ClaudeAgentSdkRunner:
                     True,
                     warm.store,
                     committed=committed,
-                    delivered=set(),
+                    # A call that ran in this engine has its result in it already.
+                    delivered={warm.paused} if warm.state == "turn_waits" else set(),
                     warm=warm,
                 )
             self._end_warm(warm)
@@ -3169,6 +3558,13 @@ class ClaudeAgentSdkRunner:
         a result the step already has is kept even if the engine fails afterwards,
         so the Activity is not retried for a call that ran.
 
+        With warm engines, the call may wait for this step in its segment's engine on
+        this Worker (see ``warm_engines``): for exactly that call, with the input its
+        hook saw, the step lets it run there instead (``_step_in_warm``). The engine
+        runs it as it would have in the segment, and the same rules hold: the hook
+        records the call's start before it runs, and a step that ends first makes
+        sure it never does.
+
         A step that fails says on which side of the call's start it failed: the hook
         writes ``allowed`` just before it lets the call run. Without that record, the
         call did not run only if the engine never got it, or the hook or Claude
@@ -3217,6 +3613,15 @@ class ClaudeAgentSdkRunner:
     async def _tool_step(self, step: ToolStepInput, allowed: list[bool]) -> ToolOutcome:
         """``run_tool_step``'s work; sets ``allowed[0]`` when the call may have run."""
         await self._prepare_engine()
+        waiting = self._take_waiting(step)
+        if waiting is not None:
+            return await self._step_in_warm(step, waiting, allowed)
+        return await self._step_in_new_engine(step, allowed)
+
+    async def _step_in_new_engine(
+        self, step: ToolStepInput, allowed: list[bool]
+    ) -> ToolOutcome:
+        """A tool step in a new engine (see ``run_tool_step``)."""
         call = step.call
         key = {
             "project_key": project_key_for_directory(self._cwd),
@@ -3451,7 +3856,10 @@ class ClaudeAgentSdkRunner:
             )
         is_error = bool(result.is_error)
         entry: dict[str, Any] | None = None
-        if call.name in RECORDED_TOOLS:
+        # The call waited for its step in a warm engine: its checkpoint is the call's
+        # own entry, with no deferral marker to resume at (see ``_hook_span``).
+        waited = span[0] == span[1] + 1
+        if call.name in RECORDED_TOOLS or waited:
             # Claude Code's own record, or one of the same shape (see ``_record``),
             # so the next segment never sends an Edit's result as a message.
             own = records[0] if len(records) == 1 else None
@@ -3605,7 +4013,24 @@ class ClaudeAgentSdkRunner:
             and all(k in (delivered or ()) for k in injected)
         )
         options: dict[str, Any] = {}
-        hook_dir = warm.hook_dir if warm is not None else _hook_folder()
+        # Warm tool calls: in a new engine that may stay warm, a call of a Claude Code
+        # tool that runs as an Activity can wait for its tool step (``_keeps_waiting``).
+        may_wait = warm is None and self._may_wait(inp) and not local_copy
+        wait_seconds = self._warm_seconds + WAIT_MARGIN_SECONDS
+        hook_dir = (
+            warm.hook_dir
+            if warm is not None
+            else _hook_folder(wait_seconds if may_wait else None)
+        )
+        inbox: _Inbox | None = warm.inbox if warm is not None else None
+        view: _GuardedStore | None = warm.view if warm is not None else None
+        waiting: _WaitingCall | None = None  # the call that waits for its tool step
+        waiting_cost = 0.0  # the engine's running cost then
+        waiting_entry: dict[str, Any] = {}  # the call's own entry, the checkpoint
+        calls_of_message: dict[
+            str, list[str]
+        ] = {}  # the main agent's calls, by message
+        tasks = False  # a task (an agent, a background command) started in this run
         # Durable tools the engine ran itself (must stay empty), and decisions hooks
         # in extra_options tried to make.
         ran_inside: list[str] = warm.ran_inside if warm is not None else []
@@ -3646,8 +4071,9 @@ class ClaudeAgentSdkRunner:
                     hook_dir,
                     self._cwd,
                     CONTINUE_ENV if waits else NEW_TURN_ENV,
-                    {},
+                    {"TCA_WAIT_SECONDS": str(wait_seconds)} if may_wait else {},
                 )
+                view = cast("_GuardedStore", options["session_store"])
             else:
                 ran_inside.clear()
                 violations.clear()
@@ -3671,15 +4097,43 @@ class ClaudeAgentSdkRunner:
                 if warm is not None:  # a warm engine: its next message
                     assert feed is not None
                     feed.put(await _as_messages(prompt))
+                    if warm.state == "turn_waits":
+                        # The call ran here in its tool step, and the turn waits right
+                        # after it: let it go on.
+                        Path(hook_dir, TURN_GO).touch()
                     messages = _turn_messages(
-                        client, feed, False, stay=True, answered=set(injected)
+                        client,
+                        feed,
+                        False,
+                        stay=True,
+                        answered=set(injected),
+                        source=(
+                            _inbox_messages(warm.inbox, hook_dir)
+                            if warm.inbox is not None
+                            else None
+                        ),
                     )
                 else:
                     job = _JobWatch(hook_dir, required=self._cleanup_required)
                     lock = _hold_worker_lock(hook_dir, required=self._cleanup_required)
                     first = await _as_messages(prompt)
                     opened: _Feed
-                    if self._may_park(inp) and not local_copy:
+                    if may_wait:
+                        feed = opened = _Feed(first)
+                        client = ClaudeSDKClient(ClaudeAgentOptions(**options))
+                        inbox = _Inbox()
+                        inbox.reader = asyncio.ensure_future(
+                            _read_engine(client, feed, inbox)
+                        )
+                        messages = _turn_messages(
+                            client,
+                            feed,
+                            resume,
+                            stay=True,
+                            answered=set(injected),
+                            source=_inbox_messages(inbox, hook_dir),
+                        )
+                    elif self._may_park(inp) and not local_copy:
                         feed = opened = _Feed(first)
                         client = ClaudeSDKClient(ClaudeAgentOptions(**options))
                         messages = _connected(client, feed, resume, set(injected))
@@ -3690,6 +4144,44 @@ class ClaudeAgentSdkRunner:
                         watch = _StartWatch(opened, CONTINUE_START_SECONDS)
                 async with contextlib.aclosing(messages):
                     async for message in messages:
+                        if isinstance(message, _WaitingCall):
+                            # From now on the turn stops after the call unless a
+                            # tool step lets it run here (``after_calls``), also
+                            # if this segment is cancelled or fails first. A go
+                            # this segment gave an earlier call's turn is spent:
+                            # left there, it would let this turn go on too.
+                            with contextlib.suppress(OSError):
+                                os.remove(os.path.join(hook_dir, TURN_GO))
+                            Path(hook_dir, TURN_GATE).touch()
+                            checked = await self._keeps_waiting(
+                                message, hook_dir, client, view, calls_of_message, tasks
+                            )
+                            if checked is not None:
+                                waiting = message
+                                waiting_cost, waiting_entry = checked
+                                break
+                            # As without waiting: the turn ends at the deferred call.
+                            with contextlib.suppress(OSError):
+                                os.remove(os.path.join(hook_dir, TURN_GATE))
+                            _decide(hook_dir, message.id, "defer")
+                            continue
+                        if (
+                            isinstance(message, SystemMessage)
+                            and message.subtype == "task_started"
+                        ):
+                            tasks = True
+                        if (
+                            isinstance(message, AssistantMessage)
+                            and message.parent_tool_use_id is None
+                        ):
+                            # Claude Code sends each block of a message on its own.
+                            calls_of_message.setdefault(
+                                message.message_id or "", []
+                            ).extend(
+                                b.id
+                                for b in message.content
+                                if isinstance(b, ToolUseBlock)
+                            )
                         if watch is not None:
                             if _turn_began(message):
                                 watch.heard()
@@ -3769,6 +4261,49 @@ class ClaudeAgentSdkRunner:
                 # Even with a result: its input had ended, so neither hooks nor
                 # in-process tools could answer during the turn.
                 raise _not_continued(await self._engine_version() or engine_version)
+            if waiting is not None:
+                assert client is not None and feed is not None and view is not None
+                out = await self._waiting_output(
+                    session_id,
+                    store,
+                    committed,
+                    waiting_entry,
+                    waiting,
+                    max(0.0, waiting_cost - (warm.cost if warm is not None else 0.0)),
+                )
+                if out.is_error:
+                    return out  # the engine ends: its hook denies the call
+                assert out.deferred is not None and out.checkpoint is not None
+                self._park(
+                    _WarmEngine(
+                        client=client,
+                        feed=feed,
+                        session_id=out.session_id,
+                        checkpoint=out.checkpoint,
+                        paused=waiting.id,
+                        shape=self._shape(inp),
+                        hook_dir=hook_dir,
+                        lock=lock,
+                        store=store,
+                        cost=waiting_cost,
+                        version=engine_version,
+                        ran_inside=ran_inside,
+                        violations=violations,
+                        buffer=(
+                            warm.buffer
+                            if warm is not None
+                            else int(options["max_buffer_size"])
+                        ),
+                        inbox=inbox,
+                        state="call_waits",
+                        call_name=out.deferred.name,
+                        digest=waiting.digest,
+                        view=view,
+                        owner=waiting_entry,
+                    )
+                )
+                parked = True
+                return out
             if warm is not None and result is None:
                 # The engine ended after it was taken (it was alive then): a new
                 # engine can do the step.
@@ -3821,12 +4356,21 @@ class ClaudeAgentSdkRunner:
                             if warm is not None
                             else int(options["max_buffer_size"])
                         ),
+                        inbox=inbox,
+                        view=view,
                     )
                 )
                 parked = True
             return out
         finally:
             if not parked:
+                if inbox is not None:
+                    # A hook may still wait (a call, or the turn after it): it denies
+                    # the call or stops the turn now, instead of when the engine is
+                    # made to exit.
+                    for name in (TURN_GATE, "stop"):
+                        with contextlib.suppress(OSError):
+                            Path(hook_dir, name).touch()
                 try:
                     if client is not None:
                         await _disconnect(client)
@@ -3834,6 +4378,8 @@ class ClaudeAgentSdkRunner:
                     _release_worker_lock(lock)
                     _remove_hook_folder(hook_dir)  # the hook denies from now on
                     _forget_local_copy(local_copy)
+                    if inbox is not None:
+                        inbox.stop()
 
     def _parks(
         self,
@@ -3870,6 +4416,253 @@ class ClaudeAgentSdkRunner:
             and not os.path.exists(os.path.join(hook_dir, "stop"))
             and _engine_alive(client)
         )
+
+    # ---- Warm tool calls: a call waits in its engine for its tool step ----
+
+    async def _keeps_waiting(
+        self,
+        call: _WaitingCall,
+        hook_dir: str,
+        client: Any,
+        view: _GuardedStore | None,
+        calls_of_message: dict[str, list[str]],
+        tasks: bool,
+    ) -> tuple[float, dict[str, Any]] | None:
+        """Whether the segment pauses with ``call`` waiting in its hook for its tool step.
+
+        Only when this run is not stopping and its hook denied nothing; when no task or
+        agent runs (an engine that ends would lose it); and when the call is the only
+        tool call of its message, once that message is complete in the session store
+        and the store ends with the call's entry (the pause's checkpoint). Claude Code
+        starts a call as soon as its block arrives, while the rest of the message may
+        still come, and writes the message's entries when it is complete, every 100 ms
+        in the middle of a turn: ``ENTRY_SECONDS`` is ample. Only one call of a
+        message may pause the run, so a message with more calls pauses as without
+        waiting.
+
+        Returns:
+            The engine's running cost then (``_engine_cost``) and the call's entry, or
+            None: the call is deferred, as without waiting.
+        """
+        stop = os.path.join(hook_dir, "stop")
+        if (
+            view is None
+            or os.path.exists(stop)
+            or _hook_denials(hook_dir)
+            or tasks
+            or _agents_running(client)
+        ):
+            return None
+        calls = next((c for c in calls_of_message.values() if call.id in c), None)
+        if calls is not None and calls != [call.id]:
+            return None
+        deadline = time.monotonic() + ENTRY_SECONDS
+        while True:
+            await _mirror_flush(client)
+            message_id = next((m for m, c in view.calls.items() if call.id in c), None)
+            stored = view.calls.get(message_id) if message_id is not None else None
+            if stored is not None and stored != [call.id]:
+                return None  # its message holds more calls than this one
+            last = view.last
+            if (
+                stored is not None
+                and last is not None
+                and _waiting_call_of(last) == call.id
+                and last["message"].get("stop_reason") == "tool_use"  # complete
+            ):
+                break  # the session ends with the call's entry
+            if (
+                stored is not None
+                and isinstance(last, dict)
+                and last.get("type") == "assistant"
+                and str((last.get("message") or {}).get("id")) == message_id
+                and _waiting_call_of(last) != call.id
+            ):
+                return None  # its message goes on after the call (a text block)
+            if time.monotonic() > deadline or os.path.exists(stop):
+                return None
+            await asyncio.sleep(ENTRY_POLL_SECONDS)
+        if calls_of_message.get(str(last["message"].get("id")), [call.id]) != [call.id]:
+            return None
+        total = await _engine_cost(client)
+        if total is None or _hook_denials(hook_dir) or os.path.exists(stop):
+            return None
+        return total, last
+
+    async def _waiting_output(
+        self,
+        session_id: str,
+        store: Any,
+        committed: list[dict[str, Any]] | None,
+        entry: dict[str, Any],
+        call: _WaitingCall,
+        cost: float,
+    ) -> SegmentOutput:
+        """The pause at a call that waits for its tool step.
+
+        The checkpoint is the call's own entry, which ``_keeps_waiting`` saw last in
+        the session. The call's input is the one its hook saw, as a paused call
+        reports it (with a relative ``file_path`` made absolute): its tool step must
+        bring exactly that input.
+        """
+        block = entry["message"]["content"][0]
+        out = SegmentOutput(
+            session_id=session_id,
+            deferred=DeferredCall(
+                id=call.id,
+                name=str(block.get("name")).removeprefix(PREFIX),
+                input=dict(call.input),
+                kind="engine",
+            ),
+            checkpoint=entry["uuid"],
+            cost_usd=cost,
+        )
+        out.external_storage = external_storage_on()
+        if committed is not None:
+            key = {
+                "project_key": project_key_for_directory(self._cwd),
+                "session_id": session_id,
+            }
+            entries = cast("list[dict[str, Any]]", await store.load(key) or [])
+            keep, covered = _kept(committed, entries)
+            out.transcript_keep = keep
+            out.transcript_add = _without_cost_state(entries[covered:])
+            problem = too_large(out)
+            if problem is not None:
+                return SegmentOutput(
+                    session_id=session_id, is_error=True, error=problem, cost_usd=cost
+                )
+        return out
+
+    def _take_waiting(self, step: ToolStepInput) -> _WarmEngine | None:
+        """The warm engine where this step's call waits, taken from the pool, or None.
+
+        Only for the call it paused at, with the input its hook saw, the same tools, and
+        the engine still running. Another warm engine at that checkpoint ends: the
+        step runs in a new engine, as without warm engines.
+        """
+        key = (step.session_id, step.checkpoint)
+        warm = self._warm.get(key)
+        if warm is None or warm.state != "call_waits":
+            return None
+        del self._warm[key]
+        if warm.timer is not None:
+            warm.timer.cancel()
+        shape = json.loads(warm.shape)
+        if (
+            warm.paused == step.call.id
+            and warm.call_name == step.call.name
+            and warm.digest == input_digest(step.call.input)
+            and shape[2]
+            == [[t.name, t.description, t.input_schema] for t in step.tools]
+            and shape[3] == list(step.builtin_tools)
+            and _engine_alive(warm.client)
+        ):
+            return warm
+        self._end_warm(warm)
+        return None
+
+    async def _step_in_warm(
+        self, step: ToolStepInput, warm: _WarmEngine, allowed: list[bool]
+    ) -> ToolOutcome:
+        """Run the call in the warm engine where it waits; the turn then waits after it.
+
+        The engine runs the call as it would have in its segment, and writes its own
+        result entry. Its ``PostToolBatch`` hook then holds the turn, so Claude is asked
+        nothing until the next segment takes the engine; if that does not happen here
+        within ``warm_seconds``, the turn stops and the engine ends.
+        """
+        call = step.call
+        hook_dir = warm.hook_dir
+        assert warm.inbox is not None
+        result: ToolResultBlock | None = None
+        stopper = (
+            asyncio.ensure_future(_stop_hooks_when_cancelled(hook_dir))
+            if activity.in_activity()
+            else None
+        )
+        try:
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(hook_dir, TURN_GO))
+            Path(hook_dir, TURN_GATE).touch()  # before the call can run
+            if warm.view is not None:
+                warm.view.ran_here.add(call.id)  # its record goes in without metadata
+            _decide(hook_dir, call.id, f"allow {warm.digest}")
+            async for message in _inbox_messages(warm.inbox, None):
+                if isinstance(message, UserMessage) and not isinstance(
+                    message.content, str
+                ):
+                    for content in message.content:
+                        if (
+                            isinstance(content, ToolResultBlock)
+                            and content.tool_use_id == call.id
+                        ):
+                            result = content
+                    if result is not None:
+                        break
+                elif isinstance(message, ResultMessage):
+                    break  # the turn ended without the call's result
+        except BaseException:
+            allowed[0] = _close_call(hook_dir)
+            self._end_warm(warm)
+            raise
+        finally:
+            if stopper is not None:
+                stopper.cancel()
+        allowed[0] = _close_call(hook_dir)
+        denials = _hook_denials(hook_dir)
+        if result is None and not allowed[0] and denial_name(call.id) not in denials:
+            # The engine ended before its hook let the call run, and now it never
+            # can (``_close_call``): run it in a new engine, as without warm engines.
+            self._end_warm(warm)
+            return await self._step_in_new_engine(step, allowed)
+        if result is None or denial_name(call.id) in denials:
+            self._end_warm(warm)
+            if result is None and allowed[0]:
+                raise ApplicationError(
+                    f"Claude Code was let run tool call {call.id} ({call.name}) in its "
+                    "step, but the step ended without its result."
+                )
+            text = _text(result.content) if result is not None else ""
+            raise ApplicationError(
+                f"Claude Code did not run tool call {call.id} ({call.name}) in its "
+                f"step: {text or 'no result'}",
+                non_retryable=True,
+            )
+        # A record of the result, for any tool, as a step in a new engine returns for
+        # a call that waited (there is no deferral marker to resume at): Claude Code's
+        # own if it already reached the store (it writes every 100 ms), else one of
+        # the same shape (``_record``).
+        own = None
+        if warm.view is not None:
+            own = warm.view.results.get(call.id)
+            warm.view.results.clear()  # only this call's was needed
+        entry: dict[str, Any] | None = None
+        if own is not None:
+            entry = _result_record(own)
+        elif warm.owner is not None:
+            entry = _result_record(_record(warm.owner, call.id, ToolOutcome(), []))
+        is_error = bool(result.is_error)
+        if isinstance(result.content, list):
+            outcome = ToolOutcome(
+                blocks=list(result.content), is_error=is_error, entry=entry
+            )
+        else:
+            text = _text(result.content)
+            saved = _saved_output_tail(
+                result.content, project_key_for_directory(self._cwd), warm.session_id
+            )
+            if saved is not None:
+                # As in a step of its own: the next segment may run elsewhere.
+                text += (
+                    "\n\nThe file named above was removed when the step that ran this "
+                    f"call ended. The output ends with:\n{saved}"
+                )
+            outcome = ToolOutcome(content=text, is_error=is_error, entry=entry)
+        warm.state = "turn_waits"
+        warm.outcome = outcome
+        self._park(warm)
+        return outcome
 
     async def _segment_output(
         self,

@@ -4,6 +4,9 @@ ROUND_BENCHMARK=1 runs it. ROUND_MODES (default "held,store"; add "-warm" to a m
 for warm_engines=4, as in "held-warm"), ROUND_TRIALS (3),
 ROUND_COUNT (20), ROUND_OUT (a JSON file). Latency is the time between successive
 model requests, as in the hybrid benchmark; wall time includes start and teardown.
+ROUND_TOOL picks what Claude calls in each round: the durable echo tool (``echo``, the
+default), or a Claude Code tool as a tool step: ``Bash``, ``Write``, or ``Read,Edit``
+(a Read in the first round, in the segment, then an Edit in each round).
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from temporalio.claude_agent_sdk import ClaudeAgentPlugin, ClaudeAgentSdkRunner
 from temporalio.client import Client
 from temporalio.worker import Worker
 from tests.bench.store import TranscriptStore
-from tests.bench.workflow import SegmentBenchmarkWorkflow
+from tests.bench.workflow import BuiltinBenchmarkWorkflow, SegmentBenchmarkWorkflow
 from tests.bench.workload import segment_echo
 from tests.helpers.fake_messages_api import FakeMessagesAPI, engine_env, history_of
 
@@ -37,14 +40,35 @@ pytestmark = [
 ]
 
 
-def rounds(round_count: int) -> FakeMessagesAPI:
+def rounds(
+    round_count: int, tool: str = "echo", work: Path = Path()
+) -> FakeMessagesAPI:
     holder: list[FakeMessagesAPI] = []
+
+    def call(n: int) -> dict[str, Any]:
+        api = holder[0]
+        if tool == "Bash":
+            return api.call("Bash", {"command": f"echo {n}", "description": "echo"})
+        if tool == "Write":
+            target = str(work / f"f{n}.txt")
+            return api.call("Write", {"file_path": target, "content": f"{n}\n"})
+        if tool == "Read,Edit":
+            notes = str(work / "notes.txt")
+            if n == 0:
+                return api.call("Read", {"file_path": notes})
+            edit = {
+                "file_path": notes,
+                "old_string": f"v{n - 1}",
+                "new_string": f"v{n}",
+            }
+            return api.call("Edit", edit)
+        return api.tool_use("echo", {"n": n})
 
     def decide(body: dict[str, Any]) -> list[dict[str, Any]]:
         _, _, history = history_of(body)
         if len(history) >= round_count:
             return [{"type": "text", "text": f"DONE {len(history)}"}]
-        return [holder[0].tool_use("echo", {"n": len(history)})]
+        return [call(len(history))]
 
     api = FakeMessagesAPI(decide)
     holder.append(api)
@@ -75,6 +99,7 @@ class CountingRunner(ClaudeAgentSdkRunner):
 
 async def test_rounds(client: Client, tmp_path: Path) -> None:
     modes = os.environ.get("ROUND_MODES", "held,store").split(",")
+    tool = os.environ.get("ROUND_TOOL", "echo")
     trials = int(os.environ.get("ROUND_TRIALS", "3"))
     count = int(os.environ.get("ROUND_COUNT", "20"))
     measurements: list[dict[str, Any]] = []
@@ -82,7 +107,8 @@ async def test_rounds(client: Client, tmp_path: Path) -> None:
         for mode in modes:
             root = tmp_path / f"{mode}-{trial}"
             root.mkdir()
-            api = rounds(count)
+            (root / "notes.txt").write_text("v0\n", encoding="utf-8")
+            api = rounds(count, tool, root)
             times: list[float] = []
             decide = api.decide
 
@@ -108,13 +134,24 @@ async def test_rounds(client: Client, tmp_path: Path) -> None:
                 async with Worker(
                     client,
                     task_queue=queue,
-                    workflows=[SegmentBenchmarkWorkflow],
+                    workflows=[SegmentBenchmarkWorkflow, BuiltinBenchmarkWorkflow],
                     activities=[segment_echo],
                     plugins=[ClaudeAgentPlugin(runner)],
                 ):
-                    answer = await client.execute_workflow(
-                        SegmentBenchmarkWorkflow.run, "work", id=queue, task_queue=queue
-                    )
+                    if tool == "echo":
+                        answer = await client.execute_workflow(
+                            SegmentBenchmarkWorkflow.run,
+                            "work",
+                            id=queue,
+                            task_queue=queue,
+                        )
+                    else:
+                        answer = await client.execute_workflow(
+                            BuiltinBenchmarkWorkflow.run,
+                            args=["work", tool],
+                            id=queue,
+                            task_queue=queue,
+                        )
                 elapsed = time.monotonic() - started
                 assert answer == f"DONE {count}", answer
                 assert len(times) == len(model_requests(api)) == count + 1
@@ -123,6 +160,7 @@ async def test_rounds(client: Client, tmp_path: Path) -> None:
                 measurements.append(
                     {
                         "mode": mode,
+                        "tool": tool,
                         "trial": trial + 1,
                         "rounds": count,
                         "process_starts": runner.starts,
