@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,6 +19,67 @@ run: the call may have run, in full or in part."""
 TRY_AGAIN = "try_again"
 """Key in the details of a ``ToolCallNotRun`` failure: whether the Workflow may run
 the call in a new attempt (see ``ToolStepRetry``)."""
+
+WORKSPACE_NOT_FOUND = "WorkspaceNotFound"
+"""Type of the ``ApplicationError`` of a step whose agent's workspace snapshot cannot
+be restored: an object of it is not in the workspace store. Not retryable."""
+
+WORKSPACE_CORRUPT = "WorkspaceCorrupt"
+"""Type of the ``ApplicationError`` of a step whose agent's workspace snapshot cannot
+be restored: an object of it does not match its key, or is not valid. Not retryable."""
+
+WORKSPACE_TOO_LARGE = "WorkspaceTooLarge"
+"""Type of the ``ApplicationError`` of a step whose agent's folder holds more bytes of
+files than ``workspace_max_bytes``. Not retryable."""
+
+WORKSPACE_INVALID = "WorkspaceInvalid"
+"""Type of the ``ApplicationError`` of a step whose agent's folder cannot be used: its
+id is not a plain name, it is a link or a file, a file in it cannot be read, or a link
+in it cannot be created. Not retryable."""
+
+
+_WORKSPACE_ID = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?")
+_WINDOWS_DEVICES = frozenset(
+    ["con", "prn", "aux", "nul", "conin$", "conout$"]
+    + [f"com{i}" for i in range(10)]
+    + [f"lpt{i}" for i in range(10)]
+)
+
+
+def windows_device_name(name: str) -> bool:
+    """Whether Windows keeps ``name`` for a device (``con``, ``nul.txt``, ...)."""
+    return name.split(".")[0].lower() in _WINDOWS_DEVICES
+
+
+def workspace_id_ok(value: Any) -> bool:
+    """Whether ``value`` can name an agent's folder on any system.
+
+    1 to 128 letters, digits, ``.``, ``_`` or ``-``, starting and ending with a letter
+    or a digit, and not a name Windows keeps for a device.
+    """
+    return (
+        isinstance(value, str)
+        and _WORKSPACE_ID.fullmatch(value) is not None
+        and not windows_device_name(value)
+    )
+
+
+@dataclass
+class Workspace:
+    """An agent's own folder, and the snapshot of it that the Workflow committed.
+
+    Used by a runner with a ``workspace_store``: the folder is ``<cwd>/<id>`` on every
+    Worker, and each segment and tool step first makes it match ``snapshot``.
+
+    Attributes:
+        id: The folder's name: the agent's first session id.
+        snapshot: The snapshot of the folder that the last completed segment or tool
+            step saved (the SHA-256 of its root tree in the store), or None before
+            the first one (an empty folder).
+    """
+
+    id: str
+    snapshot: str | None = None
 
 
 @dataclass
@@ -51,12 +113,16 @@ class ToolOutcome:
             segment puts it where the call's result belongs, so Claude Code continues
             from its own record of the call (without it, the segment writes a record
             of the same shape).
+        workspace: From a tool step of a runner with a ``workspace_store``: the
+            snapshot of the agent's folder after the call. The Workflow takes it as
+            the agent's current snapshot; it is not passed to Claude.
     """
 
     content: Any = None
     is_error: bool = False
     blocks: list[dict[str, Any]] | None = None
     entry: dict[str, Any] | None = None
+    workspace: str | None = None
 
 
 @dataclass
@@ -126,6 +192,8 @@ class SegmentInput:
             directly (tests); the Workflow passes ``conversation`` instead.
         tool_activities: Name patterns of Claude Code tools that pause the segment
             like durable tools, to run as their own Activities.
+        workspace: The agent's own folder and its committed snapshot, for a runner
+            with a ``workspace_store`` (others ignore it).
     """
 
     session_id: str
@@ -143,6 +211,7 @@ class SegmentInput:
     conversation: ConversationRef | None = None
     transcript: list[dict[str, Any]] | None = None
     tool_activities: list[str] = field(default_factory=list)
+    workspace: Workspace | None = None
 
 
 @dataclass
@@ -185,6 +254,8 @@ class ToolStepInput:
         attempt: Which attempt at the call this step is, from 1.
         retry: When the step may be tried again if its call did not run; None when
             Temporal's own retries run the step (``repeatable_tools``).
+        workspace: The agent's own folder and its committed snapshot, for a runner
+            with a ``workspace_store`` (others ignore it).
     """
 
     session_id: str
@@ -196,6 +267,7 @@ class ToolStepInput:
     transcript: list[dict[str, Any]] | None = None
     attempt: int = 1
     retry: ToolStepRetry | None = None
+    workspace: Workspace | None = None
 
 
 @dataclass
@@ -222,6 +294,8 @@ class SegmentOutput:
         siblings: The other durable calls Claude made in the same message as
             ``deferred``. They did not run in the engine: the Workflow runs them with
             ``deferred``, and the next segment delivers every result.
+        workspace: From a runner with a ``workspace_store``: the snapshot of the
+            agent's folder after this segment. None from other runners.
     """
 
     session_id: str
@@ -235,6 +309,7 @@ class SegmentOutput:
     transcript_add: list[dict[str, Any]] = field(default_factory=list)
     external_storage: bool = False
     siblings: list[DeferredCall] = field(default_factory=list)
+    workspace: str | None = None
 
 
 @dataclass
@@ -268,6 +343,8 @@ class AgentState:
             objects.
         external_storage: Whether the Workers reported External Storage, so a large
             conversation can move to the next run.
+        workspace: The agent's own folder and its committed snapshot (used by
+            runners with a ``workspace_store``); None until the agent's first task.
     """
 
     session_id: str | None = None
@@ -285,3 +362,4 @@ class AgentState:
     stream: WorkflowStreamState | None = None
     conversation: list[str] = field(default_factory=list)
     external_storage: bool = False
+    workspace: Workspace | None = None

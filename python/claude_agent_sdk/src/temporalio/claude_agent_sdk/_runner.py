@@ -79,9 +79,11 @@ import asyncio
 import atexit
 import collections
 import contextlib
+import contextvars
 import dataclasses
 import fnmatch
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -96,7 +98,7 @@ import time
 import unicodedata
 import uuid
 import warnings
-from collections.abc import AsyncGenerator, AsyncIterator, Collection
+from collections.abc import AsyncGenerator, AsyncIterator, Collection, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -155,8 +157,16 @@ from ._models import (
     ToolOutcome,
     ToolSpec,
     ToolStepInput,
+    Workspace,
 )
 from ._stand_in import RecordedCall, StandInModel
+from ._workspace import DEFAULT_MAX_BYTES, Workspaces, WorkspaceStore
+
+_AGENT_FOLDER: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "temporalio_claude_agent_sdk_agent_folder", default=None
+)
+"""The agent's own folder, while a step of a runner with a workspace store runs (see
+``ClaudeAgentSdkRunner._folder``)."""
 
 ENV_AUTH = (
     "ANTHROPIC_API_KEY",
@@ -2758,6 +2768,9 @@ class ClaudeAgentSdkRunner:
         warm_engines: int = 0,
         warm_seconds: float = 30.0,
         engine_cleanup: Literal["required", "best_effort"] = "required",
+        workspace_store: WorkspaceStore | None = None,
+        workspace_max_bytes: int | None = DEFAULT_MAX_BYTES,
+        workspace_exclude: Sequence[str] = (),
     ) -> None:
         """Create the runner.
 
@@ -2768,7 +2781,9 @@ class ClaudeAgentSdkRunner:
                 keep conversations there instead (``FileSessionStore`` is for tests
                 and one machine). Every Worker of a task queue needs the same choice.
             cwd: Working directory of the engine. Sessions are keyed by it, so give
-                every Worker the same one.
+                every Worker the same one. With a ``workspace_store``, the folder that
+                holds each agent's own folder (``<cwd>/<id>``), where its engine
+                works.
             env: Extra environment variables for the engine. The engine also
                 inherits the Worker's environment.
             cli_path: Path of a Claude Code executable to use instead of the bundled one.
@@ -2823,6 +2838,30 @@ class ClaudeAgentSdkRunner:
                 started: the step then ends it at once). ``"best_effort"``: the step
                 goes on with a warning, and if the Worker process dies, its engine
                 finishes its current turn, built-in tools included.
+            workspace_store: None (the default): every agent on this Worker works in
+                ``cwd``, on this Worker's disk. Or a ``WorkspaceStore`` that every
+                Worker can reach (``FileWorkspaceStore`` for tests, one machine or a
+                shared mount): each agent then works in its own folder,
+                ``<cwd>/<id>``, that follows it to any Worker. After each segment and
+                tool step the runner saves what changed in the folder to the store,
+                and the Workflow takes the new snapshot with the step's result; each
+                segment and tool step first makes the folder match the agent's
+                current snapshot (an attempt that did not complete is rolled back).
+                Every Worker of a task queue needs the same store, ``cwd``,
+                ``workspace_exclude`` and kind of system: a runner without a store
+                refuses the steps of an agent whose folder has a snapshot (Temporal
+                tries them again). An agent whose first segment ran without a store
+                keeps working in ``cwd``.
+            workspace_max_bytes: Most bytes of files an agent's folder may hold (1 GiB
+                by default; None: no limit). A step that leaves more fails, not
+                retryable (``WorkspaceTooLarge``).
+            workspace_exclude: Paths left out of the snapshots, as ``fnmatch``
+                patterns: never saved or restored, and left as they are (unless a
+                directory that holds them is not in the snapshot). A pattern with no
+                ``/``, or only a trailing one, matches a name at any depth
+                (``node_modules``, ``*.log``); one with a ``/`` at its start or in its
+                middle matches the path from the agent's folder (``build/*``,
+                ``/cache``).
 
         Raises:
             ValueError: If ``extra_options`` sets an option the plugin manages, or
@@ -2830,7 +2869,11 @@ class ClaudeAgentSdkRunner:
                 working directory (for example decomposed Unicode or emoji in its
                 path, or a path given in another form than its real one), or
                 ``warm_engines`` is negative, or ``warm_seconds`` not positive, or
-                ``engine_cleanup`` is not ``"required"`` or ``"best_effort"``.
+                ``engine_cleanup`` is not ``"required"`` or ``"best_effort"``, or
+                ``workspace_max_bytes`` is not positive, or a ``workspace_exclude``
+                pattern is empty.
+            TypeError: If ``workspace_store`` has no async ``save`` and ``load``, or
+                ``workspace_exclude`` is one string instead of a list of patterns.
         """
         _check_extra_options(extra_options or {})
         if warm_engines < 0 or not warm_seconds > 0:  # NaN too
@@ -2848,6 +2891,28 @@ class ClaudeAgentSdkRunner:
                 f"different session keys ({mismatch}), so resumed sessions would not "
                 "be found. Pass the path exactly as os.path.realpath gives it, or use "
                 "a directory with a plain ASCII path."
+            )
+        self._workspaces: Workspaces | None = None
+        if workspace_store is not None:
+            store_methods = [
+                getattr(workspace_store, name, None) for name in ("save", "load")
+            ]
+            if not all(inspect.iscoroutinefunction(m) for m in store_methods):
+                raise TypeError(
+                    "workspace_store must have async save(key, path) and "
+                    "load(key, path) methods (see WorkspaceStore)"
+                )
+            if isinstance(cast("object", workspace_exclude), str):
+                raise TypeError(
+                    "workspace_exclude takes a list of patterns, not one string"
+                )
+            if workspace_max_bytes is not None and not workspace_max_bytes > 0:
+                raise ValueError("workspace_max_bytes must be above 0, or None")
+            self._workspaces = Workspaces(
+                directory,
+                workspace_store,
+                max_bytes=workspace_max_bytes,
+                exclude=list(workspace_exclude),
             )
         self._store = session_store
         self._cwd = cwd
@@ -3037,7 +3102,7 @@ class ClaudeAgentSdkRunner:
         """
         assert inp.checkpoint is not None
         key = {
-            "project_key": project_key_for_directory(self._cwd),
+            "project_key": project_key_for_directory(self._folder()),
             "session_id": inp.session_id,
         }
         entries = cast("list[dict[str, Any]]", await self._store.load(key) or [])
@@ -3071,7 +3136,7 @@ class ClaudeAgentSdkRunner:
         """
         assert inp.checkpoint is not None
         key = {
-            "project_key": project_key_for_directory(self._cwd),
+            "project_key": project_key_for_directory(self._folder()),
             "session_id": inp.session_id,
         }
         entries = cast("list[dict[str, Any]]", await self._store.load(key) or [])
@@ -3081,7 +3146,7 @@ class ClaudeAgentSdkRunner:
             forked = await fork_session_via_store(
                 self._store,
                 inp.session_id,
-                directory=self._cwd,
+                directory=self._folder(),
                 up_to_message_id=inp.checkpoint,
             )
             return forked.session_id, set(), False
@@ -3107,7 +3172,7 @@ class ClaudeAgentSdkRunner:
             RuntimeError: If the store does not have the turn (Temporal retries).
         """
         key = {
-            "project_key": project_key_for_directory(self._cwd),
+            "project_key": project_key_for_directory(self._folder()),
             "session_id": session_id,
         }
         entries = cast("list[dict[str, Any]]", await store.load(key) or [])
@@ -3292,7 +3357,7 @@ class ClaudeAgentSdkRunner:
         checkpoint must be the engine's own.
         """
         key = {
-            "project_key": project_key_for_directory(self._cwd),
+            "project_key": project_key_for_directory(self._folder()),
             "session_id": inp.session_id,
         }
         entries = cast("list[Any]", await self._store.load(key) or [])
@@ -3314,8 +3379,64 @@ class ClaudeAgentSdkRunner:
         while self._warm:
             self._end_warm(self._warm.pop(next(iter(self._warm))))
 
+    def _end_session_warm(self, session_id: str) -> None:
+        """End the session's warm engines: its folder had to change under them.
+
+        A call that waits in one never runs there; the step runs it in a new engine.
+        """
+        for key in [k for k in self._warm if k[0] == session_id]:
+            self._end_warm(self._warm.pop(key))
+
+    def _has_folder(self, workspace: Workspace | None, checkpoint: str | None) -> bool:
+        """Whether this step runs in the agent's own folder (see ``workspace_store``).
+
+        Not without a workspace store, nor for an agent that started without one: its
+        first segment ran on a Worker with no store (so its Workflow has a checkpoint
+        but no snapshot), or before the plugin knew of workspaces (no ``workspace``
+        in the input). Such an agent keeps working in ``cwd``, as before.
+        """
+        return (
+            self._workspaces is not None
+            and workspace is not None
+            and (workspace.snapshot is not None or not checkpoint)
+        )
+
+    def _check_store_for(self, workspace: Workspace | None) -> None:
+        """Refuse a step of an agent whose folder is kept in a workspace store.
+
+        Only on a runner without a store: the step would run in ``cwd``, where the
+        agent's files are not.
+
+        Raises:
+            RuntimeError: Temporal tries the step again, on a Worker with the store
+                once there is one (as when a session store is missing).
+        """
+        if (
+            self._workspaces is None
+            and workspace is not None
+            and workspace.snapshot is not None
+        ):
+            raise RuntimeError(
+                "This agent's folder is kept in a workspace store, but this Worker's "
+                "runner has none, so the step would not see the agent's files. Every "
+                "Worker of a task queue needs the same workspace_store. Retrying."
+            )
+
+    def _folder(self) -> str | None:
+        """The engine's working directory in this segment or tool step.
+
+        With a workspace store, the agent's own folder (set by ``run`` and
+        ``run_tool_step`` for the step, and seen by every task it starts); otherwise
+        the runner's ``cwd``.
+        """
+        return _AGENT_FOLDER.get() or self._cwd
+
     async def run(self, inp: SegmentInput, attempt: int) -> SegmentOutput:
         """Run one segment until Claude pauses at a durable tool call or finishes.
+
+        With a workspace store, the agent's folder first matches its committed
+        snapshot (see ``workspace_store``), and the segment's output carries the
+        snapshot saved after it, unless the output is an error.
 
         Args:
             inp: The segment input.
@@ -3329,14 +3450,36 @@ class ClaudeAgentSdkRunner:
 
         Raises:
             RuntimeError: If the transcript did not reach the session store, the
-                Workflow did not serve its conversation, or the conversation is kept
-                where this runner does not keep it (a session store, or the
-                Workflow). Temporal retries the segment.
+                Workflow did not serve its conversation, or the conversation or the
+                agent's folder is kept where this runner does not keep it (a session
+                store, the Workflow, or a workspace store). Temporal retries the
+                segment.
+            ApplicationError: Not retryable, if the agent's workspace cannot be
+                restored or saved (types ``WorkspaceNotFound``, ``WorkspaceCorrupt``,
+                ``WorkspaceTooLarge``, ``WorkspaceInvalid``).
         """
+        self._check_store_for(inp.workspace)
         reported = await self._engine_version()
         if reported is not None and _too_old(reported):
             return _too_old_output(inp.session_id, reported)  # before the engine starts
         await self._prepare_engine()
+        if not self._has_folder(inp.workspace, inp.checkpoint):
+            return await self._run(inp, attempt)
+        assert self._workspaces is not None and inp.workspace is not None
+        async with self._workspaces.use(inp.workspace) as folder:
+            if folder.changed:
+                self._end_session_warm(inp.session_id)
+            token = _AGENT_FOLDER.set(folder.folder)
+            try:
+                out = await self._run(inp, attempt)
+            finally:
+                _AGENT_FOLDER.reset(token)
+            if not out.is_error:
+                out.workspace = await folder.save()
+            return out
+
+    async def _run(self, inp: SegmentInput, attempt: int) -> SegmentOutput:
+        """``run``'s work, in the engine's working directory (``_folder``)."""
         injected = {k: _as_outcome(v) for k, v in inp.injected.items()}
         if self._store is None:
             return await self._run_held(inp, injected, attempt)
@@ -3506,7 +3649,7 @@ class ClaudeAgentSdkRunner:
         store = InMemorySessionStore()
         if seed:
             key = {
-                "project_key": project_key_for_directory(self._cwd),
+                "project_key": project_key_for_directory(self._folder()),
                 "session_id": session_id,
             }
             await store.append(key, seed)  # type: ignore[arg-type]
@@ -3572,6 +3715,11 @@ class ClaudeAgentSdkRunner:
         Workflow can tell Claude whether the call ran; it gives the step one attempt
         unless the tool is in ``repeatable_tools``.
 
+        With a workspace store, the agent's folder first matches its committed
+        snapshot, and the result carries the snapshot saved after the call
+        (``ToolOutcome.workspace``). A step that fails saves none: the next step
+        rolls back what its call changed in the folder.
+
         Args:
             step: The call, and where its session paused.
             attempt: The Activity attempt number.
@@ -3585,14 +3733,32 @@ class ClaudeAgentSdkRunner:
                 ``ToolCallInterrupted`` if it failed after the hook let the call run
                 (it may have run). Not retryable where retrying cannot help: the
                 session did not pause at this call, or the hook refused it (also
-                for other input than the segment reported, or when it failed). (A
-                hook in ``extra_options`` that decides on the call already stopped
-                the task in the segment, where the same call came first.)
+                for other input than the segment reported, or when it failed), or
+                the agent's workspace cannot be restored or saved. (A hook in
+                ``extra_options`` that decides on the call already stopped the task
+                in the segment, where the same call came first.)
         """
         del attempt
         allowed = [False]  # whether the call may have run (``_tool_step`` sets it)
         try:
-            return await self._tool_step(step, allowed)
+            self._check_store_for(step.workspace)
+            if not self._has_folder(step.workspace, step.checkpoint):
+                return await self._tool_step(step, allowed)
+            assert self._workspaces is not None and step.workspace is not None
+            async with self._workspaces.use(step.workspace) as folder:
+                if folder.changed:
+                    self._end_session_warm(step.session_id)
+                token = _AGENT_FOLDER.set(folder.folder)
+                try:
+                    outcome = await self._tool_step(step, allowed)
+                finally:
+                    _AGENT_FOLDER.reset(token)
+                # The step has the call's result, so the call ran, even if no hook
+                # let it (an allow rule in a settings file can): a save that fails
+                # now says it may have run, so it never runs again.
+                allowed[0] = True
+                outcome.workspace = await folder.save()
+                return outcome
         except asyncio.CancelledError:
             if not _cancelled_by_shutdown():
                 raise  # the Workflow cancelled the step, or it timed out, or ...
@@ -3624,7 +3790,7 @@ class ClaudeAgentSdkRunner:
         """A tool step in a new engine (see ``run_tool_step``)."""
         call = step.call
         key = {
-            "project_key": project_key_for_directory(self._cwd),
+            "project_key": project_key_for_directory(self._folder()),
             "session_id": step.session_id,
         }
         held = step.transcript is not None or (
@@ -3910,7 +4076,7 @@ class ClaudeAgentSdkRunner:
         return _command_env(
             env,
             hook_dir,
-            self._cwd,
+            self._folder(),
             overrides,
             {"TCA_ALLOW_ID": call.id, "TCA_ALLOW_INPUT": input_digest(call.input)},
         )
@@ -3954,7 +4120,7 @@ class ClaudeAgentSdkRunner:
         folder = (
             Path(unicodedata.normalize("NFC", str(base)))
             / "projects"
-            / project_key_for_directory(self._cwd)
+            / project_key_for_directory(self._folder())
         )
         return folder / f"{session_id}.jsonl", folder / session_id
 
@@ -4069,7 +4235,7 @@ class ClaudeAgentSdkRunner:
                 options["env"] = _command_env(
                     options["env"],
                     hook_dir,
-                    self._cwd,
+                    self._folder(),
                     CONTINUE_ENV if waits else NEW_TURN_ENV,
                     {"TCA_WAIT_SECONDS": str(wait_seconds)} if may_wait else {},
                 )
@@ -4520,7 +4686,7 @@ class ClaudeAgentSdkRunner:
         out.external_storage = external_storage_on()
         if committed is not None:
             key = {
-                "project_key": project_key_for_directory(self._cwd),
+                "project_key": project_key_for_directory(self._folder()),
                 "session_id": session_id,
             }
             entries = cast("list[dict[str, Any]]", await store.load(key) or [])
@@ -4650,7 +4816,9 @@ class ClaudeAgentSdkRunner:
         else:
             text = _text(result.content)
             saved = _saved_output_tail(
-                result.content, project_key_for_directory(self._cwd), warm.session_id
+                result.content,
+                project_key_for_directory(self._folder()),
+                warm.session_id,
             )
             if saved is not None:
                 # As in a step of its own: the next segment may run elsewhere.
@@ -4869,7 +5037,7 @@ class ClaudeAgentSdkRunner:
             ),
             "settings": str(Path(hook_dir) / "settings.json"),
             "session_store": _guarded(store, session_id, guard),
-            "cwd": self._cwd,
+            "cwd": self._folder(),
             "env": {
                 **self._env,
                 **(extra.pop("env", None) or {}),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import inspect
 import json
 import re
@@ -19,6 +20,7 @@ from temporalio.exceptions import (
     ActivityError,
     ApplicationError,
     CancelledError,
+    FailureError,
     TimeoutType,
 )
 from temporalio.exceptions import TimeoutError as ActivityTimeoutError
@@ -29,6 +31,10 @@ from ._models import (
     TOOL_CALL_INTERRUPTED,
     TOOL_CALL_NOT_RUN,
     TRY_AGAIN,
+    WORKSPACE_CORRUPT,
+    WORKSPACE_INVALID,
+    WORKSPACE_NOT_FOUND,
+    WORKSPACE_TOO_LARGE,
     AgentState,
     ConversationRef,
     DeferredCall,
@@ -38,6 +44,8 @@ from ._models import (
     ToolSpec,
     ToolStepInput,
     ToolStepRetry,
+    Workspace,
+    workspace_id_ok,
 )
 
 SEGMENT_ACTIVITY_NAME = "run_claude_segment"
@@ -175,12 +183,42 @@ def _failed_step(err: ActivityError, record: dict[str, Any]) -> ToolOutcome:
     )
 
 
+_WORKSPACE_ERRORS = frozenset(
+    {WORKSPACE_NOT_FOUND, WORKSPACE_CORRUPT, WORKSPACE_TOO_LARGE, WORKSPACE_INVALID}
+)
+
+
+def _workspace_failure(err: ActivityError) -> str | None:
+    """Why the agent's folder failed a tool step, if it did (then the task stops).
+
+    Retrying cannot fix it, and Claude, told only that its call did not run or may
+    have run, would call it again: for example after an install that took the folder
+    past ``workspace_max_bytes``, whose changes the next step rolls back.
+    """
+    cause: BaseException | None = err.cause
+    while isinstance(cause, FailureError):
+        if isinstance(cause, ApplicationError) and cause.type in _WORKSPACE_ERRORS:
+            return cause.message
+        cause = cause.cause
+    return None
+
+
 def _check_tool_name(name: str) -> None:
     if not _TOOL_NAME.fullmatch(name):
         raise ValueError(
             f"Tool name {name!r}: use 1 to 50 letters, digits, '_' or '-'. Claude Code "
             "renames other tool names, and the call could never run."
         )
+
+
+def _workspace_id(session_id: str) -> str:
+    """The agent's folder name: its first session id.
+
+    Or a hash of it, if it is not a plain name (a session id given in ``AgentState``).
+    """
+    if workspace_id_ok(session_id):
+        return session_id
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
 
 
 class _Conversations:
@@ -512,6 +550,8 @@ class DurableClaudeAgent:
         self._keep_bytes = live_output_keep_bytes
         self._linger = live_output_linger
         self._stream: WorkflowStream | None = None
+        self._stop_reason: str | None = None
+        """Why the task stops once its calls settled (a tool step's folder problem)."""
         if live_output:
             if workflow.instance() is not None:
                 raise RuntimeError(
@@ -649,6 +689,9 @@ class DurableClaudeAgent:
             fork_next=s.fork_next,
             conversation=list(s.conversation),
             external_storage=s.external_storage,
+            workspace=None
+            if s.workspace is None
+            else Workspace(s.workspace.id, s.workspace.snapshot),
         )
 
     def _page(self, start: int, total: int, limit: int) -> list[dict[str, Any]]:
@@ -871,6 +914,12 @@ class DurableClaudeAgent:
             self._publish({"type": "prompt", "text": prompt})
         if state.session_id is None:
             state.session_id = str(workflow.uuid4())
+        if state.workspace is None and state.checkpoint is None:
+            # The agent's folder for runners with a workspace store: named once, for
+            # good (a later session after a stopped task keeps it), and only before
+            # anything is committed: an agent that ran without one keeps its files
+            # where they are. No new random value.
+            state.workspace = Workspace(_workspace_id(state.session_id))
         self._running = True
         try:
             return await self._loop()
@@ -916,6 +965,7 @@ class DurableClaudeAgent:
                         agent=self._key or "",
                         entries=len(state.conversation),
                     ),
+                    workspace=self._workspace(),
                 )
 
             seg_input = await self._fit_results(segment_input)
@@ -947,7 +997,9 @@ class DurableClaudeAgent:
                     "The segment runner returned no checkpoint, so a retry could not "
                     "continue this session safely."
                 )
-            mixed = self._conversation_problem(seg)
+            mixed = self._conversation_problem(seg) or self._workspace_problem(
+                seg.workspace
+            )
             if mixed is not None:
                 await self._fail(mixed)
             # The segment committed: its tool results and prompt reached Claude.
@@ -957,6 +1009,7 @@ class DurableClaudeAgent:
             state.session_id = seg.session_id or state.session_id
             state.checkpoint = seg.checkpoint
             state.external_storage = seg.external_storage
+            self._take_workspace(seg.workspace)
             if seg.transcript_keep is not None:
                 keep = seg.transcript_keep
                 added = [entry_text(e) for e in seg.transcript_add]
@@ -1007,6 +1060,8 @@ class DurableClaudeAgent:
                 *(c.id for c in calls),
             ][-_RECENT_CALLS:]
             state.tool_calls += len(calls)
+            if self._stop_reason is not None:
+                await self._fail(self._stop_reason)
 
     async def _fit_results(self, make: Callable[[], SegmentInput]) -> SegmentInput:
         """The next segment's input, with tool results it can carry.
@@ -1141,6 +1196,7 @@ class DurableClaudeAgent:
         the next task.
         """
         state = self._state
+        self._stop_reason = None
         if self._unanswered:
             state.pending = {
                 call.id: self._outcome_after_stop(call, reason)
@@ -1211,6 +1267,44 @@ class DurableClaudeAgent:
     def _publish(self, event: dict[str, Any]) -> None:
         if self._stream is not None:
             self._topic.publish(cap_event({**event, "at": workflow.now().isoformat()}))
+
+    def _workspace(self) -> Workspace | None:
+        """The agent's folder and committed snapshot, for a step's input."""
+        ws = self._state.workspace
+        return None if ws is None else Workspace(ws.id, ws.snapshot)
+
+    def _workspace_problem(self, snapshot: str | None) -> str | None:
+        """Refuse a step that saved no snapshot of a folder that has one."""
+        ws = self._state.workspace
+        if snapshot is None and ws is not None and ws.snapshot is not None:
+            return (
+                "This agent's folder is kept in a workspace store, but the Worker "
+                "that ran its last step has none, so the step's changes to it could "
+                "be lost. Every Worker of a task queue needs the same "
+                "workspace_store."
+            )
+        return None
+
+    def _take_workspace(self, snapshot: str | None) -> None:
+        """Make a completed step's snapshot the agent's current one."""
+        ws = self._state.workspace
+        if ws is not None and snapshot is not None:
+            ws.snapshot = snapshot
+
+    def _step_done(self, outcome: ToolOutcome) -> ToolOutcome:
+        """A tool step returned: take the snapshot it saved, not for Claude.
+
+        A step from a Worker with no store stops the task, but only once every call
+        of the message settled and its result is pending (``_loop``): its call ran,
+        and Claude gets its result with the next task.
+        """
+        problem = self._workspace_problem(outcome.workspace)
+        if problem is not None:
+            self._stop_reason = problem
+        else:
+            self._take_workspace(outcome.workspace)
+        outcome.workspace = None
+        return outcome
 
     async def _tool_step_activity(
         self,
@@ -1341,6 +1435,7 @@ class DurableClaudeAgent:
             conversation=ConversationRef(
                 query=QUERY, agent=self._key or "", entries=len(state.conversation)
             ),
+            workspace=self._workspace(),
         )
 
     async def _run_tools(self, calls: list[DeferredCall]) -> list[ToolOutcome]:
@@ -1427,13 +1522,13 @@ class DurableClaudeAgent:
                 )
                 outcome = await self._step_until_its_call_runs(call, record, repeatable)
                 record["status"] = "done"
-                return outcome
+                return self._step_done(outcome)
             if tool is None:  # as in Workflows started before ``_ONCE_PATCH``
                 outcome = await self._tool_step_activity(
                     call, f"tool-{call.id}", self._tool_activity_retry_policy
                 )
                 record["status"] = "done"
-                return outcome
+                return self._step_done(outcome)
             result = await workflow.execute_activity(
                 tool.activity,
                 call.input,
@@ -1451,6 +1546,12 @@ class DurableClaudeAgent:
                 record["status"] = "cancelled"
                 raise  # the Workflow is being cancelled: do not hide it from Claude's loop
             if once:
+                problem = _workspace_failure(err)
+                if problem is not None:
+                    self._stop_reason = (
+                        f"Tool call {call.id} ({call.name}) could not keep the agent's "
+                        f"folder: {problem}"
+                    )
                 return _failed_step(err, record)
             cause = err.cause
             message = (

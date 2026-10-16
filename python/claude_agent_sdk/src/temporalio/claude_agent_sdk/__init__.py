@@ -18,6 +18,10 @@ from temporalio.claude_agent_sdk._events import follow_agent
 from temporalio.claude_agent_sdk._models import (
     TOOL_CALL_INTERRUPTED,
     TOOL_CALL_NOT_RUN,
+    WORKSPACE_CORRUPT,
+    WORKSPACE_INVALID,
+    WORKSPACE_NOT_FOUND,
+    WORKSPACE_TOO_LARGE,
     AgentState,
     ConversationRef,
     DeferredCall,
@@ -27,6 +31,7 @@ from temporalio.claude_agent_sdk._models import (
     ToolSpec,
     ToolStepInput,
     ToolStepRetry,
+    Workspace,
 )
 from temporalio.claude_agent_sdk._plugin import ClaudeAgentPlugin
 from temporalio.claude_agent_sdk._runner import ClaudeAgentSdkRunner
@@ -38,6 +43,7 @@ from temporalio.claude_agent_sdk._workflow import (
     DurableTool,
     activity_as_tool,
 )
+from temporalio.claude_agent_sdk._workspace import FileWorkspaceStore, WorkspaceStore
 
 from . import testing
 
@@ -46,6 +52,10 @@ __all__ = [
     "TOOL_CALL_INTERRUPTED",
     "TOOL_CALL_NOT_RUN",
     "TOOL_STEP_ACTIVITY_NAME",
+    "WORKSPACE_CORRUPT",
+    "WORKSPACE_INVALID",
+    "WORKSPACE_NOT_FOUND",
+    "WORKSPACE_TOO_LARGE",
     "AgentState",
     "ClaudeAgentPlugin",
     "ClaudeAgentSdkRunner",
@@ -54,6 +64,7 @@ __all__ = [
     "DurableClaudeAgent",
     "DurableTool",
     "FileSessionStore",
+    "FileWorkspaceStore",
     "SegmentInput",
     "SegmentOutput",
     "SegmentRunner",
@@ -61,6 +72,8 @@ __all__ = [
     "ToolSpec",
     "ToolStepInput",
     "ToolStepRetry",
+    "Workspace",
+    "WorkspaceStore",
     "activity_as_tool",
     "follow_agent",
     "make_segment_activity",

@@ -22,17 +22,23 @@ seeds per conversation mode (``CHAOS_SEED`` is the first one), for example:
 Workers keep warm engines, so calls wait in them for their tool steps and kills land
 there too. With ``CHAOS_SLOW=1`` the model takes its time after each call in some runs
 (0.5 or 1.5 s), so Claude Code pauses at a call before the rest of its message
-arrives. With ``CHAOS_LOG`` set to a file, each passed run adds a line to it: its
-seed, mode, kills and outcome.
+arrives. With ``CHAOS_WORKSPACE=1`` the Workers have a workspace store: the agent
+works in a folder of its own, and each new Worker starts on a machine whose disk does
+not have it (the folder is removed before it starts); the promises are then checked
+on the agent's last snapshot, restored from the store in a new folder (and the last
+Worker's folder, if it ran a step, must be that snapshot). With ``CHAOS_LOG`` set to a
+file, each passed run adds a line to it: its seed, mode, kills and outcome.
 """
 
 from __future__ import annotations
 
 import asyncio
 import collections
+import dataclasses
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -43,16 +49,24 @@ from typing import Any
 import pytest
 
 from temporalio.api.enums.v1 import PendingActivityState
-from temporalio.claude_agent_sdk import TOOL_CALL_NOT_RUN
+from temporalio.claude_agent_sdk import (
+    TOOL_CALL_NOT_RUN,
+    AgentState,
+    FileWorkspaceStore,
+    Workspace,
+)
+from temporalio.claude_agent_sdk._workspace import Workspaces
 from temporalio.client import Client, WorkflowHandle
 from tests.chaos.policy import STALE, ChaosAgent
 from tests.conftest import PLUGIN_ROOT
 from tests.engine_tools.workflows import ShellOptions, ShellWorkflow
 from tests.helpers.fake_messages_api import FakeMessagesAPI, engine_env
+from tests.test_workspace import describe
 
 RUNS = int(os.environ.get("CHAOS_RUNS", "0"))
 WARM = os.environ.get("CHAOS_WARM") == "1"
 SLOW = os.environ.get("CHAOS_SLOW") == "1"
+WORKSPACE = os.environ.get("CHAOS_WORKSPACE") == "1"
 FIRST = int(os.environ.get("CHAOS_SEED", "0"))
 MAX_KILLS = 3
 KINDS = ["run_claude_segment", "run_claude_tool_step"]
@@ -179,10 +193,31 @@ async def failures(handle: WorkflowHandle[Any, Any]) -> tuple[list[str], int]:
 async def test_chaos(
     client: Client, address: str, tmp_path: Path, mode: str, seed: int
 ) -> None:
-    work = tmp_path / "work"
-    work.mkdir()
-    (work / "notes.txt").write_text("start\nEND\n", encoding="utf-8")
-    (work / "over.txt").write_text("start\n", encoding="utf-8")
+    options = OPTIONS
+    store = tmp_path / "workspaces"
+    root = tmp_path / "agents"  # the runners' cwd, the same path on every Worker
+    session = ""
+    if WORKSPACE:
+        # The agent's folder starts as a snapshot made here, given in its state.
+        session = str(uuid.uuid4())
+        first = Workspaces(
+            str(tmp_path / "seed"),
+            FileWorkspaceStore(store),
+            max_bytes=None,
+            exclude=(),
+        )
+        async with first.use(Workspace(session)) as use:
+            Path(use.folder, "notes.txt").write_text("start\nEND\n", encoding="utf-8")
+            Path(use.folder, "over.txt").write_text("start\n", encoding="utf-8")
+            begin = await use.save()
+        state = AgentState(session_id=session, workspace=Workspace(session, begin))
+        options = dataclasses.replace(OPTIONS, state=state)
+        work = root / session
+    else:
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / "notes.txt").write_text("start\nEND\n", encoding="utf-8")
+        (work / "over.txt").write_text("start\n", encoding="utf-8")
     agent = ChaosAgent(seed, work)
     queue = f"chaos-{mode}-{seed}-{uuid.uuid4().hex[:6]}"
     rng = random.Random(f"{mode}-{seed}")
@@ -198,13 +233,17 @@ async def test_chaos(
 
     async def new_worker() -> None:
         n = len(workers)
+        if WORKSPACE:  # a new machine: the agent's folder is not on its disk
+            shutil.rmtree(root, ignore_errors=True)
+            root.mkdir(exist_ok=True)
         env = {
             "CHAOS_ENGINE_ENV": json.dumps(engine_env(api, str(tmp_path / f"cfg{n}"))),
-            "ENGINE_CWD": str(work),
+            "ENGINE_CWD": str(root if WORKSPACE else work),
             "RUNNER_MODE": mode,
             "SESSION_DIR": str(tmp_path / "sessions"),
             "SHOP_DIR": str(tmp_path / "shop"),
             "WARM_ENGINES": "4" if WARM else "0",
+            "WORKSPACE_STORE": str(store) if WORKSPACE else "",
         }
         workers.append(await start_worker(address, queue, env, tmp_path / f"w{n}"))
 
@@ -224,7 +263,7 @@ async def test_chaos(
         await new_worker()
         started = time.monotonic()
         handle = await client.start_workflow(
-            ShellWorkflow.run, args=["chaos", OPTIONS], id=queue, task_queue=queue
+            ShellWorkflow.run, args=["chaos", options], id=queue, task_queue=queue
         )
         live["handle"] = handle
         result_task = asyncio.ensure_future(handle.result())
@@ -270,6 +309,26 @@ async def test_chaos(
         except asyncio.TimeoutError:
             raise AssertionError(f"no result in {RUN_SECONDS} s\n{report()}") from None
         failed, not_run = await failures(live["handle"])
+        if WORKSPACE:
+            # The promises hold on the agent's last snapshot, read back from the store
+            # into a new folder. The last Worker's folder is that snapshot, if it ran
+            # a step: a kill after the last step leaves a Worker that ran none, and a
+            # disk without the folder.
+            final = await live["handle"].query(ShellWorkflow.agent_state)
+            assert final.workspace is not None and final.workspace.id == session
+            check = Workspaces(
+                str(tmp_path / "final"),
+                FileWorkspaceStore(store),
+                max_bytes=None,
+                exclude=(),
+            )
+            async with check.use(final.workspace):
+                pass
+            if work.exists():
+                assert describe(tmp_path / "final" / session) == describe(work), (
+                    report()
+                )
+            work = tmp_path / "final" / session
     finally:
         task = live.get("result")
         if task is not None and not task.done():
@@ -330,6 +389,7 @@ async def test_chaos(
             "seed": seed,
             "mode": mode,
             "warm": WARM,
+            "workspace": WORKSPACE,
             "pause": api.pause_after_call,
             "kills": kills,
             "calls": sum(len(m) for m in agent.plan),

@@ -3,8 +3,9 @@
 Settings come from the environment, so every Worker the test starts after a kill is
 the same: ``CHAOS_ENGINE_ENV`` (the runner's ``env``, as JSON), ``ENGINE_CWD``,
 ``RUNNER_MODE`` (``held`` or ``store``), ``SESSION_DIR`` and ``SHOP_DIR``. Optional:
-``WARM_ENGINES`` (the runner's ``warm_engines``) and ``STEP_DELAY`` (seconds each tool
-step waits before it starts, so a test can find a call waiting in its warm engine).
+``WARM_ENGINES`` (the runner's ``warm_engines``), ``STEP_DELAY`` (seconds each tool
+step waits before it starts, so a test can find a call waiting in its warm engine) and
+``WORKSPACE_STORE`` (a folder: the runner's ``workspace_store``).
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from temporalio.claude_agent_sdk import (
     ClaudeAgentPlugin,
     ClaudeAgentSdkRunner,
     FileSessionStore,
+    FileWorkspaceStore,
 )
 from temporalio.client import Client
 from temporalio.worker import Worker
@@ -51,6 +53,9 @@ async def main() -> None:
         env=json.loads(os.environ["CHAOS_ENGINE_ENV"]),
         warm_engines=int(os.environ.get("WARM_ENGINES") or 0),
         warm_seconds=60.0,
+        workspace_store=FileWorkspaceStore(os.environ["WORKSPACE_STORE"])
+        if os.environ.get("WORKSPACE_STORE")
+        else None,
     )
     client = await Client.connect(args.address)
     worker = Worker(

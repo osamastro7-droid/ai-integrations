@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import Any
 
 from temporalio import workflow
-from temporalio.claude_agent_sdk import DurableClaudeAgent, activity_as_tool
+from temporalio.claude_agent_sdk import AgentState, DurableClaudeAgent, activity_as_tool
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
@@ -32,6 +32,8 @@ class ShellOptions:
             default, 100 times the first).
         tool_retry_attempts: Its maximum attempts (0: unlimited).
         builtin_tools: The agent's Claude Code tools.
+        state: The agent's state to start from (for example its session and its
+            folder's first snapshot, for runners with a workspace store).
     """
 
     tool_activities: list[str] = field(default_factory=lambda: ["Bash", "mcp__*"])
@@ -44,6 +46,7 @@ class ShellOptions:
     tool_retry_max_interval: float = 0
     tool_retry_attempts: int = 5
     builtin_tools: list[str] = field(default_factory=lambda: ["Bash"])
+    state: AgentState | None = None
 
 
 @workflow.defn
@@ -77,6 +80,7 @@ class ShellWorkflow:
                 else None,
                 maximum_attempts=options.tool_retry_attempts,
             ),
+            state=options.state,
         )
 
     @workflow.run
@@ -105,6 +109,11 @@ class ShellWorkflow:
     def tool_calls(self) -> list[dict[str, Any]]:
         """Every tool call of this run, with its status."""
         return self.agent.tool_calls
+
+    @workflow.query
+    def agent_state(self) -> AgentState:
+        """The agent's state (its session, and its folder's snapshot)."""
+        return self.agent.state()
 
     @workflow.query
     def total_cost_usd(self) -> float:
