@@ -98,7 +98,9 @@ def make_tool_step_activity(
     ``run_tool_step(step, attempt)`` returns the call's result. A step that fails says
     on which side of the call's start it failed: an ``ApplicationError`` of type
     ``TOOL_CALL_NOT_RUN`` means the call did not run, so the Workflow may try again
-    (as a new Activity); any other failure means it may have run
+    (as a new Activity). Worker middleware may instead refuse the call before this
+    Activity runs (``TOOL_CALL_REFUSED``); the Workflow never retries it and reports
+    that it was refused and did not run. Any other failure means it may have run
     (``TOOL_CALL_INTERRUPTED`` says so), so it is not run again unless the tool is in
     ``repeatable_tools``. The Activity adds to a ``TOOL_CALL_NOT_RUN`` failure whether
     the call may be tried again (``step.retry``), so the Workflow's decision is in

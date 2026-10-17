@@ -8,7 +8,7 @@ import inspect
 import json
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any, NoReturn, cast
 
@@ -28,6 +28,7 @@ from ._events import TOPIC, cap_event
 from ._models import (
     TOOL_CALL_INTERRUPTED,
     TOOL_CALL_NOT_RUN,
+    TOOL_CALL_REFUSED,
     TRY_AGAIN,
     AgentState,
     ConversationRef,
@@ -137,14 +138,50 @@ def _may_try_again(err: ActivityError) -> bool:
     return isinstance(said, dict) and said.get(TRY_AGAIN) is True
 
 
+_REFUSED = (
+    "This call was refused by policy before it ran. The same call will be refused "
+    "again unless its authorization changes."
+)
+
+
+def _refused(err: ActivityError, record: dict[str, Any]) -> ToolOutcome | None:
+    """What Claude gets for a call that trusted middleware refused before it ran.
+
+    The same for a durable tool and a Claude Code tool (``ToolCallRefused``); None
+    for any other failure. The policy's own message stays in Temporal.
+    """
+    cause = err.cause
+    if not isinstance(cause, ApplicationError) or cause.type != TOOL_CALL_REFUSED:
+        return None
+    record["status"] = "refused"
+    return ToolOutcome(content=_REFUSED, is_error=True)
+
+
+def _refusals_final(policy: RetryPolicy | None) -> RetryPolicy:
+    """``policy`` (Temporal's default for None), never retrying ``ToolCallRefused``.
+
+    A refusal then never runs again, even from middleware that left out
+    ``non_retryable=True``.
+    """
+    policy = policy or RetryPolicy()
+    types = list(policy.non_retryable_error_types or ())
+    if TOOL_CALL_REFUSED in types:
+        return policy
+    return replace(policy, non_retryable_error_types=[*types, TOOL_CALL_REFUSED])
+
+
 def _failed_step(err: ActivityError, record: dict[str, Any]) -> ToolOutcome:
     """What Claude gets for a tool step that failed: whether its call ran.
 
-    Only the step itself can know that its call did not run (``ToolCallNotRun``): a
-    timeout, a lost Worker or any other failure means the call may have run. The
-    step's own error stays in Temporal: it can name the Worker's folders and
-    settings, which Claude has no use for.
+    The step can report ``ToolCallNotRun``; trusted external policy middleware can
+    report ``ToolCallRefused`` only before dispatch. A timeout, a lost Worker or
+    any other failure means the call may have run. The step's own error stays in
+    Temporal: it can name the Worker's folders and settings, which Claude has no
+    use for.
     """
+    refused = _refused(err, record)
+    if refused is not None:
+        return refused
     cause = err.cause
     if isinstance(cause, ApplicationError) and cause.type == TOOL_CALL_NOT_RUN:
         record["status"] = "not run"
@@ -565,7 +602,8 @@ class DurableClaudeAgent:
 
         Durable tools and Claude Code tools in ``tool_activities``. Each has ``id``,
         ``name``, ``input`` and ``status``: ``started``, ``waiting for approval``,
-        ``rejected``, ``done``, ``failed`` (its Activity failed), ``not run`` or
+        ``rejected``, ``refused`` (policy denied before execution), ``done``,
+        ``failed`` (its Activity failed), ``not run`` or
         ``interrupted`` (a Claude Code tool's step failed before or after its call
         could start), ``cancelled`` or ``unknown tool``.
         """
@@ -1227,7 +1265,7 @@ class DurableClaudeAgent:
             activity_id=activity_id,
             start_to_close_timeout=self._tool_activity_timeout,
             heartbeat_timeout=self._segment_heartbeat_timeout,
-            retry_policy=retry_policy,
+            retry_policy=_refusals_final(retry_policy),
             cancellation_type=self._segment_cancellation_type,
             summary=f"tool {call.name}",
         )
@@ -1442,7 +1480,7 @@ class DurableClaudeAgent:
                 start_to_close_timeout=tool.start_to_close_timeout,
                 schedule_to_close_timeout=tool.schedule_to_close_timeout,
                 heartbeat_timeout=tool.heartbeat_timeout,
-                retry_policy=tool.retry_policy,
+                retry_policy=_refusals_final(tool.retry_policy),
                 cancellation_type=tool.cancellation_type,
                 summary=f"tool {call.name}",
             )
@@ -1452,6 +1490,9 @@ class DurableClaudeAgent:
                 raise  # the Workflow is being cancelled: do not hide it from Claude's loop
             if once:
                 return _failed_step(err, record)
+            refused = _refused(err, record)
+            if refused is not None:
+                return refused
             cause = err.cause
             message = (
                 cause.message

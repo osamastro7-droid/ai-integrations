@@ -18,6 +18,7 @@ from temporalio.claude_agent_sdk._events import follow_agent
 from temporalio.claude_agent_sdk._models import (
     TOOL_CALL_INTERRUPTED,
     TOOL_CALL_NOT_RUN,
+    TOOL_CALL_REFUSED,
     AgentState,
     ConversationRef,
     DeferredCall,
@@ -45,6 +46,7 @@ __all__ = [
     "SEGMENT_ACTIVITY_NAME",
     "TOOL_CALL_INTERRUPTED",
     "TOOL_CALL_NOT_RUN",
+    "TOOL_CALL_REFUSED",
     "TOOL_STEP_ACTIVITY_NAME",
     "AgentState",
     "ClaudeAgentPlugin",
