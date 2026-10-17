@@ -481,6 +481,12 @@ async def test_calls_run_in_their_warm_engine_with_the_same_results(
     assert changed == []  # no file changed on disk after a read
 
 
+async def ended(engines: list[int]) -> None:
+    """Wait for these engines to be gone: the runner ends one in the background, and
+    ``terminate`` returns before the process is gone (on Windows, a while before)."""
+    await wait_until(lambda: not any(alive(pid) for pid in engines), timeout=15)
+
+
 @pytest.mark.parametrize("miss", ["step", "step-alive", "next", "both"])
 @pytest.mark.parametrize("mode", ["held", "store"])
 async def test_a_call_that_misses_its_engine_runs_once(
@@ -503,8 +509,7 @@ async def test_a_call_that_misses_its_engine_runs_once(
     )
     same(warm, cold)
     assert warm.runner.warm_steps == (0 if miss != "next" else activity_calls(mode))
-    for pid in warm.runner.waited:
-        assert not alive(pid)
+    await ended(warm.runner.waited)
 
 
 @pytest.mark.parametrize("miss", ["end", "alive"])
@@ -639,8 +644,7 @@ async def test_a_call_whose_step_comes_too_late_never_runs_there(
     same(warm, cold)
     assert warm.runner.warm_steps == 0
     assert len(warm.runner.waited) == activity_calls(mode)
-    for pid in warm.runner.waited:
-        assert not alive(pid)
+    await ended(warm.runner.waited)
 
 
 @pytest.mark.parametrize("mode", ["held", "store"])
@@ -782,8 +786,7 @@ async def test_a_step_that_times_out_ends_its_warm_engine(
     cold.files, warm.files = await files(cold), await files(warm)
     assert warm.files["runs.log"] == "late next"
     same(warm, cold)
-    for pid in warm.runner.waited:
-        assert not alive(pid)
+    await ended(warm.runner.waited)
 
 
 async def test_a_worker_that_stops_ends_the_engine_where_a_call_waits(
@@ -967,7 +970,7 @@ async def test_a_step_with_other_input_ends_the_waiting_engine(tmp_path: Path) -
         await all_ended()
         assert runner._warm == {}  # type: ignore[reportPrivateUsage]
         assert runner.warm_steps == 0
-        assert not alive(runner.waited[0])
+        await ended(runner.waited[:1])
         assert not log.exists()
     finally:
         runner._end_all_warm()  # type: ignore[reportPrivateUsage]
